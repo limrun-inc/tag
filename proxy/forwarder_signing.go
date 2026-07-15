@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/rs/zerolog/log"
@@ -28,7 +30,7 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	// Validate incoming request signature
-	accessKey, err := f.validator.ValidateRequest(r)
+	accessKey, err := f.validateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return mapAuthError(err)
@@ -40,14 +42,8 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 		return mapAuthError(err)
 	}
 
-	// Build the path with query string
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path = path + "?" + r.URL.RawQuery
-	}
-
 	// Create signed request (passes body hash, streams body directly)
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, buildSigningPath(r), body, bodyHash, accessKey, secretKey, r.Header)
 	if err != nil {
 		return err
 	}
@@ -64,7 +60,7 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	// Validate incoming request signature
-	accessKey, err := f.validator.ValidateRequest(r)
+	accessKey, err := f.validateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return nil, mapAuthError(err)
@@ -76,14 +72,8 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 		return nil, mapAuthError(err)
 	}
 
-	// Build the path with query string
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path = path + "?" + r.URL.RawQuery
-	}
-
 	// Create signed request (passes body hash, streams body directly)
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, buildSigningPath(r), body, bodyHash, accessKey, secretKey, r.Header)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +85,7 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 // ValidateAndGetCredentials validates the request signature and returns credentials.
 // In signing mode, validation is always performed locally — returns AuthValidated on success.
 func (f *signingForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResult, string, string, error) {
-	accessKey, err := f.validator.ValidateRequest(r)
+	accessKey, err := f.validateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return AuthNotValidated, "", "", mapAuthError(err)
@@ -116,16 +106,43 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 	// Decode AWS chunked encoding if present, otherwise pass through unchanged
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path = path + "?" + r.URL.RawQuery
-	}
-
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, buildSigningPath(r), body, bodyHash, accessKey, secretKey, r.Header)
 	if err != nil {
 		return nil, err
 	}
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
 	return f.executeRequest(fwdReq, contentLength, nil)
+}
+
+func (f *signingForwarder) validateRequest(r *http.Request) (string, error) {
+	if auth.IsPresignedRequest(r) && hasSessionToken(r) {
+		return "", auth.ErrInvalidAuthFormat
+	}
+	accessKey, err := f.validator.ValidateRequest(r)
+	if auth.IsPresignedRequest(r) && errors.Is(err, auth.ErrInvalidDate) {
+		return "", fmt.Errorf("%w: %v", auth.ErrInvalidAuthFormat, err)
+	}
+	return accessKey, err
+}
+
+// buildSigningPath removes query-string SigV4 credentials after the incoming
+// presigned request has been validated. Signing mode adds a new Authorization
+// header for the upstream, which must receive exactly one authentication
+// mechanism. Non-auth query parameters retain their original semantics.
+func buildSigningPath(r *http.Request) string {
+	if !auth.IsPresignedRequest(r) {
+		if r.URL.RawQuery != "" {
+			return r.URL.Path + "?" + r.URL.RawQuery
+		}
+		return r.URL.Path
+	}
+
+	query := r.URL.Query()
+	auth.RemoveQueryAuthentication(query)
+
+	if encodedQuery := query.Encode(); encodedQuery != "" {
+		return r.URL.Path + "?" + encodedQuery
+	}
+	return r.URL.Path
 }

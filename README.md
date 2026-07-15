@@ -11,6 +11,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
 - **Conditional Requests**: Supports If-None-Match and If-Modified-Since for efficient cache validation
 - **AWS SigV4 Authentication**: Full AWS Signature Version 4 validation and re-signing
+- **Presigned URL Caching**: Serves validated presigned GET and HEAD requests from cache
 - **Prometheus Metrics**: Comprehensive metrics for monitoring cache efficiency and performance
 - **Kubernetes Ready**: Includes deployment manifests for production use
 

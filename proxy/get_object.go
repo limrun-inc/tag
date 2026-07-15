@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
@@ -83,6 +84,17 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
 		metrics.RecordRequest("GetObject", "auth_error", time.Since(start).Seconds())
+		return err
+	}
+
+	if auth.IsPresignedRequest(r) && !isCacheEligiblePresignedRequest(r) {
+		w.Header().Set(XCacheHeader, XCacheBypass)
+		err = s.forwarder.Forward(ctx, w, r)
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
 		return err
 	}
 
