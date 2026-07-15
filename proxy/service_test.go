@@ -188,6 +188,84 @@ func TestShouldBypassCache(t *testing.T) {
 	}
 }
 
+func TestIsCacheEligiblePresignedRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		target  string
+		headers http.Header
+		want    bool
+	}{
+		{
+			name:   "standard GET",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260715T080000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc&x-id=GetObject",
+			want:   true,
+		},
+		{
+			name:   "standard HEAD",
+			method: http.MethodHead,
+			target: "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260715T080000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc&x-id=HeadObject",
+			want:   true,
+		},
+		{
+			name:   "semantic query",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&response-content-type=text%2Fplain",
+			want:   false,
+		},
+		{
+			name:   "version id",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&versionId=abc",
+			want:   false,
+		},
+		{
+			name:   "part number",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&partNumber=1",
+			want:   false,
+		},
+		{
+			name:   "temporary credentials",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Security-Token=token",
+			want:   false,
+		},
+		{
+			name:    "conditional header",
+			method:  http.MethodGet,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"If-None-Match": {`"etag"`}},
+			want:    false,
+		},
+		{
+			name:    "HEAD range",
+			method:  http.MethodHead,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"Range": {"bytes=0-9"}},
+			want:    false,
+		},
+		{
+			name:    "S3 control header",
+			method:  http.MethodGet,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"X-Amz-Expected-Bucket-Owner": {"owner"}},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.target, nil)
+			req.Header = tt.headers
+			if got := isCacheEligiblePresignedRequest(req); got != tt.want {
+				t.Errorf("isCacheEligiblePresignedRequest() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResponseCapture_ContentLength(t *testing.T) {
 	tests := []struct {
 		name string
