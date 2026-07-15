@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 )
 
@@ -221,6 +223,114 @@ func TestCache_HeadFromCache(t *testing.T) {
 	env.AssertXCacheHit(t) // HEAD should be served from cache
 	assert.Equal(t, etag, aws.ToString(resp2.ETag), "HEAD should return same ETag as GET")
 	assert.Equal(t, contentLength, aws.ToInt64(resp2.ContentLength), "HEAD should return same Content-Length")
+}
+
+func TestCache_PresignedSigningMode(t *testing.T) {
+	content := []byte("presigned signing mode content")
+	variantContent := []byte("presigned semantic query content")
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			http.Error(w, "missing upstream Authorization header", http.StatusBadRequest)
+			return
+		}
+		for key := range r.URL.Query() {
+			if auth.IsQueryAuthenticationParameter(key) {
+				http.Error(w, "multiple authentication mechanisms", http.StatusBadRequest)
+				return
+			}
+		}
+
+		switch {
+		case r.Header.Get("If-Match") != "":
+			w.WriteHeader(http.StatusPreconditionFailed)
+		case r.URL.Query().Get("response-content-type") != "":
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Content-Length", strconv.Itoa(len(variantContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(variantContent)
+		default:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("ETag", `"default-etag"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(content)
+		}
+	})
+
+	env := NewTestEnvironmentWithCacheHandler(handler)
+	defer env.Close()
+
+	bucket := "presigned-signing-bucket"
+	key := "object.txt"
+
+	coldReq, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	coldResp, err := http.DefaultClient.Do(coldReq)
+	require.NoError(t, err)
+	coldBody, err := io.ReadAll(coldResp.Body)
+	coldResp.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, coldResp.StatusCode)
+	require.Equal(t, content, coldBody)
+	require.Equal(t, "MISS", coldResp.Header.Get("X-Cache"))
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	hitReq, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	hitResp, err := http.DefaultClient.Do(hitReq)
+	require.NoError(t, err)
+	hitBody, err := io.ReadAll(hitResp.Body)
+	hitResp.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, content, hitBody)
+	require.Equal(t, "HIT", hitResp.Header.Get("X-Cache"))
+	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
+
+	sessionReq, err := presignedGetRequest(
+		t.Context(),
+		env.GetS3ClientWithSessionToken("temporary-session-token"),
+		bucket,
+		key,
+	)
+	require.NoError(t, err)
+	sessionResp, err := http.DefaultClient.Do(sessionReq)
+	require.NoError(t, err)
+	sessionResp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, sessionResp.StatusCode)
+	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
+
+	variantReq, err := env.PresignedGetRequest(t.Context(), bucket, key, func(input *s3.GetObjectInput) {
+		input.ResponseContentType = aws.String("text/plain")
+	})
+	require.NoError(t, err)
+	variantResp, err := http.DefaultClient.Do(variantReq)
+	require.NoError(t, err)
+	variantBody, err := io.ReadAll(variantResp.Body)
+	variantResp.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, variantContent, variantBody)
+	require.Equal(t, "BYPASS", variantResp.Header.Get("X-Cache"))
+
+	conditionalReq, err := env.PresignedGetRequest(t.Context(), bucket, key, func(input *s3.GetObjectInput) {
+		input.IfMatch = aws.String(`"different-etag"`)
+	})
+	require.NoError(t, err)
+	conditionalResp, err := http.DefaultClient.Do(conditionalReq)
+	require.NoError(t, err)
+	conditionalResp.Body.Close()
+	require.Equal(t, http.StatusPreconditionFailed, conditionalResp.StatusCode)
+	require.Equal(t, "BYPASS", conditionalResp.Header.Get("X-Cache"))
+
+	countBeforeHeadRange := env.GetUpstreamRequestCount()
+	headRangeReq, err := env.PresignedHeadRequest(t.Context(), bucket, key, func(input *s3.HeadObjectInput) {
+		input.Range = aws.String("bytes=0-3")
+	})
+	require.NoError(t, err)
+	headRangeResp, err := http.DefaultClient.Do(headRangeReq)
+	require.NoError(t, err)
+	headRangeResp.Body.Close()
+	require.Equal(t, "BYPASS", headRangeResp.Header.Get("X-Cache"))
+	require.Equal(t, countBeforeHeadRange+1, env.GetUpstreamRequestCount())
 }
 
 // TestCache_InvalidateOnPut verifies PUT invalidates the cache for that key.
