@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
@@ -22,7 +23,7 @@ const (
 	XCacheHeader      = "X-Cache"
 	XCacheHit         = "HIT"
 	XCacheMiss        = "MISS"
-	XCacheBypass      = "BYPASS"      // Cache-Control: no-store bypassed cache
+	XCacheBypass      = "BYPASS"      // Request policy bypassed cache
 	XCacheDisabled    = "DISABLED"    // Cache is disabled
 	XCacheRevalidated = "REVALIDATED" // Object revalidated with upstream
 )
@@ -584,6 +585,17 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 
+	if auth.IsPresignedRequest(r) && !isCacheEligiblePresignedRequest(r) {
+		w.Header().Set(XCacheHeader, XCacheBypass)
+		err = s.forwarder.Forward(ctx, w, r)
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.RecordRequest("HeadObject", status, time.Since(start).Seconds())
+		return err
+	}
+
 	// Try to serve from cached metadata (no body needed)
 	// Anonymous requests can also read from cache if the object's ACL is public-read.
 	isAnonymous := isAnonymousRequest(r, result, err)
@@ -841,11 +853,79 @@ func ParseBucketKey(r *http.Request) (bucket, key string) {
 	return
 }
 
-// hasNoAuthCredentials returns true if the request carries no SigV4 credentials
-// (no Authorization header and no X-Amz-Credential query parameter).
+// isCacheEligiblePresignedRequest reports whether a presigned read can safely
+// share TAG's path-keyed object cache. Variants and headers whose semantics TAG
+// does not implement are delegated to the upstream.
+func isCacheEligiblePresignedRequest(r *http.Request) bool {
+	if hasSessionToken(r) || hasUnsupportedPresignedHeaders(r) {
+		return false
+	}
+
+	for key, values := range r.URL.Query() {
+		if auth.IsQueryAuthenticationParameter(key) {
+			continue
+		}
+		if key != "x-id" {
+			return false
+		}
+
+		expectedOperation := ""
+		switch r.Method {
+		case http.MethodGet:
+			expectedOperation = "GetObject"
+		case http.MethodHead:
+			expectedOperation = "HeadObject"
+		}
+		for _, value := range values {
+			if value != expectedOperation {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func hasUnsupportedPresignedHeaders(r *http.Request) bool {
+	if r.Method == http.MethodHead && r.Header.Get("Range") != "" {
+		return true
+	}
+
+	for _, key := range []string{
+		"If-Match",
+		"If-None-Match",
+		"If-Modified-Since",
+		"If-Unmodified-Since",
+		"If-Range",
+	} {
+		if r.Header.Get(key) != "" {
+			return true
+		}
+	}
+
+	for key := range r.Header {
+		lowerKey := strings.ToLower(key)
+		if !strings.HasPrefix(lowerKey, "x-amz-") {
+			continue
+		}
+		switch lowerKey {
+		case "x-amz-content-sha256", "x-amz-date", "x-amz-security-token":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func hasSessionToken(r *http.Request) bool {
+	return r.Header.Get("X-Amz-Security-Token") != "" ||
+		r.URL.Query().Has("X-Amz-Security-Token")
+}
+
+// hasNoAuthCredentials returns true if the request carries no SigV4 auth attempt.
 func hasNoAuthCredentials(r *http.Request) bool {
 	return r.Header.Get("Authorization") == "" &&
-		r.URL.Query().Get("X-Amz-Credential") == ""
+		!auth.HasQueryAuthentication(r)
 }
 
 // isAnonymousRequest returns true if the request has no SigV4 authentication

@@ -198,6 +198,12 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		return AuthNotValidated, mapAuthError(err)
 	}
 
+	bucket, _ := ParseBucketKey(r)
+	if authInfo.IsPresigned && hasSessionToken(r) {
+		metrics.RecordLocalAuthValidation("temporary_credentials")
+		return AuthNotValidated, nil
+	}
+
 	// Check if we have any signing key for this access key
 	if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
 		metrics.RecordLocalAuthValidation("unknown_key")
@@ -215,7 +221,6 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 	}
 
 	// Check authorization cache
-	bucket, _ := ParseBucketKey(r)
 	if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
 		metrics.RecordLocalAuthValidation("authz_expired")
 		log.Debug().Str("bucket", bucket).Msg("Local auth: authz expired for bucket")
@@ -267,6 +272,13 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	resp.Header.Del(signingKeysHeader)
 
 	if f.keyUnwrapper == nil {
+		return
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		auth.IsPresignedRequest(r) && hasSessionToken(r) {
+		bucket, _ := ParseBucketKey(r)
+		log.Debug().Str("bucket", bucket).Msg("Skipping local key learning for temporary credentials")
 		return
 	}
 
