@@ -83,9 +83,9 @@ Key caching behaviors:
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
 - **Write-through invalidation** — PUT, DELETE, CopyObject, and DeleteObjects invalidate the cache _before_ forwarding to Tigris to prevent stale reads.
 - **Tombstone protection** — A short-lived tombstone is written on DELETE to prevent in-flight background cache writes from resurrecting deleted objects.
-- **Presigned reads** — SigV4 presigned GET and HEAD requests can be served from cache. Transparent mode requires TAG to first learn the access key's signing key and bucket authorization; signing mode uses its configured credential store. TAG validates the signature and URL expiry locally on every cache-eligible request.
+- **Presigned reads** — SigV4 presigned GET and HEAD requests can be served from cache. Transparent mode requires TAG to first learn the access key's signing key and bucket authorization; signing mode uses its configured credential store. On a signing-mode miss, TAG generates a new query signature for the upstream host while preserving the original signing time and absolute expiration deadline.
 - **Temporary credentials** — Presigned requests carrying `X-Amz-Security-Token` bypass cache in transparent mode because token expiration is opaque to TAG. Signing mode does not support presigned temporary credentials.
-- **Presigned request variants** — Presigned requests with conditional or unsupported `x-amz-*` control headers, or query parameters such as `versionId`, `partNumber`, and `response-*`, bypass cache for authoritative upstream evaluation.
+- **Presigned request variants** — Presigned requests with cache-control directives, conditional headers, `Origin`, unsupported `x-amz-*` control headers, or query parameters such as `versionId`, `partNumber`, and `response-*`, bypass cache for authoritative upstream evaluation.
 
 ## Addressing Style
 
