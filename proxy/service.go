@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -283,6 +284,10 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 // ParseBucketKey extracts bucket and key from request path.
 func ParseBucketKey(r *http.Request) (bucket, key string) {
+	if virtualBucket, ok := PresignedVirtualHostBucket(r); ok {
+		return virtualBucket, strings.TrimPrefix(r.URL.Path, "/")
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	parts := strings.SplitN(path, "/", 2)
 	if len(parts) >= 1 {
@@ -292,6 +297,32 @@ func ParseBucketKey(r *http.Request) (bucket, key string) {
 		key = parts[1]
 	}
 	return
+}
+
+// PresignedVirtualHostBucket extracts the bucket from Tigris virtual-hosted
+// presigned URLs. Native Tigris hosts use <bucket>.t3.tigrisfiles.io; Limrun
+// bucket domains use <bucket>.s3.<domain>.
+func PresignedVirtualHostBucket(r *http.Request) (string, bool) {
+	if !auth.IsPresignedRequest(r) {
+		return "", false
+	}
+
+	host := strings.ToLower(r.Host)
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+
+	const tigrisSuffix = ".t3.tigrisfiles.io"
+	if strings.HasSuffix(host, tigrisSuffix) {
+		bucket := strings.TrimSuffix(host, tigrisSuffix)
+		return bucket, bucket != ""
+	}
+
+	if index := strings.Index(host, ".s3."); index > 0 {
+		return host[:index], true
+	}
+
+	return "", false
 }
 
 // isCacheEligiblePresignedRequest reports whether a presigned read can safely

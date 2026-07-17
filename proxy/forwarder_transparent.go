@@ -93,6 +93,11 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	// Clone ALL headers from the original request (preserving Authorization, X-Amz-Date, etc.)
 	// Clone avoids mutating the original request headers when adding proxy headers below.
 	fwdReq.Header = r.Header.Clone()
+	if _, ok := PresignedVirtualHostBucket(r); ok {
+		// Keep dialing the configured upstream endpoint for TLS and connection
+		// policy, but route the HTTP request through the original bucket host.
+		fwdReq.Host = r.Host
+	}
 
 	// Ensure X-Amz-Date is present for Tigris's proxy validation path.
 	// Some SDK versions (botocore 1.42+) sign with "date" in SignedHeaders

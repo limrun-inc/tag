@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -287,5 +288,33 @@ func TestBuildTransparentRequest_DateHandling(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildTransparentRequest_PreservesVirtualHost(t *testing.T) {
+	fwd := &transparentForwarder{
+		baseForwarder:    newBaseForwarder("https://t3.storage.dev", "auto", 10),
+		proxySigner:      auth.NewProxySigner("proxy-access", "proxy-secret"),
+		upstreamEndpoint: "https://t3.storage.dev",
+	}
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"http://tag.internal/tagcheck/small.bin?X-Amz-Credential=key%2F20260717%2Fauto%2Fs3%2Faws4_request",
+		nil,
+	)
+	req.Host = "limbuild-build-cache-staging.t3.tigrisfiles.io"
+
+	upstreamReq, err := fwd.buildTransparentRequest(t.Context(), req)
+	if err != nil {
+		t.Fatalf("buildTransparentRequest() error = %v", err)
+	}
+	if upstreamReq.URL.Host != "t3.storage.dev" {
+		t.Errorf("URL host = %q, want configured upstream", upstreamReq.URL.Host)
+	}
+	if upstreamReq.Host != req.Host {
+		t.Errorf("HTTP Host = %q, want %q", upstreamReq.Host, req.Host)
+	}
+	if upstreamReq.URL.Path != "/tagcheck/small.bin" {
+		t.Errorf("path = %q, want original virtual-host key path", upstreamReq.URL.Path)
 	}
 }
