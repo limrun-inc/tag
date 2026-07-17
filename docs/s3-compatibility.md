@@ -89,7 +89,15 @@ Key caching behaviors:
 
 ## Addressing Style
 
-TAG uses **path-style** addressing only (`http://host:port/bucket/key`). Virtual-hosted style (`http://bucket.host:port/key`) is not supported.
+TAG uses path-style addressing (`http://host:port/bucket/key`) for normal S3
+requests. Presigned GET and HEAD requests additionally support Tigris
+virtual-hosted URLs using `<bucket>.t3.tigrisfiles.io`.
+
+Bucket custom domains are not recognised. A host such as `<bucket>.s3.<domain>`
+cannot be told apart from a TAG endpoint served under a similar name, and reading
+a bucket out of the latter would give the request a different object identity.
+Requests on those hosts are treated as path-style; recognising them needs the
+virtual-host domains to be configured explicitly.
 
 ## Authentication
 

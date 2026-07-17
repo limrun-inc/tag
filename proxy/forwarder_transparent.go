@@ -118,6 +118,11 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	// headers are never visible through the inbound request. Unchanged value
 	// slices are borrowed and must not be mutated by the transport.
 	fwdReq.Header = shallowHeaderCopy(r.Header)
+	if _, ok := PresignedVirtualHostBucket(r); ok {
+		// Keep dialing the configured upstream endpoint for TLS and connection
+		// policy, but route the HTTP request through the original bucket host.
+		fwdReq.Host = r.Host
+	}
 
 	// Ensure X-Amz-Date is present for Tigris's proxy validation path.
 	// Some SDK versions (botocore 1.42+) sign with "date" in SignedHeaders
