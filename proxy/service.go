@@ -857,7 +857,9 @@ func ParseBucketKey(r *http.Request) (bucket, key string) {
 // share TAG's path-keyed object cache. Variants and headers whose semantics TAG
 // does not implement are delegated to the upstream.
 func isCacheEligiblePresignedRequest(r *http.Request) bool {
-	if hasSessionToken(r) || hasUnsupportedPresignedHeaders(r) {
+	if hasSessionToken(r) ||
+		hasUnsupportedPresignedHeaders(r) ||
+		r.Header.Get("Cache-Control") != "" {
 		return false
 	}
 
@@ -886,6 +888,9 @@ func isCacheEligiblePresignedRequest(r *http.Request) bool {
 }
 
 func hasUnsupportedPresignedHeaders(r *http.Request) bool {
+	if r.Header.Get("Origin") != "" {
+		return true
+	}
 	if r.Method == http.MethodHead && r.Header.Get("Range") != "" {
 		return true
 	}
