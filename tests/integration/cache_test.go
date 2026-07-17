@@ -228,16 +228,23 @@ func TestCache_HeadFromCache(t *testing.T) {
 func TestCache_PresignedSigningMode(t *testing.T) {
 	content := []byte("presigned signing mode content")
 	variantContent := []byte("presigned semantic query content")
+	upstreamStore := auth.NewCredentialStore()
+	upstreamStore.AddCredential(TestAccessKey, TestSecretKey)
+	upstreamValidator := auth.NewRequestValidator(upstreamStore)
+	var expectedDate, expectedExpires string
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") == "" {
-			http.Error(w, "missing upstream Authorization header", http.StatusBadRequest)
+		if r.Header.Get("Authorization") != "" {
+			http.Error(w, "unexpected upstream Authorization header", http.StatusBadRequest)
 			return
 		}
-		for key := range r.URL.Query() {
-			if auth.IsQueryAuthenticationParameter(key) {
-				http.Error(w, "multiple authentication mechanisms", http.StatusBadRequest)
-				return
-			}
+		if _, err := upstreamValidator.ValidateRequest(r); err != nil {
+			http.Error(w, "invalid upstream query signature: "+err.Error(), http.StatusForbidden)
+			return
+		}
+		if r.URL.Query().Get("X-Amz-Date") != expectedDate ||
+			r.URL.Query().Get("X-Amz-Expires") != expectedExpires {
+			http.Error(w, "presigned deadline changed", http.StatusBadRequest)
+			return
 		}
 
 		switch {
@@ -265,6 +272,8 @@ func TestCache_PresignedSigningMode(t *testing.T) {
 
 	coldReq, err := env.PresignedGetRequest(t.Context(), bucket, key)
 	require.NoError(t, err)
+	expectedDate = coldReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = coldReq.URL.Query().Get("X-Amz-Expires")
 	coldResp, err := http.DefaultClient.Do(coldReq)
 	require.NoError(t, err)
 	coldBody, err := io.ReadAll(coldResp.Body)
@@ -286,6 +295,18 @@ func TestCache_PresignedSigningMode(t *testing.T) {
 	require.Equal(t, "HIT", hitResp.Header.Get("X-Cache"))
 	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
 
+	noCacheReq, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	noCacheReq.Header.Set("Cache-Control", "Max-Age=3600")
+	expectedDate = noCacheReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = noCacheReq.URL.Query().Get("X-Amz-Expires")
+	noCacheResp, err := http.DefaultClient.Do(noCacheReq)
+	require.NoError(t, err)
+	noCacheResp.Body.Close()
+	require.Equal(t, http.StatusOK, noCacheResp.StatusCode)
+	require.Equal(t, "BYPASS", noCacheResp.Header.Get("X-Cache"))
+	require.Equal(t, int32(2), env.GetUpstreamRequestCount())
+
 	sessionReq, err := presignedGetRequest(
 		t.Context(),
 		env.GetS3ClientWithSessionToken("temporary-session-token"),
@@ -297,12 +318,14 @@ func TestCache_PresignedSigningMode(t *testing.T) {
 	require.NoError(t, err)
 	sessionResp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, sessionResp.StatusCode)
-	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
+	require.Equal(t, int32(2), env.GetUpstreamRequestCount())
 
 	variantReq, err := env.PresignedGetRequest(t.Context(), bucket, key, func(input *s3.GetObjectInput) {
 		input.ResponseContentType = aws.String("text/plain")
 	})
 	require.NoError(t, err)
+	expectedDate = variantReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = variantReq.URL.Query().Get("X-Amz-Expires")
 	variantResp, err := http.DefaultClient.Do(variantReq)
 	require.NoError(t, err)
 	variantBody, err := io.ReadAll(variantResp.Body)
@@ -315,6 +338,8 @@ func TestCache_PresignedSigningMode(t *testing.T) {
 		input.IfMatch = aws.String(`"different-etag"`)
 	})
 	require.NoError(t, err)
+	expectedDate = conditionalReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = conditionalReq.URL.Query().Get("X-Amz-Expires")
 	conditionalResp, err := http.DefaultClient.Do(conditionalReq)
 	require.NoError(t, err)
 	conditionalResp.Body.Close()
@@ -326,6 +351,8 @@ func TestCache_PresignedSigningMode(t *testing.T) {
 		input.Range = aws.String("bytes=0-3")
 	})
 	require.NoError(t, err)
+	expectedDate = headRangeReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = headRangeReq.URL.Query().Get("X-Amz-Expires")
 	headRangeResp, err := http.DefaultClient.Do(headRangeReq)
 	require.NoError(t, err)
 	headRangeResp.Body.Close()

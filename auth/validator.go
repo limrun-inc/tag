@@ -297,12 +297,7 @@ func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signed
 				value = r.URL.Host
 			}
 		} else {
-			values := r.Header.Values(name)
-			// Trim and join values
-			for i, val := range values {
-				values[i] = strings.TrimSpace(val)
-			}
-			value = strings.Join(values, ",")
+			value = canonicalizeHeaderValues(r.Header.Values(name))
 		}
 
 		builder.WriteString(name)
