@@ -1089,8 +1089,10 @@ func NewTestEnvironmentWithTransparentAuth(t *testing.T, upstreamHandler http.Ha
 
 	upstream := httptest.NewServer(counter(upstreamHandler))
 
-	// Create credential store (empty — transparent mode uses ProxySigner)
+	// Create credential store with TAG's own Tigris credentials. Transparent
+	// mode can use these to validate requests signed by the proxy identity.
 	credStore := auth.NewCredentialStore()
+	credStore.AddCredential(TestProxyAccessKey, TestProxySecretKey)
 
 	// Create proxy signer (TAG's own Tigris credentials)
 	proxySigner := auth.NewProxySigner(TestProxyAccessKey, TestProxySecretKey)
