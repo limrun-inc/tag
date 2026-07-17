@@ -450,6 +450,8 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 			f.validator = localAuth.Validator
 			f.keyUnwrapper = localAuth.KeyUnwrapper
 			f.authzCache = localAuth.AuthzCache
+			f.credentialStore = credStore
+			f.credentialAuth = auth.NewRequestValidator(credStore)
 		}
 		f.initInterceptor()
 		return f
