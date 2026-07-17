@@ -48,3 +48,33 @@ func TestBuildHeaderSigningPath_StripsPresignedAuthForNonRead(t *testing.T) {
 		t.Errorf("uploadId = %q, want preserved", parsed.Query().Get("uploadId"))
 	}
 }
+
+func TestSigningForwarder_RewritesVirtualHostPath(t *testing.T) {
+	fwd := &signingForwarder{
+		baseForwarder: newBaseForwarder("https://t3.storage.dev", "auto", 10),
+	}
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"http://tag.internal/tagcheck/small.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key%2F20260717%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20260717T144748Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=signature",
+		nil,
+	)
+	req.Host = "limbuild-build-cache-staging.t3.tigrisfiles.io"
+
+	upstreamReq, err := fwd.signUpstreamRequest(
+		t.Context(),
+		req,
+		nil,
+		"",
+		"key",
+		"secret",
+	)
+	if err != nil {
+		t.Fatalf("signUpstreamRequest() error = %v", err)
+	}
+	if upstreamReq.URL.Path != "/limbuild-build-cache-staging/tagcheck/small.bin" {
+		t.Errorf("path = %q, want path-style upstream bucket and key", upstreamReq.URL.Path)
+	}
+	if upstreamReq.URL.Host != "t3.storage.dev" {
+		t.Errorf("host = %q, want configured upstream", upstreamReq.URL.Host)
+	}
+}

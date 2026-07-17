@@ -11,6 +11,8 @@ func TestParseBucketKey(t *testing.T) {
 	tests := []struct {
 		name       string
 		path       string
+		host       string
+		presigned  bool
 		wantBucket string
 		wantKey    string
 	}{
@@ -56,6 +58,22 @@ func TestParseBucketKey(t *testing.T) {
 			wantBucket: "bucket",
 			wantKey:    "file with spaces.txt",
 		},
+		{
+			name:       "Tigris virtual host",
+			path:       "/tagcheck/small.bin",
+			host:       "limbuild-build-cache-staging.t3.tigrisfiles.io",
+			presigned:  true,
+			wantBucket: "limbuild-build-cache-staging",
+			wantKey:    "tagcheck/small.bin",
+		},
+		{
+			name:       "custom S3 domain",
+			path:       "/tagcheck/small.bin",
+			host:       "limbuild-build-cache-staging.s3.limrun.dev",
+			presigned:  true,
+			wantBucket: "limbuild-build-cache-staging",
+			wantKey:    "tagcheck/small.bin",
+		},
 	}
 
 	for _, tt := range tests {
@@ -64,6 +82,10 @@ func TestParseBucketKey(t *testing.T) {
 			// httptest.NewRequest has issues with empty URLs and special characters.
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
 			req.URL = &url.URL{Path: tt.path}
+			req.Host = tt.host
+			if tt.presigned {
+				req.URL.RawQuery = "X-Amz-Credential=key%2F20260717%2Fauto%2Fs3%2Faws4_request"
+			}
 
 			bucket, key := ParseBucketKey(req)
 
