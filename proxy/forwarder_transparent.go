@@ -32,6 +32,8 @@ type transparentForwarder struct {
 	validator       *auth.RequestValidator
 	keyUnwrapper    *auth.KeyUnwrapper
 	authzCache      *auth.AuthzCache
+	credentialStore *auth.CredentialStore
+	credentialAuth  *auth.RequestValidator
 }
 
 // initInterceptor sets the response interceptor on the base forwarder.
@@ -234,6 +236,19 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		return AuthNotValidated, nil
 	}
 
+	if f.credentialStore != nil && f.credentialStore.HasCredential(authInfo.AccessKey) {
+		if _, err := f.credentialAuth.ValidateRequest(r); err != nil {
+			metrics.RecordLocalAuthValidation("signature_mismatch")
+			return AuthNotValidated, nil
+		}
+		if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
+			metrics.RecordLocalAuthValidation("authz_expired")
+			return AuthNotValidated, nil
+		}
+		metrics.RecordLocalAuthValidation("success")
+		return AuthValidated, nil
+	}
+
 	// Check if we have any signing key for this access key
 	if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
 		metrics.RecordLocalAuthValidation("unknown_key")
@@ -305,11 +320,21 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 		return
 	}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 &&
-		auth.IsPresignedRequest(r) && hasSessionToken(r) {
-		bucket, _ := ParseBucketKey(r)
-		log.Debug().Str("bucket", bucket).Msg("Skipping local key learning for temporary credentials")
-		return
+	var authInfo *auth.AuthInfo
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var err error
+		authInfo, err = auth.ParseAuthInfo(r)
+		if err == nil {
+			bucket, _ := ParseBucketKey(r)
+			if authInfo.IsPresigned && hasSessionToken(r) {
+				log.Debug().Str("bucket", bucket).Msg("Skipping local auth learning for temporary credentials")
+				return
+			}
+			if f.credentialStore != nil && f.credentialStore.HasCredential(authInfo.AccessKey) {
+				f.authzCache.Grant(authInfo.AccessKey, bucket)
+				metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+			}
+		}
 	}
 
 	// Header may be absent on 2xx if feature is disabled on Tigris side, or non-proxy request
@@ -320,10 +345,13 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 		return
 	}
 
-	authInfo, err := auth.ParseAuthInfo(r)
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to parse auth info for signing key learning")
-		return
+	if authInfo == nil {
+		var err error
+		authInfo, err = auth.ParseAuthInfo(r)
+		if err != nil {
+			log.Debug().Err(err).Msg("Failed to parse auth info for signing key learning")
+			return
+		}
 	}
 
 	entries, err := f.keyUnwrapper.Unwrap(headerVal, authInfo.AccessKey)
