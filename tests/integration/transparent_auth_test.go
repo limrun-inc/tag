@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -113,6 +114,47 @@ func TestTransparentAuth_PresignedURL_KeyLearning_ThenCacheHit(t *testing.T) {
 	headResp.Body.Close()
 	require.Equal(t, http.StatusOK, headResp.StatusCode)
 	require.Equal(t, proxy.XCacheHit, headResp.Header.Get(proxy.XCacheHeader))
+	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
+}
+
+func TestTransparentAuth_PresignedURLWithProxyCredentialsHitsCache(t *testing.T) {
+	content := []byte("proxy credential presigned content")
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.Header().Set("ETag", `"proxy-credential-etag"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	env := NewTestEnvironmentWithTransparentAuth(t, handler)
+	defer env.Close()
+
+	bucket := "proxy-credential-bucket"
+	key := "object.bin"
+	client := env.GetS3ClientWithCreds(TestProxyAccessKey, TestProxySecretKey)
+
+	req1, err := presignedGetRequest(t.Context(), client, bucket, key)
+	require.NoError(t, err)
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	body1, err := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, content, body1)
+	require.Equal(t, proxy.XCacheMiss, resp1.Header.Get(proxy.XCacheHeader))
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+	require.True(t, env.AuthzCache.IsAuthorized(TestProxyAccessKey, bucket))
+	require.False(t, env.DerivedKeyStore.HasKey(TestProxyAccessKey))
+
+	req2, err := presignedGetRequest(t.Context(), client, bucket, key)
+	require.NoError(t, err)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, content, body2)
+	require.Equal(t, proxy.XCacheHit, resp2.Header.Get(proxy.XCacheHeader))
 	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
 }
 
