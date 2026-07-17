@@ -175,7 +175,17 @@ func (f *signingForwarder) signUpstreamRequest(
 	bodyHash, accessKey, secretKey string,
 ) (*http.Request, error) {
 	if isPresignedRead(r) {
-		return f.signer.ResignPresignedRequest(ctx, r, accessKey, secretKey)
+		source := r
+		if bucket, ok := PresignedVirtualHostBucket(r); ok {
+			_, key := ParseBucketKey(r)
+			source = r.Clone(ctx)
+			source.URL.Path = "/" + bucket
+			if key != "" {
+				source.URL.Path += "/" + key
+			}
+			source.URL.RawPath = ""
+		}
+		return f.signer.ResignPresignedRequest(ctx, source, accessKey, secretKey)
 	}
 
 	return f.signer.SignRequest(
