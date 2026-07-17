@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/rs/zerolog/log"
@@ -42,8 +43,7 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 		return mapAuthError(err)
 	}
 
-	// Create signed request (passes body hash, streams body directly)
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, buildSigningPath(r), body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signUpstreamRequest(ctx, r, body, bodyHash, accessKey, secretKey)
 	if err != nil {
 		return err
 	}
@@ -72,8 +72,7 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 		return nil, mapAuthError(err)
 	}
 
-	// Create signed request (passes body hash, streams body directly)
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, buildSigningPath(r), body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signUpstreamRequest(ctx, r, body, bodyHash, accessKey, secretKey)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +105,7 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 	// Decode AWS chunked encoding if present, otherwise pass through unchanged
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, buildSigningPath(r), body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signUpstreamRequest(ctx, r, body, bodyHash, accessKey, secretKey)
 	if err != nil {
 		return nil, err
 	}
@@ -116,21 +115,44 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 }
 
 func (f *signingForwarder) validateRequest(r *http.Request) (string, error) {
-	if auth.IsPresignedRequest(r) && hasSessionToken(r) {
+	if isPresignedRead(r) && hasSessionToken(r) {
 		return "", auth.ErrInvalidAuthFormat
 	}
 	accessKey, err := f.validator.ValidateRequest(r)
-	if auth.IsPresignedRequest(r) && errors.Is(err, auth.ErrInvalidDate) {
+	if isPresignedRead(r) && errors.Is(err, auth.ErrInvalidDate) {
 		return "", fmt.Errorf("%w: %v", auth.ErrInvalidAuthFormat, err)
 	}
 	return accessKey, err
 }
 
-// buildSigningPath removes query-string SigV4 credentials after the incoming
-// presigned request has been validated. Signing mode adds a new Authorization
-// header for the upstream, which must receive exactly one authentication
-// mechanism. Non-auth query parameters retain their original semantics.
-func buildSigningPath(r *http.Request) string {
+func (f *signingForwarder) signUpstreamRequest(
+	ctx context.Context,
+	r *http.Request,
+	body io.Reader,
+	bodyHash, accessKey, secretKey string,
+) (*http.Request, error) {
+	if isPresignedRead(r) {
+		return f.signer.ResignPresignedRequest(ctx, r, accessKey, secretKey)
+	}
+
+	return f.signer.SignRequest(
+		ctx,
+		r.Method,
+		buildHeaderSigningPath(r),
+		body,
+		bodyHash,
+		accessKey,
+		secretKey,
+		r.Header,
+	)
+}
+
+func isPresignedRead(r *http.Request) bool {
+	return auth.IsPresignedRequest(r) &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead)
+}
+
+func buildHeaderSigningPath(r *http.Request) string {
 	if !auth.IsPresignedRequest(r) {
 		if r.URL.RawQuery != "" {
 			return r.URL.Path + "?" + r.URL.RawQuery
@@ -140,7 +162,6 @@ func buildSigningPath(r *http.Request) string {
 
 	query := r.URL.Query()
 	auth.RemoveQueryAuthentication(query)
-
 	if encodedQuery := query.Encode(); encodedQuery != "" {
 		return r.URL.Path + "?" + encodedQuery
 	}
