@@ -340,6 +340,9 @@ func handleError(w http.ResponseWriter, r *http.Request, err error) {
 
 // getBucketName extracts the bucket name from request path variables.
 func getBucketName(r *http.Request) string {
+	if bucket, ok := proxy.PresignedVirtualHostBucket(r); ok {
+		return bucket
+	}
 	vars := mux.Vars(r)
 	return vars["bucket"]
 }
