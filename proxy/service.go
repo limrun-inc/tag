@@ -898,24 +898,52 @@ func isCacheEligiblePresignedRequest(r *http.Request) bool {
 		if auth.IsQueryAuthenticationParameter(key) {
 			continue
 		}
-		if key != "x-id" {
-			return false
-		}
-
-		expectedOperation := ""
-		switch r.Method {
-		case http.MethodGet:
-			expectedOperation = "GetObject"
-		case http.MethodHead:
-			expectedOperation = "HeadObject"
-		}
-		for _, value := range values {
-			if value != expectedOperation {
+		switch key {
+		case "X-Amz-Checksum-Mode":
+			if r.Method != http.MethodGet || len(values) == 0 {
 				return false
 			}
+			for _, value := range values {
+				if value != "ENABLED" {
+					return false
+				}
+			}
+		case "x-id":
+			expectedOperation := ""
+			switch r.Method {
+			case http.MethodGet:
+				expectedOperation = "GetObject"
+			case http.MethodHead:
+				expectedOperation = "HeadObject"
+			}
+			for _, value := range values {
+				if value != expectedOperation {
+					return false
+				}
+			}
+		default:
+			return false
 		}
 	}
 	return true
+}
+
+func requestsChecksumMode(r *http.Request) bool {
+	values, ok := r.URL.Query()["X-Amz-Checksum-Mode"]
+	if !ok || len(values) == 0 {
+		return false
+	}
+	for _, value := range values {
+		if value != "ENABLED" {
+			return false
+		}
+	}
+	return true
+}
+
+func cachedMetaSatisfiesRequest(r *http.Request, meta *cache.CachedObjectMeta) bool {
+	return meta != nil &&
+		(!requestsChecksumMode(r) || meta.ChecksumMode || len(meta.ChecksumHeaders) > 0)
 }
 
 func hasUnsupportedPresignedHeaders(r *http.Request) bool {
