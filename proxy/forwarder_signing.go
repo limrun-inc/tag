@@ -157,6 +157,28 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 	return f.executeRequest(fwdReq, contentLength, nil)
 }
 
+func (f *signingForwarder) AuthorizePresignedRequest(
+	ctx context.Context,
+	r *http.Request,
+	accessKey, secretKey string,
+	rangeProbe bool,
+) (*http.Response, error) {
+	probe := r.Clone(ctx)
+	probe.Body = nil
+	probe.ContentLength = 0
+	if rangeProbe {
+		probe.Header.Set("Range", "bytes=0-0")
+	} else {
+		probe.Header.Del("Range")
+	}
+
+	fwdReq, err := f.signUpstreamRequest(ctx, probe, nil, "", accessKey, secretKey)
+	if err != nil {
+		return nil, err
+	}
+	return f.executeRequest(fwdReq, 0, nil)
+}
+
 func (f *signingForwarder) validateRequest(r *http.Request) (string, error) {
 	if isPresignedRead(r) && hasSessionToken(r) {
 		return "", auth.ErrInvalidAuthFormat
