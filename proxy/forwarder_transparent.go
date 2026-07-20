@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -224,6 +225,14 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		return AuthValidated, nil
 	}
 
+	if authInfo.IsPresigned && isCacheEligiblePresignedRequest(r) {
+		if authorizationKey, err := presignedAuthorizationKey(r, authInfo); err == nil &&
+			f.authzCache.IsAuthorized(authorizationKey, bucket) {
+			metrics.RecordLocalAuthValidation("success")
+			return AuthValidated, nil
+		}
+	}
+
 	// Check if we have any signing key for this access key
 	if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
 		metrics.RecordLocalAuthValidation("unknown_key")
@@ -309,6 +318,12 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 				f.authzCache.Grant(authInfo.AccessKey, bucket)
 				metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
 			}
+			if authInfo.IsPresigned && isCacheEligiblePresignedRequest(r) {
+				if authorizationKey, err := presignedAuthorizationKey(r, authInfo); err == nil {
+					f.authzCache.Grant(authorizationKey, bucket)
+					metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+				}
+			}
 		}
 	}
 
@@ -377,7 +392,37 @@ func (f *transparentForwarder) handleAuthzRevocation(resp *http.Response, r *htt
 
 	bucket, _ := ParseBucketKey(r)
 	f.authzCache.Revoke(authInfo.AccessKey, bucket)
+	if authInfo.IsPresigned {
+		if authorizationKey, err := presignedAuthorizationKey(r, authInfo); err == nil {
+			f.authzCache.Revoke(authorizationKey, bucket)
+		}
+	}
 	log.Debug().Str("access_key", maskAccessKey(authInfo.AccessKey)).Str("bucket", bucket).Msg("Authorization revoked (upstream 403)")
+}
+
+func presignedAuthorizationKey(r *http.Request, authInfo *auth.AuthInfo) (string, error) {
+	if _, err := auth.ValidatePresignedWindow(r, authInfo); err != nil {
+		return "", err
+	}
+
+	var identity strings.Builder
+	identity.WriteString(r.Method)
+	identity.WriteByte('\n')
+	identity.WriteString(strings.ToLower(r.Host))
+	identity.WriteByte('\n')
+	identity.WriteString(r.URL.RequestURI())
+	for _, header := range authInfo.SignedHeaders {
+		if header == "host" {
+			continue
+		}
+		identity.WriteByte('\n')
+		identity.WriteString(header)
+		identity.WriteByte(':')
+		identity.WriteString(strings.Join(r.Header.Values(header), ","))
+	}
+
+	sum := sha256.Sum256([]byte(identity.String()))
+	return "presigned:" + hex.EncodeToString(sum[:]), nil
 }
 
 // maskAccessKey returns the last 4 characters of an access key prefixed with "...",
