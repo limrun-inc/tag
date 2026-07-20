@@ -132,37 +132,9 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 
 // validatePresigned validates a presigned URL request.
 func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo, signingKey []byte) error {
-	query := r.URL.Query()
-
-	// Get expiration time
-	dateStr := query.Get("X-Amz-Date")
-	if dateStr == "" {
-		return ErrInvalidDate
-	}
-
-	requestTime, err := time.Parse(TimeFormat, dateStr)
+	requestTime, err := ValidatePresignedWindow(r, authInfo)
 	if err != nil {
-		return ErrInvalidDate
-	}
-	if authInfo.Date != requestTime.UTC().Format(shortTimeFormat) {
-		return ErrInvalidDate
-	}
-
-	// Reject timestamps too far in the future before applying the URL lifetime.
-	age := time.Since(requestTime)
-	if age < -maxRequestAge {
-		return ErrExpiredRequest
-	}
-
-	// X-Amz-Expires is required and limited to seven days by the S3 SigV4 protocol.
-	expiresStr := query.Get("X-Amz-Expires")
-	expiresSeconds, err := strconv.ParseInt(expiresStr, 10, 64)
-	maxExpiresSeconds := int64(maxPresignedExpiry / time.Second)
-	if err != nil || expiresSeconds < 1 || expiresSeconds > maxExpiresSeconds {
-		return fmt.Errorf("%w: invalid X-Amz-Expires", ErrInvalidAuthFormat)
-	}
-	if age > time.Duration(expiresSeconds)*time.Second {
-		return ErrExpiredRequest
+		return err
 	}
 
 	// For presigned URLs, body hash is typically UNSIGNED-PAYLOAD
@@ -177,6 +149,47 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 	}
 
 	return nil
+}
+
+// ValidatePresignedWindow validates the timestamp and expiration window of a
+// parsed presigned request without requiring access to its signing secret.
+func ValidatePresignedWindow(r *http.Request, authInfo *AuthInfo) (time.Time, error) {
+	if authInfo == nil || !authInfo.IsPresigned {
+		return time.Time{}, ErrInvalidAuthFormat
+	}
+
+	query := r.URL.Query()
+	dateStr := query.Get("X-Amz-Date")
+	if dateStr == "" {
+		return time.Time{}, ErrInvalidDate
+	}
+
+	requestTime, err := time.Parse(TimeFormat, dateStr)
+	if err != nil {
+		return time.Time{}, ErrInvalidDate
+	}
+	if authInfo.Date != requestTime.UTC().Format(shortTimeFormat) {
+		return time.Time{}, ErrInvalidDate
+	}
+
+	// Reject timestamps too far in the future before applying the URL lifetime.
+	age := time.Since(requestTime)
+	if age < -maxRequestAge {
+		return time.Time{}, ErrExpiredRequest
+	}
+
+	// X-Amz-Expires is required and limited to seven days by the S3 SigV4 protocol.
+	expiresStr := query.Get("X-Amz-Expires")
+	expiresSeconds, err := strconv.ParseInt(expiresStr, 10, 64)
+	maxExpiresSeconds := int64(maxPresignedExpiry / time.Second)
+	if err != nil || expiresSeconds < 1 || expiresSeconds > maxExpiresSeconds {
+		return time.Time{}, fmt.Errorf("%w: invalid X-Amz-Expires", ErrInvalidAuthFormat)
+	}
+	if age > time.Duration(expiresSeconds)*time.Second {
+		return time.Time{}, ErrExpiredRequest
+	}
+
+	return requestTime, nil
 }
 
 // computeSignature computes the expected signature for a signed request.
