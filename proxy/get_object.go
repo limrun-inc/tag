@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -129,6 +131,31 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// Anonymous requests can also read from cache if the object's ACL is public-read.
 	// Cache-Control: no-store bypasses cache entirely; no-cache/max-age=0 triggers revalidation.
 	isAnonymous := isAnonymousRequest(r, result, err)
+
+	if result == AuthNotValidated &&
+		!isAnonymous &&
+		auth.IsPresignedRequest(r) &&
+		rangeHeader == "" &&
+		!bypassCache &&
+		s.cache.IsEnabled() {
+		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+		if cacheErr == nil && found && meta != nil {
+			handled, authorizeErr := s.authorizePresignedAndServeCached(
+				ctx,
+				w,
+				r,
+				bucket,
+				key,
+				accessKey,
+				secretKey,
+				meta,
+				start,
+			)
+			if handled {
+				return authorizeErr
+			}
+		}
+	}
 
 	if (result == AuthValidated || isAnonymous) && !bypassCache && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
@@ -272,6 +299,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 
 	// Full object request: use broadcast manager for streaming coalescing
 	bcastKey := makeBroadcastKey(bucket, key, rangeHeader)
+	if auth.IsPresignedRequest(r) {
+		bcastKey += ":presigned:" + presignedCoalescingKey(r)
+	}
 	broadcaster, isFirstCaller := s.broadcastManager.GetOrCreate(bcastKey)
 
 	// Update active broadcasts metric
@@ -303,6 +333,107 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// Successfully subscribed - receive streamed chunks
 	metrics.RecordBroadcastShared()
 	return s.receiveFromBroadcastListener(ctx, w, listener, start, xCache)
+}
+
+func (s *Service) authorizePresignedAndServeCached(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request,
+	bucket, key, accessKey, secretKey string,
+	meta *cache.CachedObjectMeta,
+	start time.Time,
+) (bool, error) {
+	resp, err := s.forwarder.AuthorizePresignedRequest(
+		ctx,
+		r,
+		accessKey,
+		secretKey,
+		meta.ContentLength > 0,
+	)
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		s.cache.Delete(context.Background(), bucket, key)
+		return false, nil
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		copyHeaders(w.Header(), resp.Header)
+		w.Header().Set(XCacheHeader, XCacheMiss)
+		w.WriteHeader(resp.StatusCode)
+		n, copyErr := io.Copy(w, resp.Body)
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+		metrics.RecordRequest("GetObject", "auth_error", time.Since(start).Seconds())
+		return true, copyErr
+	}
+
+	if !probeMatchesCachedObject(resp, meta) {
+		s.cache.Delete(context.Background(), bucket, key)
+		return false, nil
+	}
+
+	if err := s.serveFromCache(ctx, w, bucket, key, meta, start); err != nil {
+		s.cache.Delete(context.Background(), bucket, key)
+		return false, nil
+	}
+	return true, nil
+}
+
+func probeMatchesCachedObject(resp *http.Response, meta *cache.CachedObjectMeta) bool {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return false
+	}
+
+	etag := resp.Header.Get("ETag")
+	if etag == "" || etag != meta.ETag {
+		return false
+	}
+
+	if resp.Header.Get("x-amz-version-id") != meta.VersionID {
+		return false
+	}
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		totalSize, ok := probeTotalSize(resp.Header.Get("Content-Range"))
+		return ok && totalSize == meta.ContentLength
+	case http.StatusOK:
+		return resp.ContentLength >= 0 && resp.ContentLength == meta.ContentLength
+	default:
+		return false
+	}
+}
+
+func probeTotalSize(contentRange string) (int64, bool) {
+	slash := strings.LastIndex(contentRange, "/")
+	if slash < 0 || slash == len(contentRange)-1 {
+		return 0, false
+	}
+	total, err := strconv.ParseInt(contentRange[slash+1:], 10, 64)
+	return total, err == nil && total >= 0
+}
+
+func presignedCoalescingKey(r *http.Request) string {
+	var identity strings.Builder
+	identity.WriteString(strings.ToLower(r.Host))
+	identity.WriteByte('\n')
+	identity.WriteString(r.URL.RequestURI())
+	if authInfo, err := auth.ParseAuthInfo(r); err == nil {
+		for _, header := range authInfo.SignedHeaders {
+			if header == "host" {
+				continue
+			}
+			identity.WriteByte('\n')
+			identity.WriteString(header)
+			identity.WriteByte(':')
+			identity.WriteString(strings.Join(r.Header.Values(header), ","))
+		}
+	}
+	sum := sha256.Sum256([]byte(identity.String()))
+	return hex.EncodeToString(sum[:])
 }
 
 // makeBroadcastKey creates a unique key for broadcast coalescing.

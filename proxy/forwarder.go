@@ -45,6 +45,11 @@ type RequestForwarder interface {
 	// Returns the raw response for streaming. Caller is responsible for closing the response body.
 	DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error)
 
+	// AuthorizePresignedRequest sends a minimal ranged request using the
+	// client's original presigned capability. It is used to authorize serving
+	// an already-cached object when local signature verification is unavailable.
+	AuthorizePresignedRequest(ctx context.Context, r *http.Request, accessKey, secretKey string, rangeProbe bool) (*http.Response, error)
+
 	// DoFullObjectRequest executes a full object GET request (no Range header).
 	// Used for background cache population after a Range request cache miss.
 	// Caller is responsible for closing the response body.
