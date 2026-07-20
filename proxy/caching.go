@@ -95,6 +95,7 @@ func (s *Service) setupCacheListener(
 	bucket, key string,
 	broadcaster *broadcast.Broadcaster,
 	slotHeld bool,
+	checksumMode bool,
 ) (*io.PipeWriter, chan error) {
 	// Bound concurrent cache-populate operations. When the limit is saturated,
 	// skip caching entirely: the object is still served/forwarded from upstream,
@@ -141,6 +142,7 @@ func (s *Service) setupCacheListener(
 
 		// Build metadata from response headers
 		meta := cache.MetaFromHTTPHeaders(bucket, key, statusCode, headers)
+		meta.ChecksumMode = checksumMode
 		// Check if still cacheable based on metadata
 		if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
 			pipeWriter.CloseWithError(nil)
@@ -334,7 +336,7 @@ func (s *Service) fetchFullObjectToCache(
 	// Hand the reserved slot to the cache listener (streams to cache via pipe).
 	// Ownership of releasing the slot transfers to setupCacheListener, so drop
 	// our own release regardless of the result.
-	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true)
+	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true, false)
 	slotOwned = false
 	if cachePipeWriter == nil {
 		// No listener could be created; nothing to populate.

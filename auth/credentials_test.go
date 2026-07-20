@@ -9,8 +9,6 @@ func TestCredentialStore_LoadFromEnv(t *testing.T) {
 	// Set environment variables
 	t.Setenv("AWS_ACCESS_KEY_ID", "env_access_key")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "env_secret_key")
-	t.Setenv("TAG_VALIDATION_ACCESS_KEY_ID", "")
-	t.Setenv("TAG_VALIDATION_SECRET_ACCESS_KEY", "")
 
 	store := NewCredentialStore()
 	if err := store.LoadFromEnv(); err != nil {
@@ -36,34 +34,10 @@ func TestCredentialStore_LoadFromEnv(t *testing.T) {
 	}
 }
 
-func TestCredentialStore_LoadFromEnv_SecondaryValidationCredential(t *testing.T) {
-	t.Setenv("AWS_ACCESS_KEY_ID", "proxy_access_key")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "proxy_secret_key")
-	t.Setenv("TAG_VALIDATION_ACCESS_KEY_ID", "validation_access_key")
-	t.Setenv("TAG_VALIDATION_SECRET_ACCESS_KEY", "validation_secret_key")
-
-	store := NewCredentialStore()
-	if err := store.LoadFromEnv(); err != nil {
-		t.Fatalf("LoadFromEnv() error = %v", err)
-	}
-	if store.Count() != 2 {
-		t.Fatalf("Count() = %d, want 2", store.Count())
-	}
-	secret, err := store.GetSecretKey("validation_access_key")
-	if err != nil {
-		t.Fatalf("GetSecretKey() error = %v", err)
-	}
-	if secret != "validation_secret_key" {
-		t.Errorf("GetSecretKey() = %q, want validation secret", secret)
-	}
-}
-
 func TestCredentialStore_LoadFromEnv_NoEnvVars(t *testing.T) {
 	// Ensure env vars are not set
 	os.Unsetenv("AWS_ACCESS_KEY_ID")
 	os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-	os.Unsetenv("TAG_VALIDATION_ACCESS_KEY_ID")
-	os.Unsetenv("TAG_VALIDATION_SECRET_ACCESS_KEY")
 
 	store := NewCredentialStore()
 	if err := store.LoadFromEnv(); err != nil {

@@ -25,23 +25,18 @@ func NewCredentialStore() *CredentialStore {
 	}
 }
 
-// LoadFromEnv loads the proxy credential and an optional secondary validation
-// credential. The secondary credential is used only for local signature
-// validation; transparent forwarding continues using the proxy credential.
+// LoadFromEnv loads the proxy credential from environment variables.
 func (c *CredentialStore) LoadFromEnv() error {
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if accessKey == "" || secretKey == "" {
+		return nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, names := range [][2]string{
-		{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},
-		{"TAG_VALIDATION_ACCESS_KEY_ID", "TAG_VALIDATION_SECRET_ACCESS_KEY"},
-	} {
-		accessKey := os.Getenv(names[0])
-		secretKey := os.Getenv(names[1])
-		if accessKey != "" && secretKey != "" {
-			c.credentials[accessKey] = secretKey
-		}
-	}
+	c.credentials[accessKey] = secretKey
 	return nil
 }
 
