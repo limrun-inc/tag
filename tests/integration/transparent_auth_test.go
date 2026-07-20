@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -206,6 +207,58 @@ func TestTransparentAuth_DifferentKeyAuthorizesCachedObjectUpstream(t *testing.T
 	require.Equal(t, proxy.XCacheHit, resp2.Header.Get(proxy.XCacheHeader))
 	require.Equal(t, int32(2), env.GetUpstreamRequestCount(), "second request should use one-byte auth probe")
 	require.Equal(t, int32(1), atomic.LoadInt32(&probeCount))
+}
+
+func TestTransparentAuth_DifferentKeyChecksumModeHitsCache(t *testing.T) {
+	content := []byte("checksum-mode cached content")
+	const checksum = "dGVzdC1jaGVja3N1bQ=="
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"checksum-mode-etag"`)
+		w.Header().Set("X-Amz-Checksum-Crc32c", checksum)
+		if r.Header.Get("Range") == "bytes=0-0" {
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(content[:1])
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	env := NewTestEnvironmentWithTransparentAuth(t, handler)
+	defer env.Close()
+
+	bucket := "checksum-mode-bucket"
+	key := "object.bin"
+	withChecksumMode := func(input *s3.GetObjectInput) {
+		input.ChecksumMode = s3types.ChecksumModeEnabled
+	}
+
+	req1, err := env.PresignedGetRequest(t.Context(), bucket, key, withChecksumMode)
+	require.NoError(t, err)
+	require.Equal(t, "ENABLED", req1.URL.Query().Get("X-Amz-Checksum-Mode"))
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	body1, err := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, content, body1)
+	require.Equal(t, proxy.XCacheMiss, resp1.Header.Get(proxy.XCacheHeader))
+	require.Equal(t, checksum, resp1.Header.Get("X-Amz-Checksum-Crc32c"))
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	req2, err := env.PresignedGetRequest(t.Context(), bucket, key, withChecksumMode)
+	require.NoError(t, err)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, content, body2)
+	require.Equal(t, proxy.XCacheHit, resp2.Header.Get(proxy.XCacheHeader))
+	require.Equal(t, checksum, resp2.Header.Get("X-Amz-Checksum-Crc32c"))
+	require.Equal(t, int32(2), env.GetUpstreamRequestCount())
 }
 
 func TestTransparentAuth_DifferentKeyProbeDenialIsReturned(t *testing.T) {

@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+
+	"github.com/tigrisdata/tag/cache"
 )
 
 func TestParseBucketKey(t *testing.T) {
@@ -233,6 +235,24 @@ func TestIsCacheEligiblePresignedRequest(t *testing.T) {
 			want:   true,
 		},
 		{
+			name:   "GET with checksum mode",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Checksum-Mode=ENABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260715T080000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc&x-id=GetObject",
+			want:   true,
+		},
+		{
+			name:   "HEAD with checksum mode",
+			method: http.MethodHead,
+			target: "/bucket/key?X-Amz-Checksum-Mode=ENABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			want:   false,
+		},
+		{
+			name:   "invalid checksum mode",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Checksum-Mode=DISABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			want:   false,
+		},
+		{
 			name:   "semantic query",
 			method: http.MethodGet,
 			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&response-content-type=text%2Fplain",
@@ -315,6 +335,39 @@ func TestIsCacheEligiblePresignedRequest(t *testing.T) {
 				t.Errorf("isCacheEligiblePresignedRequest() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCachedMetaSatisfiesChecksumRequest(t *testing.T) {
+	checksumRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/bucket/key?X-Amz-Checksum-Mode=ENABLED",
+		nil,
+	)
+	plainRequest := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	withoutChecksum := &cache.CachedObjectMeta{ETag: `"etag"`}
+	withChecksum := &cache.CachedObjectMeta{
+		ETag: `"etag"`,
+		ChecksumHeaders: map[string]string{
+			"x-amz-checksum-crc32c": "checksum-value",
+		},
+	}
+	fetchedWithChecksumMode := &cache.CachedObjectMeta{
+		ETag:         `"etag"`,
+		ChecksumMode: true,
+	}
+
+	if cachedMetaSatisfiesRequest(checksumRequest, withoutChecksum) {
+		t.Error("checksum request accepted cached metadata without a checksum")
+	}
+	if !cachedMetaSatisfiesRequest(checksumRequest, withChecksum) {
+		t.Error("checksum request rejected cached metadata with a checksum")
+	}
+	if !cachedMetaSatisfiesRequest(checksumRequest, fetchedWithChecksumMode) {
+		t.Error("checksum request rejected metadata fetched in checksum mode")
+	}
+	if !cachedMetaSatisfiesRequest(plainRequest, withoutChecksum) {
+		t.Error("plain request rejected otherwise valid cached metadata")
 	}
 }
 
