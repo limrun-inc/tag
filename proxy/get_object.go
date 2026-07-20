@@ -124,7 +124,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 		if err != nil {
 			status = "error"
 		}
-		metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 		return err
 	}
 
@@ -142,7 +142,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 		!bypassCache &&
 		s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
-		if cacheErr == nil && found && meta != nil {
+		if cacheErr == nil &&
+			found &&
+			cachedMetaSatisfiesRequest(r, meta) {
 			handled, authorizeErr := s.authorizePresignedAndServeCached(
 				ctx,
 				w,
@@ -162,7 +164,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 
 	if (result == AuthValidated || isAnonymous) && !bypassCache && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
-		cacheHit := cacheErr == nil && found && meta != nil
+		cacheHit := cacheErr == nil && found && cachedMetaSatisfiesRequest(r, meta)
 		// Anonymous requests can only be served from cache if the object's ACL allows it
 		if cacheHit && isAnonymous && !meta.IsPublicRead() {
 			cacheHit = false
@@ -357,7 +359,7 @@ func (s *Service) authorizePresignedAndServeCached(
 		w.WriteHeader(resp.StatusCode)
 		n, copyErr := io.Copy(w, resp.Body)
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-		metrics.RecordRequest("GetObject", "auth_error", time.Since(start).Seconds())
+		metrics.RecordRequest("GetObject", "auth_error", metrics.SourceUpstream, time.Since(start).Seconds())
 		return true, copyErr
 	}
 
@@ -547,7 +549,7 @@ func (s *Service) streamFromUpstream(
 		// Reserve against the memory budget by the object's actual size (capped at
 		// the buffer ceiling), so small objects don't each reserve the worst case.
 		weight := s.populateWeight(resp.ContentLength)
-		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, expected)
+		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, expected, requestsChecksumMode(r))
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,

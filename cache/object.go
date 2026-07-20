@@ -44,6 +44,8 @@ type CachedObjectMeta struct {
 	VersionID            string            `json:"version_id,omitempty"`             // x-amz-version-id
 	PartsCount           string            `json:"parts_count,omitempty"`            // x-amz-mp-parts-count
 	UserMetadata         map[string]string `json:"user_metadata,omitempty"`          // x-amz-meta-*
+	ChecksumHeaders      map[string]string `json:"checksum_headers,omitempty"`       // x-amz-checksum-*
+	ChecksumMode         bool              `json:"checksum_mode,omitempty"`          // Fetched with X-Amz-Checksum-Mode=ENABLED
 	StatusCode           int               `json:"status_code"`                      // Original HTTP status (200, etc.)
 	// BodyUpstream marks a tiered-mode entry whose body lives upstream (the large
 	// tier): this metadata is authoritative for existence, HEAD, and conditionals,
@@ -110,6 +112,7 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 		VersionID:            headers.Get("x-amz-version-id"),
 		PartsCount:           headers.Get("x-amz-mp-parts-count"),
 		UserMetadata:         make(map[string]string),
+		ChecksumHeaders:      make(map[string]string),
 	}
 
 	// Parse Content-Length. Absent means UNKNOWN (a chunked upstream
@@ -136,6 +139,9 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 		lk := strings.ToLower(k)
 		if strings.HasPrefix(lk, "x-amz-meta-") && len(v) > 0 {
 			meta.UserMetadata[lk] = v[0]
+		}
+		if strings.HasPrefix(lk, "x-amz-checksum-") && len(v) > 0 {
+			meta.ChecksumHeaders[lk] = v[0]
 		}
 	}
 
@@ -216,6 +222,9 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 		// casing turns the user's key "meta1" into "Meta1" on the client.
 		lk := strings.ToLower(k)
 		w.Header()[lk] = []string{v}
+	}
+	for k, v := range m.ChecksumHeaders {
+		w.Header().Set(strings.ToLower(k), v)
 	}
 
 	// Apply options (may override headers like Content-Length for range responses)
