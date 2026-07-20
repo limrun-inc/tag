@@ -919,6 +919,13 @@ func isCacheEligiblePresignedRequest(r *http.Request) bool {
 }
 
 func hasUnsupportedPresignedHeaders(r *http.Request) bool {
+	if authInfo, err := auth.ParseAuthInfo(r); err == nil {
+		for _, header := range authInfo.SignedHeaders {
+			if strings.EqualFold(header, "range") {
+				return true
+			}
+		}
+	}
 	if r.Header.Get("Origin") != "" {
 		return true
 	}
