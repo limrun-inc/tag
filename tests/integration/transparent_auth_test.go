@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -158,19 +159,28 @@ func TestTransparentAuth_PresignedURLWithProxyCredentialsHitsCache(t *testing.T)
 	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
 }
 
-func TestTransparentAuth_PresignedURLWithoutSigningKeysHitsCache(t *testing.T) {
-	content := []byte("authoritative presigned capability content")
+func TestTransparentAuth_DifferentKeyAuthorizesCachedObjectUpstream(t *testing.T) {
+	content := []byte("upstream-authorized cached content")
+	var probeCount int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"upstream-authorized-etag"`)
+		if r.Header.Get("Range") == "bytes=0-0" {
+			atomic.AddInt32(&probeCount, 1)
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(content[:1])
+			return
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
-		w.Header().Set("ETag", `"presigned-capability-etag"`)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(content)
 	})
 	env := NewTestEnvironmentWithTransparentAuth(t, handler)
 	defer env.Close()
 
-	bucket := "different-credential-bucket"
+	bucket := "different-key-bucket"
 	key := "object.bin"
 
 	req1, err := env.PresignedGetRequest(t.Context(), bucket, key)
@@ -194,7 +204,130 @@ func TestTransparentAuth_PresignedURLWithoutSigningKeysHitsCache(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, content, body2)
 	require.Equal(t, proxy.XCacheHit, resp2.Header.Get(proxy.XCacheHeader))
-	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
+	require.Equal(t, int32(2), env.GetUpstreamRequestCount(), "second request should use one-byte auth probe")
+	require.Equal(t, int32(1), atomic.LoadInt32(&probeCount))
+}
+
+func TestTransparentAuth_DifferentKeyProbeDenialIsReturned(t *testing.T) {
+	content := []byte("private cached content")
+	var denyProbe int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-0" && atomic.LoadInt32(&denyProbe) == 1 {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("<Error><Code>AccessDenied</Code></Error>"))
+			return
+		}
+		w.Header().Set("ETag", `"private-etag"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	env := NewTestEnvironmentWithTransparentAuth(t, handler)
+	defer env.Close()
+
+	bucket := "denied-key-bucket"
+	key := "object.bin"
+	req1, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp1.Body)
+	resp1.Body.Close()
+	require.NoError(t, err)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	atomic.StoreInt32(&denyProbe, 1)
+	req2, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusForbidden, resp2.StatusCode)
+	require.Equal(t, proxy.XCacheMiss, resp2.Header.Get(proxy.XCacheHeader))
+	require.Contains(t, string(body2), "AccessDenied")
+	require.Equal(t, int32(2), env.GetUpstreamRequestCount())
+}
+
+func TestTransparentAuth_DifferentKeyZeroByteObject(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"zero-byte-etag"`)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+	})
+	env := NewTestEnvironmentWithTransparentAuth(t, handler)
+	defer env.Close()
+
+	bucket := "zero-byte-bucket"
+	key := "empty.bin"
+	req1, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	resp1.Body.Close()
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	req2, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	require.NoError(t, err)
+	require.Empty(t, body2)
+	require.Equal(t, proxy.XCacheHit, resp2.Header.Get(proxy.XCacheHeader))
+	require.Equal(t, int32(2), env.GetUpstreamRequestCount())
+}
+
+func TestTransparentAuth_DifferentKeyProbe416RefetchesFullObject(t *testing.T) {
+	var objectBecameEmpty int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-0" && atomic.LoadInt32(&objectBecameEmpty) == 1 {
+			w.Header().Set("Content-Range", "bytes */0")
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if atomic.LoadInt32(&objectBecameEmpty) == 1 {
+			w.Header().Set("ETag", `"empty-etag"`)
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		content := []byte("old nonempty content")
+		w.Header().Set("ETag", `"old-etag"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	env := NewTestEnvironmentWithTransparentAuth(t, handler)
+	defer env.Close()
+
+	bucket := "range-416-bucket"
+	key := "object.bin"
+	req1, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp1.Body)
+	resp1.Body.Close()
+	require.NoError(t, err)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	atomic.StoreInt32(&objectBecameEmpty, 1)
+	req2, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	require.Empty(t, body2)
+	require.Equal(t, proxy.XCacheMiss, resp2.Header.Get(proxy.XCacheHeader))
+	require.Equal(t, int32(3), env.GetUpstreamRequestCount())
 }
 
 func TestTransparentAuth_PresignedSemanticQueryBypassesCache(t *testing.T) {
