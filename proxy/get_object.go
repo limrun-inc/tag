@@ -382,8 +382,10 @@ func (s *Service) fetchAndBroadcast(
 	start time.Time,
 	xCache string,
 ) error {
-	// Subscribe ourselves as the first listener
-	listener := broadcaster.Subscribe()
+	// The client that initiated this upstream fetch is required: if upstream
+	// outruns it, apply backpressure rather than truncating its response. Other
+	// coalesced clients remain optional and may be dropped when they lag.
+	listener := broadcaster.SubscribeRequired()
 
 	// Start the upstream fetch in a goroutine
 	go func() {

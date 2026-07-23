@@ -21,6 +21,8 @@ import (
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/handlers"
 	"github.com/tigrisdata/tag/proxy"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // Build-time variables set via ldflags.
@@ -36,7 +38,21 @@ const (
 
 	// Shutdown timeout for graceful shutdown
 	shutdownTimeout = 30 * time.Second
+
+	// OCache clients send idle keepalive pings every 30 seconds. grpc-go's
+	// default server policy rejects those pings and eventually closes healthy
+	// peer connections with ENHANCE_YOUR_CALM: too_many_pings.
+	cacheGRPCKeepaliveMinTime = 30 * time.Second
 )
+
+func cacheGRPCServerOptions() []grpc.ServerOption {
+	return []grpc.ServerOption{
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             cacheGRPCKeepaliveMinTime,
+			PermitWithoutStream: true,
+		}),
+	}
+}
 
 func main() {
 	// Parse command line flags
@@ -217,14 +233,15 @@ func main() {
 			Msg("Initializing embedded cache")
 
 		embeddedCfg := &embedded.Config{
-			DiskPath:      cfg.Cache.DiskPath,
-			TTL:           cfg.Cache.TTL,
-			MaxDiskUsage:  cfg.Cache.MaxDiskUsageBytes,
-			NodeID:        cfg.Cache.NodeID,
-			ClusterAddr:   cfg.Cache.ClusterAddr,
-			GRPCAddr:      cfg.Cache.GRPCAddr,
-			AdvertiseAddr: cfg.Cache.AdvertiseAddr,
-			SeedNodes:     cfg.Cache.SeedNodes,
+			DiskPath:          cfg.Cache.DiskPath,
+			TTL:               cfg.Cache.TTL,
+			MaxDiskUsage:      cfg.Cache.MaxDiskUsageBytes,
+			NodeID:            cfg.Cache.NodeID,
+			ClusterAddr:       cfg.Cache.ClusterAddr,
+			GRPCAddr:          cfg.Cache.GRPCAddr,
+			AdvertiseAddr:     cfg.Cache.AdvertiseAddr,
+			SeedNodes:         cfg.Cache.SeedNodes,
+			GRPCServerOptions: cacheGRPCServerOptions(),
 		}
 
 		// Advanced storage tuning. Defaults are applied by config.applyDefaults;
@@ -243,7 +260,7 @@ func main() {
 				log.Fatal().Msg("Cache gRPC auth requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (set TAG_CACHE_GRPC_AUTH=false to disable)")
 			}
 			grpcToken := auth.DeriveGRPCAuthToken(accessKey, secretKey)
-			embeddedCfg.GRPCServerOptions = auth.GRPCServerOptions(grpcToken)
+			embeddedCfg.GRPCServerOptions = append(embeddedCfg.GRPCServerOptions, auth.GRPCServerOptions(grpcToken)...)
 			embeddedCfg.GRPCDialOptions = auth.GRPCDialOptions(grpcToken)
 			log.Info().Msg("Cache gRPC auth enabled")
 		}

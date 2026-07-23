@@ -92,6 +92,7 @@ type Listener struct {
 	status       int
 	headerCh     chan struct{} // Closed when headers are available
 	disconnected bool          // True if disconnected due to slow consumption
+	required     bool          // Apply backpressure instead of disconnecting
 }
 
 // WaitForHeaders blocks until headers are available.
@@ -158,6 +159,18 @@ func (b *Broadcaster) IsStreaming() bool {
 // Subscribe adds a new listener to receive chunks.
 // Returns nil if streaming has already started (no late joiners).
 func (b *Broadcaster) Subscribe() *Listener {
+	return b.subscribe(false)
+}
+
+// SubscribeRequired adds a listener that must receive every chunk. When its
+// buffer fills, Broadcast applies backpressure rather than truncating the
+// response. Use this for the primary client that initiated the upstream fetch;
+// coalesced clients should use Subscribe so one slow peer cannot stall everyone.
+func (b *Broadcaster) SubscribeRequired() *Listener {
+	return b.subscribe(true)
+}
+
+func (b *Broadcaster) subscribe(required bool) *Listener {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -169,6 +182,7 @@ func (b *Broadcaster) Subscribe() *Listener {
 	l := &Listener{
 		ch:       make(chan Chunk, b.channelBuf),
 		headerCh: make(chan struct{}),
+		required: required,
 	}
 
 	// If headers already set, copy them and close headerCh
@@ -228,6 +242,16 @@ func (b *Broadcaster) Broadcast(data []byte) {
 
 		chunk := Chunk{Data: GetChunkBuf(len(data))}
 		copy(chunk.Data, data)
+
+		if l.required {
+			// The primary fetcher's response must never be truncated merely
+			// because upstream is faster than the client. Its consumer drains
+			// the channel after cancellation, so this also unblocks promptly
+			// when the client goes away.
+			l.ch <- chunk
+			activeListeners = append(activeListeners, l)
+			continue
+		}
 
 		// Non-blocking send - disconnect immediately if buffer is full
 		select {
