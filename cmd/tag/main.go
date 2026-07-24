@@ -52,10 +52,14 @@ const (
 
 func cacheGRPCServerOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             cacheGRPCKeepaliveMinTime,
-			PermitWithoutStream: true,
-		}),
+		grpc.KeepaliveEnforcementPolicy(cacheGRPCKeepalivePolicy()),
+	}
+}
+
+func cacheGRPCKeepalivePolicy() keepalive.EnforcementPolicy {
+	return keepalive.EnforcementPolicy{
+		MinTime:             cacheGRPCKeepaliveMinTime,
+		PermitWithoutStream: true,
 	}
 }
 
