@@ -727,7 +727,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	}
 
 	if auth.IsPresignedRequest(r) && !isCacheEligiblePresignedRequest(r) {
-		w.Header().Set(XCacheHeader, XCacheBypass)
+		writeCacheStatus(w, XCacheBypass)
 		err = s.forwarder.Forward(ctx, w, r)
 		status := "success"
 		if err != nil {

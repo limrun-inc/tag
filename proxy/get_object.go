@@ -115,7 +115,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	}
 
 	if auth.IsPresignedRequest(r) && !isCacheEligiblePresignedRequest(r) {
-		w.Header().Set(XCacheHeader, XCacheBypass)
+		writeCacheStatus(w, XCacheBypass)
 		err = s.forwarder.Forward(ctx, w, r)
 		status := "success"
 		if err != nil {
@@ -364,7 +364,7 @@ func (s *Service) authorizePresignedAndServeCached(
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		copyHeaders(w.Header(), resp.Header)
-		w.Header().Set(XCacheHeader, XCacheMiss)
+		writeCacheStatus(w, XCacheMiss)
 		w.WriteHeader(resp.StatusCode)
 		n, copyErr := io.Copy(w, resp.Body)
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
@@ -378,7 +378,9 @@ func (s *Service) authorizePresignedAndServeCached(
 	}
 
 	if err := s.serveFromCache(ctx, w, bucket, key, meta, start); err != nil {
-		s.cache.Delete(context.Background(), bucket, key)
+		if bodyGone(err) {
+			s.cache.Delete(context.Background(), bucket, key)
+		}
 		return false, nil
 	}
 	return true, nil
