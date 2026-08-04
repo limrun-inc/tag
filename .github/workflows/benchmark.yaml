@@ -2,9 +2,30 @@ name: Warp Benchmarks
 
 on:
   workflow_dispatch:
+    inputs:
+      cache_mode:
+        description: "Cache mode to benchmark"
+        type: choice
+        options:
+          - default # whole-object caching (default path)
+          - blocks # block-aligned caching (RFC 0001)
+        default: default
+      block_size:
+        description: "Block size in bytes for blocks mode (empty = 4 MiB default). e.g. 65536 to match the 64 KiB GET RANGE size."
+        type: string
+        default: ""
   workflow_call:
+    inputs:
+      cache_mode:
+        description: "Cache mode to benchmark: default | blocks"
+        type: string
+        default: default
+      block_size:
+        description: "Block size in bytes for blocks mode (empty = 4 MiB default)"
+        type: string
+        default: ""
   schedule:
-    # Nightly at 07:00 UTC
+    # Nightly at 07:00 UTC (runs the default-mode benchmark)
     - cron: "0 7 * * *"
 
 env:
@@ -34,10 +55,18 @@ jobs:
       - name: Install system dependencies
         run: make install-deps
 
+      # cache_mode='blocks' enables block-aligned caching. block_size tunes the granularity: empty
+      # uses the 4 MiB production default, but warp GET RANGE reads 64 KiB ranges from 256 MiB
+      # objects (the SlateDB pattern), so at 4 MiB blocks each 64 KiB read pulls a full 4 MiB block
+      # (~64x read amplification). Pass block_size=65536 to size blocks to the range (1:1, no
+      # amplification) and measure where block caching actually wins. Anything else (default, or the
+      # empty cache_mode on scheduled/push runs) uses the whole-object path.
       - name: Start TAG (local mode)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TAG_CACHE_BLOCK_CACHING_ENABLED: ${{ inputs.cache_mode == 'blocks' && 'true' || 'false' }}
+          TAG_CACHE_BLOCK_SIZE: ${{ inputs.block_size }}
         run: make s3-test-local
 
       - name: Run warp benchmarks

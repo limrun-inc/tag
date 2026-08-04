@@ -18,7 +18,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
 | `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
-| `TAG_CACHE_WRITE_THROUGH_MAX_SIZE` | Max object size (bytes) cached via the write-through tee, which buffers the body in memory (only when `warm_on_write` is on; larger objects fall back to the streaming warm read-back; negative disables the tee; clamped to `size_threshold`) | `26214400` (25 MiB) |
+| `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `false`                  |
+| `TAG_CACHE_BLOCK_SIZE`             | Block granularity **and** the read-side whole-vs-block boundary (bytes): a read miss below this is whole-cached, at/above it is block-cached; must stay below ocache's 64 MB compaction threshold | `4194304` (4 MiB)        |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -154,13 +155,17 @@ cache:
   # negative disables. Override with TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION env var.
   warm_on_write_reserved_fraction: 0.5
 
-  # Max object size cached via the write-through tee. The tee buffers the whole object
-  # in memory while forwarding the PUT, so this is far smaller than size_threshold (which
-  # only decides overall cacheability on the streaming paths). Larger-but-cacheable objects
-  # fall back to the streaming warm-on-write read-back. Only applied when warm_on_write is
-  # true. 0/unset = default, negative disables the tee, clamped to size_threshold. Override
-  # with TAG_CACHE_WRITE_THROUGH_MAX_SIZE env var.
-  write_through_max_size: 26214400
+  # Block-aligned caching for large objects (RFC 0001). When enabled, any object at or above
+  # block_size is cached at block granularity regardless of how it was fetched (range read,
+  # full GET, or warm-on-write), so a range read populates and serves only the blocks it
+  # touches. Off by default (opt-in rollout).
+  block_caching_enabled: false
+
+  # Block granularity AND the whole-vs-block boundary for every populate path: an object
+  # smaller than one block is whole-cached, one this size or larger is block-cached. Must stay
+  # below ocache's 64 MB compaction threshold so blocks pack into shared segments. 0/unset =
+  # default. Override with TAG_CACHE_BLOCK_SIZE env var.
+  block_size: 4194304
 
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
@@ -332,7 +337,8 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `enabled`               | bool     | `true`           | Enable caching                                                                      |
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
-| `write_through_max_size` | int64   | `26214400`       | Max object size cached via the write-through tee (buffers in memory; negative disables; clamped to `size_threshold`) |
+| `block_caching_enabled` | bool     | `false`          | Enable block-aligned caching for large objects (RFC 0001)                           |
+| `block_size`            | int64    | `4194304`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |

@@ -492,19 +492,19 @@ func TestLoad_WarmOnWriteReservedFractionOverrideAndClamp(t *testing.T) {
 	}
 }
 
-func TestLoad_WriteThroughMaxSizeDefaultOverrideAndClamp(t *testing.T) {
+func TestLoad_BlockSizeDefaultAndOverride(t *testing.T) {
 	cases := []struct {
 		name string
 		yaml string
 		env  string
 		want int64
 	}{
-		{"default", "cache:\n  enabled: true\n", "", DefaultCacheWriteThroughMaxSize},
-		{"env override honored", "cache:\n  enabled: true\n", "8388608", 8388608}, // 8 MiB
-		{"negative disables the tee", "cache:\n  enabled: true\n", "-1", -1},
-		// WT default (25 MiB) exceeds a 1 MiB size_threshold, so it clamps down: a tee'd
-		// object must be cacheable.
-		{"clamped to size_threshold", "cache:\n  enabled: true\n  size_threshold: 1048576\n", "", 1048576},
+		{"default", "cache:\n  enabled: true\n", "", DefaultCacheBlockSize},
+		{"env override honored", "cache:\n  enabled: true\n", "1048576", 1048576}, // 1 MiB
+		{"non-positive env ignored", "cache:\n  enabled: true\n", "-1", DefaultCacheBlockSize},
+		// A negative block_size must never reach block arithmetic (it is a divisor): it
+		// falls back to the default rather than passing through.
+		{"negative yaml defaults", "cache:\n  enabled: true\n  block_size: -4096\n", "", DefaultCacheBlockSize},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -513,14 +513,48 @@ func TestLoad_WriteThroughMaxSizeDefaultOverrideAndClamp(t *testing.T) {
 				t.Fatalf("Failed to create temp file: %v", err)
 			}
 			if tc.env != "" {
-				t.Setenv("TAG_CACHE_WRITE_THROUGH_MAX_SIZE", tc.env)
+				t.Setenv("TAG_CACHE_BLOCK_SIZE", tc.env)
 			}
 			cfg, err := Load(tmpFile)
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			if cfg.Cache.WriteThroughMaxSize != tc.want {
-				t.Errorf("WriteThroughMaxSize = %d, want %d", cfg.Cache.WriteThroughMaxSize, tc.want)
+			if cfg.Cache.BlockSize != tc.want {
+				t.Errorf("BlockSize = %d, want %d", cfg.Cache.BlockSize, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_BlockCachingEnabledOverrideByEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		env  string
+		want bool
+	}{
+		{"default off", "cache:\n  enabled: true\n", "", false},
+		{"yaml on", "cache:\n  enabled: true\n  block_caching_enabled: true\n", "", true},
+		{"env enables", "cache:\n  enabled: true\n", "true", true},
+		{"env disables over yaml", "cache:\n  enabled: true\n  block_caching_enabled: true\n", "false", false},
+		// An unparseable value is ignored (ParseBool errors), leaving the yaml value intact.
+		{"invalid env keeps yaml", "cache:\n  enabled: true\n  block_caching_enabled: true\n", "notabool", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_BLOCK_CACHING_ENABLED", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.BlockCachingEnabled != tc.want {
+				t.Errorf("BlockCachingEnabled = %v, want %v", cfg.Cache.BlockCachingEnabled, tc.want)
 			}
 		})
 	}

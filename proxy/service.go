@@ -14,6 +14,7 @@ import (
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -70,6 +71,7 @@ type Service struct {
 	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
 	broadcastManager        *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
+	blockFetch              singleflight.Group // Coalesce concurrent fetches of the same block (RFC 0001)
 }
 
 // NewService creates a new proxy service.
@@ -766,31 +768,39 @@ func isAnonymousRequest(r *http.Request, result AuthResult, authErr error) bool 
 	return authErr == nil && result == AuthNotValidated && hasNoAuthCredentials(r)
 }
 
-// extractTotalSizeFromContentRange extracts total size from Content-Range header.
-// Header format: "bytes start-end/total" (e.g., "bytes 0-499/1234")
-// Returns 0 if header is missing or malformed.
-func extractTotalSizeFromContentRange(contentRange string) int64 {
+// parseContentRange parses a "bytes START-END/TOTAL" Content-Range header. total is the object
+// size (0 if the header is absent, the total is "*", or it is unparseable — total extraction is
+// prefix-independent to preserve historical behavior). hasBounds is true only when the "bytes "
+// prefix and numeric START-END are present and parsed, so the unsatisfied-range form
+// "bytes */TOTAL" yields total>0 with hasBounds=false.
+func parseContentRange(contentRange string) (start, end, total int64, hasBounds bool) {
 	if contentRange == "" {
-		return 0
+		return 0, 0, 0, false
 	}
-
-	// Find the slash separator
 	slashIdx := strings.LastIndex(contentRange, "/")
 	if slashIdx == -1 {
-		return 0
+		return 0, 0, 0, false
 	}
-
-	totalStr := contentRange[slashIdx+1:]
-	if totalStr == "*" {
-		// Unknown total size
-		return 0
+	if totalStr := contentRange[slashIdx+1:]; totalStr != "*" {
+		if t, err := strconv.ParseInt(totalStr, 10, 64); err == nil {
+			total = t
+		}
 	}
-
-	total, err := strconv.ParseInt(totalStr, 10, 64)
-	if err != nil {
-		return 0
+	const prefix = "bytes "
+	if !strings.HasPrefix(contentRange, prefix) {
+		return 0, 0, total, false
 	}
-	return total
+	rangePart := contentRange[len(prefix):slashIdx] // "START-END" or "*"
+	dashIdx := strings.IndexByte(rangePart, '-')
+	if dashIdx == -1 {
+		return 0, 0, total, false
+	}
+	s, err1 := strconv.ParseInt(rangePart[:dashIdx], 10, 64)
+	e, err2 := strconv.ParseInt(rangePart[dashIdx+1:], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, total, false
+	}
+	return s, e, total, true
 }
 
 // GetRegion returns the configured upstream region.
