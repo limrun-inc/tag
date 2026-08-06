@@ -68,6 +68,7 @@ type Service struct {
 	config                  *config.Config
 	cacheSemaphore          chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
 	populateBudget          *byteBudget        // Byte budget bounding aggregate populate buffering (nil = unlimited)
+	serveStagingBudget      *byteBudget        // Byte budget bounding block-serve staging buffers (nil = unlimited)
 	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
 	broadcastManager        *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
@@ -98,6 +99,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	perPopulateCap := perPopulateBufferBytes(cfg)
 
 	var populateBudget *byteBudget
+	var serveStagingBudget *byteBudget
 	if cfg.Cache.MaxPopulateMemoryBytes > 0 {
 		// Reserve a share of the budget for warm-on-write only when it's enabled;
 		// otherwise there's no warm path to protect.
@@ -106,22 +108,40 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 			reserveFraction = cfg.Cache.WarmOnWriteReservedFraction
 		}
 		populateBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, reserveFraction, perPopulateCap)
+		// Block-serve staging buffers (pre-commit range/first-block assembly, the
+		// streaming pipeline's double buffers) get their OWN budget of the same size,
+		// never the populate budget: a warm multi-block serve holds its staging bytes
+		// for the whole (possibly multi-second) response, and at high concurrency
+		// those long holds would crowd cold-miss populates out of a shared budget —
+		// objects get served but never cached, and the working set stays cold
+		// (measured as a ~3x warm-GET collapse). Staging memory is still bounded (by
+		// this budget — declines degrade the serve, never fail it); it just cannot
+		// starve populates. Warm-on-write reservation semantics don't apply here.
+		serveStagingBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, 0, perPopulateCap)
+	}
+
+	// The block buffer pool's retention cap must track the configured block size, or every
+	// block staging buffer in a larger-block deployment would be allocated fresh and dropped.
+	if bs := cfg.Cache.BlockSize; bs > maxPooledBlockBufBytes.Load() {
+		maxPooledBlockBufBytes.Store(bs)
 	}
 
 	log.Info().
 		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
 		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
 		Int64("per_populate_buffer_cap_bytes", perPopulateCap).
+		Int64("serve_staging_budget_bytes", cfg.Cache.MaxPopulateMemoryBytes).
 		Msg("Cache-populate limits configured")
 
 	return &Service{
-		forwarder:        forwarder,
-		cache:            cache,
-		config:           cfg,
-		cacheSemaphore:   cacheSem,
-		populateBudget:   populateBudget,
-		perPopulateCap:   perPopulateCap,
-		broadcastManager: broadcast.NewManager(channelBuf),
+		forwarder:          forwarder,
+		cache:              cache,
+		config:             cfg,
+		cacheSemaphore:     cacheSem,
+		populateBudget:     populateBudget,
+		serveStagingBudget: serveStagingBudget,
+		perPopulateCap:     perPopulateCap,
+		broadcastManager:   broadcast.NewManager(channelBuf),
 	}
 }
 
@@ -165,6 +185,24 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 		w = budget
 	}
 	return w
+}
+
+// stagingWeight is the byte weight a block-serve staging buffer reserves against the
+// serve-staging budget: the buffer's ACTUAL size, clamped only by the total budget (so a
+// buffer larger than the whole budget still serves one-at-a-time, mirroring populateWeight).
+// Unlike populateWeight it is NOT capped at perPopulateCap — that ceiling models the
+// broadcast pipeline's buffering, which has no relationship to raw block-sized staging
+// buffers; clamping to it would let the budget admit more bytes than are actually allocated
+// (e.g. two 64 MiB pipeline buffers reserved as one 80 MiB cap), silently breaking the very
+// bound the budget exists to enforce.
+func (s *Service) stagingWeight(n int64) int64 {
+	if n < 1 {
+		n = 1
+	}
+	if budget := s.config.Cache.MaxPopulateMemoryBytes; budget > 0 && n > budget {
+		n = budget
+	}
+	return n
 }
 
 // populatePriority classifies a cache-populate for admission against the byte

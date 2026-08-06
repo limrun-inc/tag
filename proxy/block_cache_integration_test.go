@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1150,5 +1151,677 @@ func TestBlockCache_ColdLargeRangeSkipsPopulate(t *testing.T) {
 	}
 	if after := mock.blockGets.Load(); after != before {
 		t.Errorf("cold large range fanned out into per-block fetches: %d -> %d", before, after)
+	}
+}
+
+// blockReadFaultClient wraps a CacheClient and, when armed, fails every block-key range read
+// with a transient error — simulating a cluster gRPC blip during a warm serve's block reads.
+type blockReadFaultClient struct {
+	cacheclient.CacheClient
+	fail atomic.Bool
+}
+
+func (p *blockReadFaultClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if p.fail.Load() && strings.HasPrefix(key, "blk|") {
+		return fmt.Errorf("simulated block read blip")
+	}
+	return p.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+// A warm range that spans a block boundary is assembled byte-exact from both blocks with no
+// upstream fetch (the probe-free assembled path).
+func TestBlockCache_AssembledRangeSpansBlockBoundary(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // 10 bytes → blocks [0..3][4..7][8..9]
+	svc, c := newBlockService(t, mock)
+
+	// Establish blocks 0 and 1 via a cold miss.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold miss")
+	}
+
+	// bytes=2-5 (len 4 = one block) covers blocks 0 and 1: assembled across the boundary.
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=2-5")); err != nil {
+		t.Fatalf("warm boundary range: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "CDEF" {
+		t.Fatalf("warm boundary range: code=%d body=%q, want 206 CDEF", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if after := mock.blockGets.Load(); after != before {
+		t.Errorf("warm boundary range fetched blocks upstream: %d -> %d", before, after)
+	}
+	if cr := w2.Header().Get("Content-Range"); cr != "bytes 2-5/10" {
+		t.Errorf("Content-Range=%q, want bytes 2-5/10", cr)
+	}
+}
+
+// A transient fetch failure for a block discovered missing during assembly falls through to
+// upstream BEFORE anything is committed: the client gets a clean 206 from the forward and the
+// still-valid entry is not invalidated.
+func TestBlockCache_AssembledRangeTransientFetchFallsThrough(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish only block 0.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// Block 1 is missing and its fetch fails transiently → clean upstream fall-through.
+	mock.blockGetTransient = true
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
+		t.Fatalf("range with failing block fetch: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "EFGH" {
+		t.Fatalf("fall-through: code=%d body=%q, want 206 EFGH", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheMiss {
+		t.Errorf("X-Cache=%q, want %q (upstream fall-through)", got, XCacheMiss)
+	}
+	// The entry survives: a transient failure never invalidates.
+	if m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || m.BlockSize != 4 {
+		t.Fatalf("entry lost after transient fetch failure: found=%v", found)
+	}
+}
+
+// A transient CACHE read failure during assembly (e.g. a cluster gRPC blip) aborts with
+// nothing committed — the client is served via the upstream fall-through and the still-valid
+// entry is not invalidated. Pins that a read error is treated as transient, never as a
+// missing block.
+func TestBlockCache_AssemblyCacheReadFailureFallsThroughWithoutInvalidating(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	faulty := &blockReadFaultClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(faulty, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Establish a block-mode entry with block 0 present.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// Arm block-read failures: the warm serve's assembly read fails → upstream fall-through.
+	faulty.fail.Store(true)
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("range with failing cache reads: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "ABCD" {
+		t.Fatalf("fall-through: code=%d body=%q, want 206 ABCD", w2.Code, w2.Body.String())
+	}
+	faulty.fail.Store(false)
+	if m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || m.BlockSize != 4 {
+		t.Fatalf("entry lost after transient cache read failure: found=%v", found)
+	}
+}
+
+// The probe-first path (full-object serves, oversized ranges) must surface a transient probe
+// failure as an error from ensureBlocksCached — never as "blocks missing". If failed probes
+// were counted as absent, the full-object caller's mostly-missing bail would fire and DELETE
+// a still-valid entry on a network blip.
+func TestBlockCache_ProbePathTransientFailureAbortsWithoutInvalidating(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	faulty := &blockReadFaultClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(faulty, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Establish a fully-populated block-mode entry (all three blocks + meta).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-9")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold miss")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+
+	faulty.fail.Store(true)
+	err := svc.ensureBlocksCached(context.Background(), wowBucket, wowKey, "ak", "sk", meta, 0, 2, true, 0)
+	if err == nil {
+		t.Fatal("ensureBlocksCached returned nil despite probe failures")
+	}
+	if errors.Is(err, errBlockAssemblyWouldAmplify) {
+		t.Fatal("transient probe failure misreported as amplify-bail (would delete a valid entry)")
+	}
+	if !strings.Contains(err.Error(), "simulated block read blip") {
+		t.Fatalf("ensureBlocksCached error = %v, want the injected read error", err)
+	}
+	if m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || m.BlockSize != 4 {
+		t.Fatalf("entry lost after transient probe failure: found=%v", found)
+	}
+}
+
+// A warm full GET over many blocks still serves byte-exact from cache via the probe-first
+// path (full-object serves are unchanged by the assembled-range path).
+func TestBlockCache_WarmFullGetManyBlocksServesFromCache(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes
+	mock := newBlockMock(object, `"v1"`)
+	svc, c := newBlockServiceWithBudget(t, mock, 2, 1<<20) // 2-byte blocks → 20 blocks
+
+	// Cold full GET: the miss path streams from upstream and block-splits into cache.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if w.Code != http.StatusOK || w.Body.String() != string(object) {
+		t.Fatalf("cold full GET: code=%d body=%q", w.Code, w.Body.String())
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold full GET")
+	}
+
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("warm full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != string(object) {
+		t.Fatalf("warm full GET: code=%d body=%q, want cache-assembled object", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if got := mock.blockGets.Load(); got != 0 {
+		t.Errorf("warm serve fetched %d blocks from upstream, want 0", got)
+	}
+}
+
+// With the populate budget saturated by other work, an assembled range whose missing-block
+// fetch declines falls through to a clean upstream forward — no truncation, no invalidation —
+// and serves from cache again once the budget frees. (The staging and populate budgets are
+// independent pools, so a decline means real global populate pressure; retrying via the probe
+// path would draw on the same budget and just repeat it.)
+func TestBlockCache_AssemblyFetchDeclineFallsThroughToUpstream(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockServiceWithBudget(t, mock, 4, 100)
+
+	// Establish only block 0.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// Saturate the populate budget so block 1's fetch declines.
+	if !svc.populateBudget.tryAcquireReadMiss(100) {
+		t.Fatal("could not saturate populate budget")
+	}
+
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
+		t.Fatalf("range under populate saturation: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "EFGH" {
+		t.Fatalf("range under saturation: code=%d body=%q, want 206 EFGH (upstream forward)", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got == XCacheHit {
+		t.Errorf("X-Cache=%q, want a non-HIT upstream forward under populate saturation", got)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+		t.Fatal("still-valid entry was invalidated by a budget decline")
+	}
+
+	// Budget freed: the fetch fits again and the range serves from cache.
+	svc.populateBudget.release(100)
+	w3 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w3, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
+		t.Fatalf("range after budget freed: %v", err)
+	}
+	if w3.Code != http.StatusPartialContent || w3.Body.String() != "EFGH" || w3.Header().Get("X-Cache") != XCacheHit {
+		t.Fatalf("after budget freed: code=%d body=%q x-cache=%q, want 206 EFGH HIT", w3.Code, w3.Body.String(), w3.Header().Get("X-Cache"))
+	}
+}
+
+// A full-stream split marks the entry BlocksComplete; a block evicted afterwards is recovered
+// by an inline fetch mid-serve — the client still gets the complete, byte-exact object.
+func TestBlockCache_CompleteEntryInlineFetchRecoversEvictedBlock(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // blocks [0..3][4..7][8..9]
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Cold full GET → block split → complete entry.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if !meta.BlocksComplete {
+		t.Fatal("entry from full-stream split not marked BlocksComplete")
+	}
+
+	// Evict block 1 out from under the complete entry.
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 1)); err != nil {
+		t.Fatalf("delete block 1: %v", err)
+	}
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("warm full GET with evicted block: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("inline-fetch serve: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if after := mock.blockGets.Load(); after != before+1 {
+		t.Errorf("inline fetches = %d, want exactly 1 (the evicted block)", after-before)
+	}
+}
+
+// A complete entry whose FIRST block is gone and unrecoverable (upstream failing) must fall
+// through pre-commit: the client gets a clean 200 from the miss path, never a truncated body.
+func TestBlockCache_CompleteEntryFirstBlockGoneFallsThroughCleanly(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 0)); err != nil {
+		t.Fatalf("delete block 0: %v", err)
+	}
+	mock.blockGetTransient = true // the pre-commit recovery fetch fails
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET with gone first block: %v", err)
+	}
+	// Served whole from the miss-path forward — a complete body, not a truncated one.
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("fall-through: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+}
+
+// An entry established from a range (not complete) is promoted to BlocksComplete after its
+// first successful full assembly, so later full GETs skip the probe pass.
+func TestBlockCache_PartialEntryPromotedAfterFullAssembly(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish blocks 0 and 1 via a cold range miss (block 2 missing → not complete).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.BlocksComplete {
+		t.Fatal("range-established entry unexpectedly marked complete")
+	}
+
+	// Full GET assembles (fetching block 2) and serves; the promotion lands asynchronously.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q", w2.Code, w2.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+		if found && m.BlocksComplete {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("entry not promoted to BlocksComplete after successful full assembly")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A definitive stale signal (upstream 404) surfacing from a mid-serve inline fetch must
+// invalidate the BlocksComplete entry even though headers are already committed — otherwise
+// every later full GET commits and truncates the same way until the meta TTL expires.
+func TestBlockCache_CompleteEntryMidServeStaleSignalInvalidates(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Complete entry via a cold full GET.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	// Evict block 1, then delete the object out of band: the mid-serve inline fetch 404s.
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 1)); err != nil {
+		t.Fatalf("delete block 1: %v", err)
+	}
+	mock.blockGet404 = true
+
+	w2 := httptest.NewRecorder()
+	err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey))
+	if err == nil {
+		t.Fatal("mid-serve stale fetch: want a (truncation) error, got nil")
+	}
+	// The stale entry must be gone so the next GET re-resolves upstream instead of
+	// repeating the truncation.
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Fatal("stale BlocksComplete entry survived a definitive mid-serve stale signal")
+	}
+}
+
+// A populate-budget decline for a block AFTER headers are committed must not truncate the
+// response: the serve salvages the remaining bytes with one uncached upstream range GET and
+// the still-valid entry survives (a transient decline is not a degenerate entry).
+func TestBlockCache_CompleteEntryFetchDeclineSalvagesViaRemainder(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	cfg.Cache.MaxPopulateMemoryBytes = 100
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Complete entry via a cold full GET.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	// Evict a MID-stream block and saturate the populate budget: the inline recovery fetch
+	// declines only after the 200 is committed.
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 1)); err != nil {
+		t.Fatalf("delete block 1: %v", err)
+	}
+	if !svc.populateBudget.tryAcquireReadMiss(100) {
+		t.Fatal("could not saturate populate budget")
+	}
+	defer svc.populateBudget.release(100)
+
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET under populate saturation: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("degraded serve: code=%d body=%q, want the COMPLETE object (no truncation)", w2.Code, w2.Body.String())
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+		t.Fatal("entry invalidated by a transient budget decline")
+	}
+}
+
+// A BlocksComplete meta surviving mass block eviction must not turn one full GET into N
+// serial upstream fetches: after maxInlineFetchesPerServe recoveries the serve switches to a
+// single uncached upstream remainder stream, and the degenerate entry is invalidated so the
+// next GET re-establishes it with one streaming re-split.
+func TestBlockCache_CompleteEntryMassEvictionBoundsUpstreamFanout(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes -> 20 2-byte blocks
+	mock := newBlockMock(object, `"v1"`)
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 2
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	// Mass-evict blocks 3..19 out from under the complete meta.
+	for i := int64(3); i <= 19; i++ {
+		if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 2, i)); err != nil {
+			t.Fatalf("delete block %d: %v", i, err)
+		}
+	}
+
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("degraded full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != string(object) {
+		t.Fatalf("degraded serve: code=%d body=%q, want the exact object", w2.Code, w2.Body.String())
+	}
+	// Bounded fan-out: at most the inline-fetch cap in aligned GETs plus ONE remainder GET —
+	// never one upstream round trip per missing block (17 here).
+	if got := mock.blockGets.Load() - before; int(got) > maxInlineFetchesPerServe+1 {
+		t.Errorf("degraded serve made %d upstream requests, want <= %d", got, maxInlineFetchesPerServe+1)
+	}
+	// The degenerate entry is invalidated so the next GET re-splits in one streaming fetch.
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Fatal("degenerate mass-evicted entry survived the degraded serve")
+	}
+}
+
+// Promotion must never extend an entry's lifetime: the rewritten meta carries only the
+// REMAINING TTL computed from CachedAt, and entries with unknown age (or already expired)
+// are not rewritten at all.
+func TestRemainingMetaTTL(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, _ := newBlockService(t, mock)
+	svc.config.Cache.TTL = time.Hour
+	now := time.Now().Unix()
+	cases := []struct {
+		name     string
+		cachedAt int64
+		min, max int
+	}{
+		{"fresh entry keeps ~full TTL", now, 3590, 3600},
+		{"aged entry keeps only the remainder", now - 3500, 90, 110},
+		{"expired entry is not rewritten", now - 4000, 0, 0},
+		{"unknown age is not rewritten", 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := svc.remainingMetaTTL(&cache.CachedObjectMeta{CachedAt: tc.cachedAt})
+			if got < tc.min || got > tc.max {
+				t.Errorf("remainingMetaTTL(age=%ds) = %d, want in [%d,%d]", now-tc.cachedAt, got, tc.min, tc.max)
+			}
+		})
+	}
+}
+
+// A warm multi-block serve whose pipeline buffer reservation the budget declines degrades to
+// the direct sequential stream and still serves byte-exact from cache — budget pressure slows
+// a warm serve down, it never surrenders it to upstream. Budget of 5: the complete path's
+// first-block reservation (2) leaves 3, so the pipeline's two-buffer reservation (4) declines.
+func TestBlockCache_PipelineBudgetDeclineDegradesToSequential(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
+	mock := newBlockMock(object, `"v1"`)
+	svc, c := newBlockServiceWithBudget(t, mock, 2, 5)
+
+	// Cold full GET: the populate reserves min(40, budget)=5 and releases before the meta lands.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold full GET")
+	}
+
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("warm full GET under budget pressure: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != string(object) {
+		t.Fatalf("warm full GET: code=%d body=%q, want the exact object", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if after := mock.blockGets.Load(); after != before {
+		t.Errorf("warm sequential serve fetched %d blocks from upstream, want 0", after-before)
+	}
+}
+
+// A warm range wider than one block takes the probe-first path and streams its covering blocks
+// through the pipeline; a block the probe found missing is fetched first, and the assembled 206
+// is byte-exact across all block boundaries.
+func TestBlockCache_WarmMultiBlockRangeServesPipelined(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // blocks [0..3][4..7][8..9]
+	svc, c := newBlockService(t, mock)
+
+	// Cold miss on bytes=0-7 populates blocks 0 and 1 (and the meta) in the background.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// bytes=0-9 (10 bytes > BlockSize 4) skips the assembled-range path: probe finds block 2
+	// missing, fetches it, then the three blocks stream pipelined.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=0-9")); err != nil {
+		t.Fatalf("warm multi-block range: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("multi-block range: code=%d body=%q, want 206 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
+		t.Error("block 2 not cached after the probe-path fetch")
+	}
+}
+
+// failAfterWriter fails every Write once `remaining` bytes have been accepted, simulating a
+// client that disconnects mid-body.
+type failAfterWriter struct {
+	http.ResponseWriter
+	remaining int
+}
+
+func (f *failAfterWriter) Write(p []byte) (int, error) {
+	if f.remaining <= 0 {
+		return 0, errors.New("client gone")
+	}
+	if len(p) > f.remaining {
+		p = p[:f.remaining]
+	}
+	n, err := f.ResponseWriter.Write(p)
+	f.remaining -= n
+	if err != nil {
+		return n, err
+	}
+	if f.remaining == 0 {
+		return n, errors.New("client gone")
+	}
+	return n, nil
+}
+
+// A client write failure mid-pipeline must unwind the prefetching reader promptly (returning
+// its in-flight buffer) instead of leaving it blocked on the handoff forever. The serve returns
+// without hanging; -race would flag an unsynchronized unwind.
+func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
+	mock := newBlockMock(object, `"v1"`)
+	svc, c := newBlockServiceWithBudget(t, mock, 2, 1<<20)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold full GET")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fw := &failAfterWriter{ResponseWriter: httptest.NewRecorder(), remaining: 9}
+		_ = svc.HandleGetObject(fw, fullGet(wowBucket, wowKey))
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after a mid-body client write failure (pipeline reader stuck?)")
+	}
+}
+
+// A client write failure on the SEQUENTIAL stream path (where cache bytes write straight
+// into the client connection) must not trigger the upstream remainder salvage: the client is
+// broken, not the cache, so retrying from upstream would waste a round trip on a dead
+// connection. Pins the clientWriteTracker classification.
+func TestBlockCache_SequentialClientWriteFailureDoesNotFetchRemainder(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
+	mock := newBlockMock(object, `"v1"`)
+	// Budget 5: the complete path's first-block reservation (2) leaves 3, so the pipeline's
+	// two-buffer reservation (4) declines and the stream takes the sequential path.
+	svc, c := newBlockServiceWithBudget(t, mock, 2, 5)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	before := mock.blockGets.Load()
+	fw := &failAfterWriter{ResponseWriter: httptest.NewRecorder(), remaining: 9}
+	_ = svc.HandleGetObject(fw, fullGet(wowBucket, wowKey))
+	if got := mock.blockGets.Load() - before; got != 0 {
+		t.Errorf("client write failure triggered %d upstream requests, want 0 (no remainder salvage)", got)
 	}
 }

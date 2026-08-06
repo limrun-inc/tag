@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -45,6 +46,27 @@ var errBlockUpstreamGone = errors.New("block upstream gone")
 // as "fall through to the miss path", not a real error.
 var errBlockAssemblyWouldAmplify = errors.New("block assembly would amplify")
 
+// maxInlineFetchesPerServe bounds how many absent blocks one COMMITTED block serve recovers via
+// individual aligned upstream fetches. BlocksComplete is a hint: blocks and meta evict/expire
+// independently, so a surviving meta over mass-evicted blocks would otherwise turn one full GET
+// into N serial upstream range GETs — the exact amplification bailIfMostlyMissing prevents on
+// the pre-commit probe path. Past this cap the serve switches to a single uncached upstream
+// remainder stream and the degenerate entry is invalidated.
+const maxInlineFetchesPerServe = 2
+
+// errBlockStreamDegraded marks a committed block serve that hit a block the cache can no longer
+// produce and an inline fetch could not (or should not) recover — but whose remaining bytes
+// upstream can still supply. streamBlockRange salvages the response with one uncached upstream
+// range GET for the remainder instead of truncating the committed body. Stale signals
+// (errBlockETagMismatch / errBlockUpstreamGone) are deliberately NEVER wrapped in it: a
+// different object version must not be mixed into an already-committed response.
+var errBlockStreamDegraded = errors.New("block stream degraded")
+
+// errBlocksMostlyAbsent wraps errBlockStreamDegraded when the inline-fetch cap was exhausted:
+// the entry has lost too many blocks to be worth keeping, so after the remainder salvage the
+// serve invalidates it and the next GET re-establishes it via a single streaming re-split.
+var errBlocksMostlyAbsent = fmt.Errorf("too many absent blocks: %w", errBlockStreamDegraded)
+
 // isBlockEligibleSize reports whether an object of the given content length is block-cached on
 // the read-miss path (RFC 0001): block caching is enabled and the object is at least one block
 // (BlockSize is the whole-vs-block boundary — a sub-block object is whole-cached, since blocking
@@ -76,6 +98,13 @@ func coveringBlocks(s, e, blockSize int64) (b0, bK int64) {
 	return s / blockSize, e / blockSize
 }
 
+// blockLocalRange returns the block-local byte bounds [localStart,localEnd] of the portion of
+// the object byte range [start,end] that falls inside block i (clamped to the object end).
+func blockLocalRange(i, start, end, blockSize, contentLength int64) (localStart, localEnd int64) {
+	bStart, bEnd := blockBounds(i, blockSize, contentLength)
+	return max(start, bStart) - bStart, min(end, bEnd) - bStart
+}
+
 // touchedBlocks returns the block indices a single-range request covers, or nil for a
 // malformed/empty/multi-range request (which is not block-populated).
 func touchedBlocks(rangeHeader string, totalSize, blockSize int64) []int64 {
@@ -92,8 +121,11 @@ func touchedBlocks(rangeHeader string, totalSize, blockSize int64) []int64 {
 }
 
 // serveRangeFromBlockCache serves a single-range request from a block-mode cache entry
-// (meta.BlockSize > 0). It probes the covering blocks, fetches any that are missing (from
-// upstream, coalesced), then streams the requested bytes assembled from those blocks.
+// (meta.BlockSize > 0). A range no longer than one block — the hot footer/row-group pattern —
+// is assembled probe-free into a pooled buffer (serveAssembledRange): each present block is
+// read exactly once, with the read itself acting as the existence check. Larger ranges (and
+// small ones the assembly-buffer budget declines) take the probe-first path: probe the
+// covering blocks, fetch any missing, then stream.
 //
 // It returns served=true when it has produced a complete client response (a 206 body, or a
 // definitive 416). It returns served=false, without having written anything to w, when the
@@ -117,6 +149,32 @@ func (s *Service) serveRangeFromBlockCache(
 		return true, nil
 	}
 	rng := ranges[0]
+
+	// Probe-free hot path: a range no longer than one block covers at most two blocks, so the
+	// requested bytes are assembled into a pooled buffer BEFORE anything is committed. Each
+	// present block is read exactly ONCE (the read doubles as the existence probe, halving
+	// warm-serve cache ops versus the probe-then-stream path below); a missing block is
+	// discovered by that same read and fetched pre-commit, so every failure still leaves the
+	// response unwritten for a clean upstream fall-through — identical semantics, fewer ops.
+	// The buffer (<= one block) is reserved against the serve-staging byte budget (NOT the
+	// populate budget — long-held serve buffers must not crowd out cold-miss populates — and
+	// NOT a cacheSemaphore count slot, which bounds concurrent cache WRITES and must not be
+	// held across a (possibly slow) client write). On budget decline, serve via the probe path.
+	// A fetch failure inside assembly (including a populate-budget decline) returns with the
+	// response untouched and the caller forwards upstream — the probe path's own fetch draws
+	// on the same populate budget, so retrying there could only repeat the outcome.
+	if rangeLen := rng.end - rng.start + 1; rangeLen <= meta.BlockSize {
+		weight := s.stagingWeight(rangeLen)
+		if s.serveStagingBudget == nil || s.serveStagingBudget.tryAcquireReadMiss(weight) {
+			assembled, aerr := s.serveAssembledRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime)
+			if s.serveStagingBudget != nil {
+				s.serveStagingBudget.release(weight)
+			}
+			return assembled, aerr
+		}
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Assembly buffer budget declined - serving range via probe path")
+	}
+
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
 
 	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent). Cap the
@@ -141,7 +199,7 @@ func (s *Service) serveRangeFromBlockCache(
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
 
-	if _, berr := s.streamBlockRange(ctx, w, bucket, key, meta, rng.start, rng.end); berr != nil {
+	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng.start, rng.end); berr != nil {
 		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
@@ -149,37 +207,442 @@ func (s *Service) serveRangeFromBlockCache(
 	return true, nil
 }
 
-// streamBlockRange streams object bytes [start,end] (inclusive) from a block-mode entry's
-// cached blocks, in order, into w. The caller must have committed the status line + headers and
-// ensured the covering blocks are present. On a block evicted mid-serve it returns a non-nil
-// error; headers are already sent so the caller cannot fall through (the client sees a truncated
-// body). Shared by the range and full-object serve paths.
-func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key string, meta *cache.CachedObjectMeta, start, end int64) (written int64, err error) {
-	b0, bK := coveringBlocks(start, end, meta.BlockSize)
-	cw := &countingWriter{w: w}
-	for i := b0; i <= bK; i++ {
-		bStart, bEnd := blockBounds(i, meta.BlockSize, meta.ContentLength)
-		localStart := max(start, bStart) - bStart
-		localEnd := min(end, bEnd) - bStart
-		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw); berr != nil {
-			if cw.written > 0 {
-				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-			}
-			log.Warn().Err(berr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block vanished mid-serve")
-			return cw.written, berr
-		}
-	}
-	if cw.written > 0 {
-		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	}
-	return cw.written, nil
+// sliceWriter writes into a fixed destination slice, failing on overflow. Used to land a
+// block's bytes at their exact offset in a pre-commit assembly buffer.
+type sliceWriter struct {
+	dst []byte
+	off int64
 }
 
-// serveFullObjectFromBlockCache serves a full-object GET from a block-mode entry by assembling
-// all of its blocks (fetching any missing), streaming them in order. It returns served=false,
-// without writing anything, when the blocks cannot be populated — the caller then falls through
-// to the miss path. A block-mode meta always has ContentLength >= BlockSize >= 1, so there is no
-// zero-byte case to handle here.
+func (sw *sliceWriter) Write(p []byte) (int, error) {
+	n := copy(sw.dst[sw.off:], p)
+	sw.off += int64(n)
+	if n < len(p) {
+		return n, io.ErrShortBuffer // more bytes than the requested block-local range
+	}
+	return n, nil
+}
+
+// maxPooledBlockBufBytes caps the capacity of block buffers the pool retains, so an entry
+// written under an unusually large historical block_size can't pin oversized buffers in the
+// pool forever. It starts at the 4 MiB default block size and is raised (monotonically —
+// services in one process share the pool) to the configured block_size at service
+// construction, so pooling isn't silently disabled for deployments with larger blocks.
+var maxPooledBlockBufBytes atomic.Int64
+
+func init() { maxPooledBlockBufBytes.Store(4 << 20) }
+
+// blockBufPool recycles block-sized scratch buffers: pre-commit range/first-block assembly on
+// the serve paths, and the block staging buffers on the populate paths (fetchOneBlock,
+// putBlocksFromStream). Buffers are handed out by capacity; a request larger than a pooled
+// buffer's capacity allocates fresh.
+var blockBufPool sync.Pool
+
+func getBlockBuf(n int64) *[]byte {
+	if v := blockBufPool.Get(); v != nil {
+		bp := v.(*[]byte)
+		if int64(cap(*bp)) >= n {
+			return bp
+		}
+		blockBufPool.Put(bp) // too small for this request; keep it for a smaller one
+	}
+	b := make([]byte, n)
+	return &b
+}
+
+func putBlockBuf(bp *[]byte) {
+	if int64(cap(*bp)) <= maxPooledBlockBufBytes.Load() {
+		blockBufPool.Put(bp)
+	}
+}
+
+// serveAssembledRange serves a single-range request (spanning at most two blocks) by
+// assembling the requested bytes from the entry's blocks into a pooled buffer before
+// committing anything. Present blocks are read exactly once — the read itself is the
+// existence check, there is no separate probe pass — and blocks the read reports absent are
+// fetched (coalesced, bounded) and re-read, all BEFORE headers are written. It returns
+// served=true only once the 206 is committed; any assembly failure returns served=false with
+// the response untouched, so the caller falls through to upstream exactly as the probe-first
+// path would. Block hit/miss and range-served metrics are recorded only on a committed
+// serve, and a definitive stale signal invalidates the entry — both matching
+// ensureBlocksCached.
+func (s *Service) serveAssembledRange(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key, accessKey, secretKey string,
+	meta *cache.CachedObjectMeta,
+	rng byteRange,
+	startTime time.Time,
+) (served bool, err error) {
+	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
+	rangeLen := rng.end - rng.start + 1
+	bufp := getBlockBuf(rangeLen)
+	defer putBlockBuf(bufp)
+	buf := (*bufp)[:rangeLen]
+
+	// Pass 1: read every covering block's slice of the range into place. ErrNotFound marks
+	// the block missing (exactly what the old probe detected). Any other error is transient —
+	// abort with nothing committed. A nil-error short read means the cache delivered fewer
+	// bytes than the in-bounds request, which a present block never legitimately does — also
+	// treated as transient rather than as a missing block.
+	var missing []int64
+	off := int64(0)
+	for i := b0; i <= bK; i++ {
+		localStart, localEnd := blockLocalRange(i, rng.start, rng.end, meta.BlockSize, meta.ContentLength)
+		n := localEnd - localStart + 1
+		sw := &sliceWriter{dst: buf[off : off+n]}
+		rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, sw)
+		switch {
+		case errors.Is(rerr, cache.ErrNotFound):
+			missing = append(missing, i)
+		case rerr != nil:
+			return false, rerr
+		case sw.off != n:
+			return false, fmt.Errorf("block %d assembly: short read %d of %d bytes", i, sw.off, n)
+		}
+		off += n
+	}
+
+	// Fetch whatever pass 1 found missing (coalesced across requests, bounded fan-out, stale
+	// signals prioritized over transient ones — a stale signal also invalidates the entry
+	// inside fetchBlocksToCache), then fill the gaps. Still pre-commit: a fetch or re-read
+	// failure falls through with the response untouched.
+	if len(missing) > 0 {
+		if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); ferr != nil {
+			return false, ferr
+		}
+		for _, i := range missing {
+			localStart, localEnd := blockLocalRange(i, rng.start, rng.end, meta.BlockSize, meta.ContentLength)
+			bStart, _ := blockBounds(i, meta.BlockSize, meta.ContentLength)
+			goff := bStart + localStart - rng.start
+			n := localEnd - localStart + 1
+			sw := &sliceWriter{dst: buf[goff : goff+n]}
+			rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, sw)
+			if rerr != nil || sw.off != n {
+				return false, fmt.Errorf("block %d assembly: fetched block unreadable (err=%v, %d of %d bytes)", i, rerr, sw.off, n)
+			}
+		}
+	}
+
+	// Committed serve: record hit/miss + serve metrics (only here, never on a fall-through),
+	// then write the response.
+	recordBlockServeMetrics(bK-b0+1, int64(len(missing)))
+	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(http.StatusPartialContent)
+	n, werr := w.Write(buf)
+	if n > 0 {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+	}
+	if werr != nil {
+		return true, werr
+	}
+	metrics.RecordRangeFromCacheHit()
+	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	return true, nil
+}
+
+// streamOutcome describes what a committed block-range stream actually did, so callers can
+// record hit/miss metrics from facts instead of assumptions.
+type streamOutcome struct {
+	fromCache int64 // block slices fully read from cache (no fetch needed)
+	fetched   int64 // blocks recovered via an inline upstream fetch-and-cache
+	remainder bool  // tail streamed from upstream in one uncached range GET (degraded serve)
+}
+
+// streamBlockRange streams object bytes [start,end] (inclusive) from a block-mode entry's
+// cached blocks, in order, into w. The caller must have committed the status line + headers.
+// A block the cache reports absent (evicted since the caller last saw it) is fetched from
+// upstream (coalesced, budget-gated) and re-read — but at most maxInlineFetchesPerServe times
+// per serve, since a meta surviving mass block eviction would otherwise turn one committed
+// serve into N serial upstream fetches. Past the cap, on a fetch decline, or on any transient
+// read failure, the serve is SALVAGED rather than truncated: the remaining bytes stream from
+// upstream in a single uncached range GET (streamRemainderFromUpstream), and a cap-tripped
+// (degenerate) entry is invalidated so the next GET re-establishes it with one streaming
+// re-split. Only stale signals (a different object version — never mixable into a committed
+// body), client write failures, and a failed remainder still truncate.
+//
+// Multi-block serves are PIPELINED: a reader goroutine prefetches block i+1 into a pooled
+// buffer while block i's bytes are being written to the client, so the cache read latency and
+// the client write latency overlap instead of adding up — the structural stall that made warm
+// multi-block GETs trail whole-object serves (whose single contiguous body never waits
+// per-block). The pipeline holds at most two block buffers (one draining to the client, one
+// filling), reserved against the serve-staging byte budget (never the populate budget — see
+// NewService); on decline — and for single-block serves, where there is nothing to overlap —
+// it degrades to the direct sequential path.
+func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (out streamOutcome, err error) {
+	cw := &countingWriter{w: w}
+	defer func() {
+		if cw.written > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+		}
+	}()
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+	if b0 == bK {
+		out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
+	} else if weight := s.stagingWeight(2 * meta.BlockSize); s.serveStagingBudget == nil || s.serveStagingBudget.tryAcquireReadMiss(weight) {
+		if s.serveStagingBudget != nil {
+			defer s.serveStagingBudget.release(weight)
+		}
+		out, err = s.streamBlockRangePipelined(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
+	} else {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pipeline buffer budget declined - streaming blocks sequentially")
+		out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
+	}
+	if err == nil {
+		return out, nil
+	}
+	if errors.Is(err, errBlockStreamDegraded) && ctx.Err() == nil && start+cw.written <= end {
+		// The committed response can still be completed byte-exact from upstream: cw.written
+		// counts exactly the bytes delivered so far (buffered blocks are written whole; a
+		// direct-streamed partial block advances it precisely), so the remainder picks up at
+		// start+cw.written. Cap-tripped entries are additionally invalidated — they have lost
+		// too many blocks to keep serving one recovery at a time.
+		absStart := start + cw.written
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Int64("from", absStart).Msg("Block serve degraded - streaming remainder from upstream uncached")
+		if rerr := s.streamRemainderFromUpstream(ctx, cw, bucket, key, accessKey, secretKey, meta, absStart, end); rerr != nil {
+			log.Warn().Err(rerr).Str("bucket", bucket).Str("key", key).Msg("Remainder stream failed - response truncated")
+			return out, rerr
+		}
+		if errors.Is(err, errBlocksMostlyAbsent) {
+			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		}
+		out.remainder = true
+		return out, nil
+	}
+	// Not salvageable: stale signal (version must not be mixed), client write failure, or the
+	// client is already gone. Route the noise accordingly — a disconnect is routine.
+	if ctx.Err() != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block stream aborted - client gone")
+	} else {
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block stream failed mid-serve")
+	}
+	return out, err
+}
+
+// streamBlockRangePipelined is streamBlockRange's overlapped core: an unbuffered channel
+// hands each prefetched block from the reader goroutine to the write loop, so exactly one
+// block is filling while one is draining (double buffering — two pooled buffers alive at
+// peak, which is what streamBlockRange reserved). Absent blocks are recovered by the reader
+// via readBlockSlice (bounded by the shared per-serve fetch cap) before the handoff; the
+// first reader error ends the stream in order, exactly where the sequential path would have
+// failed. The stop channel unwinds the reader (and returns its in-flight buffer) when the
+// write loop exits early on a client write error.
+func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (out streamOutcome, err error) {
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+	type blockRead struct {
+		bufp      *[]byte
+		n         int64
+		fetchedIt bool
+		err       error
+	}
+	results := make(chan blockRead)
+	stop := make(chan struct{})
+	go func() {
+		defer close(results)
+		fetchesLeft := int64(maxInlineFetchesPerServe)
+		for i := b0; i <= bK; i++ {
+			localStart, localEnd := blockLocalRange(i, start, end, meta.BlockSize, meta.ContentLength)
+			br := blockRead{n: localEnd - localStart + 1}
+			br.bufp = getBlockBuf(br.n)
+			br.fetchedIt, br.err = s.readBlockSlice(ctx, bucket, key, accessKey, secretKey, meta, i, localStart, localEnd, (*br.bufp)[:br.n], &fetchesLeft)
+			select {
+			case results <- br:
+			case <-stop:
+				putBlockBuf(br.bufp)
+				return
+			}
+			if br.err != nil {
+				return
+			}
+		}
+	}()
+	defer close(stop)
+	for br := range results {
+		if br.fetchedIt {
+			out.fetched++ // counted even when the post-fetch re-read failed: the miss happened
+		}
+		if br.err != nil {
+			putBlockBuf(br.bufp)
+			return out, br.err
+		}
+		if !br.fetchedIt {
+			out.fromCache++
+		}
+		_, werr := cw.Write((*br.bufp)[:br.n])
+		putBlockBuf(br.bufp)
+		if werr != nil {
+			return out, werr
+		}
+	}
+	return out, nil
+}
+
+// readBlockSlice reads block idx's local byte range [localStart,localEnd] into dst
+// (len(dst) == the range length). A block the cache reports absent is fetched from upstream
+// (coalesced, budget-gated) and re-read — dst is scratch, never client-visible, so the retry
+// can't duplicate bytes in the response the way a direct-to-client re-read could. A non-nil
+// fetchesLeft caps how many absent blocks the serve recovers this way (the shared per-serve
+// budget); nil means uncapped (the pre-commit first-block check, where a failure falls
+// through instead of truncating). A nil-error short read is reported as an error: a present
+// block never legitimately under-delivers an in-bounds range.
+//
+// Failures that upstream could still satisfy — cap exhausted, fetch declined or transiently
+// failed, unreadable after fetch, transient read error — are wrapped in errBlockStreamDegraded
+// so a committed caller can salvage the response with one uncached remainder stream. Stale
+// signals pass through unwrapped: a different version must never be mixed into a committed
+// body (fetchBlocksToCache has already invalidated the entry).
+func (s *Service) readBlockSlice(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, idx, localStart, localEnd int64, dst []byte, fetchesLeft *int64) (fetched bool, err error) {
+	read := func() error {
+		sw := &sliceWriter{dst: dst}
+		rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, localStart, localEnd, sw)
+		if rerr == nil && sw.off != int64(len(dst)) {
+			return fmt.Errorf("block %d stream: short read %d of %d bytes", idx, sw.off, len(dst))
+		}
+		return rerr
+	}
+	rerr := read()
+	switch {
+	case rerr == nil:
+		return false, nil
+	case errors.Is(rerr, cache.ErrNotFound):
+		if fetchesLeft != nil {
+			if *fetchesLeft <= 0 {
+				return false, errBlocksMostlyAbsent
+			}
+			*fetchesLeft--
+		}
+		if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{idx}); ferr != nil {
+			if errors.Is(ferr, errBlockETagMismatch) || errors.Is(ferr, errBlockUpstreamGone) {
+				return false, ferr
+			}
+			return false, fmt.Errorf("block %d inline fetch failed (%w): %w", idx, ferr, errBlockStreamDegraded)
+		}
+		if rerr = read(); rerr != nil {
+			return true, fmt.Errorf("block %d unreadable after fetch (%w): %w", idx, rerr, errBlockStreamDegraded)
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("block %d read failed (%w): %w", idx, rerr, errBlockStreamDegraded)
+	}
+}
+
+// clientWriteTracker distinguishes write-side failures from cache-read failures on the
+// sequential path, where cache bytes stream STRAIGHT into the client connection: an error
+// surfaced by GetBlockRangeStream could have originated on either side, and only cache-side
+// failures are salvageable by an upstream remainder stream — retrying a broken client write
+// from upstream would waste a round trip on a dead connection (and a bytes-plus-error final
+// write could even mask a fully delivered body).
+type clientWriteTracker struct {
+	w        io.Writer
+	writeErr error
+}
+
+func (t *clientWriteTracker) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil && t.writeErr == nil {
+		t.writeErr = err
+	}
+	return n, err
+}
+
+// streamBlockRangeSequential is streamBlockRange's unbuffered fallback (single-block serves,
+// or the pipeline's buffer budget declined): each block streams from cache directly into the
+// client writer with no staging buffer. Because the read target IS the response body here, an
+// absent block is refetched and re-read only when its failed read delivered nothing — a
+// partial write followed by a re-read would duplicate bytes in the response (a partial write
+// followed by the remainder salvage is fine: cw.written stays byte-exact).
+func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (out streamOutcome, err error) {
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+	fetchesLeft := int64(maxInlineFetchesPerServe)
+	tw := &clientWriteTracker{w: cw}
+	for i := b0; i <= bK; i++ {
+		localStart, localEnd := blockLocalRange(i, start, end, meta.BlockSize, meta.ContentLength)
+		before := cw.written
+		wasFetched := false
+		berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, tw)
+		if errors.Is(berr, cache.ErrNotFound) && cw.written == before {
+			if fetchesLeft <= 0 {
+				return out, errBlocksMostlyAbsent
+			}
+			fetchesLeft--
+			if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{i}); ferr != nil {
+				if errors.Is(ferr, errBlockETagMismatch) || errors.Is(ferr, errBlockUpstreamGone) {
+					return out, ferr
+				}
+				return out, fmt.Errorf("block %d inline fetch failed (%w): %w", i, ferr, errBlockStreamDegraded)
+			}
+			out.fetched++
+			wasFetched = true
+			berr = s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, tw)
+		}
+		if berr != nil {
+			// A write-side failure is the client's, not the cache's: return it raw so the
+			// caller truncates instead of attempting an upstream remainder salvage.
+			if tw.writeErr != nil {
+				return out, berr
+			}
+			return out, fmt.Errorf("block %d stream failed (%w): %w", i, berr, errBlockStreamDegraded)
+		}
+		if !wasFetched {
+			out.fromCache++
+		}
+	}
+	return out, nil
+}
+
+// streamRemainderFromUpstream salvages a committed block serve whose entry can no longer
+// produce object bytes [absStart,absEnd]: one upstream range GET streams the remaining bytes
+// straight to the client, uncached (a pass-through rescue, not a populate — no budget, no
+// block writes). The response must be a 206 for exactly the requested range carrying the
+// entry's ETag: a different version cannot be mixed into an already-committed body, so a
+// changed ETag invalidates the entry and truncates, and a missing one (unverifiable) just
+// truncates.
+func (s *Service) streamRemainderFromUpstream(ctx context.Context, cw *countingWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, absStart, absEnd int64) error {
+	resp, err := s.forwarder.DoConditionalGetRequest(ctx, bucket, key, accessKey, secretKey, "", 0, fmt.Sprintf("bytes=%d-%d", absStart, absEnd))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		return errBlockUpstreamGone
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("remainder fetch: unexpected status %d (want 206)", resp.StatusCode)
+	}
+	respETag := resp.Header.Get("ETag")
+	if respETag == "" {
+		return fmt.Errorf("remainder fetch: response missing ETag, cannot verify version")
+	}
+	if respETag != meta.ETag {
+		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		return errBlockETagMismatch
+	}
+	if rs, re, _, ok := parseContentRange(resp.Header.Get("Content-Range")); !ok || rs != absStart || re != absEnd {
+		return fmt.Errorf("remainder fetch: content-range bounds %d-%d (ok=%t), want %d-%d", rs, re, ok, absStart, absEnd)
+	}
+	want := absEnd - absStart + 1
+	n, cerr := io.Copy(cw, resp.Body)
+	if cerr != nil {
+		return cerr
+	}
+	if n != want {
+		return fmt.Errorf("remainder fetch: body %d bytes, want %d", n, want)
+	}
+	return nil
+}
+
+// serveFullObjectFromBlockCache serves a full-object GET from a block-mode entry. A complete
+// entry (meta.BlocksComplete — every block present when the meta was written) is served
+// probe-free: the first block is read into a pooled buffer pre-commit (so a gone-first-block
+// still falls through cleanly), then the rest stream with an inline fetch recovering any block
+// evicted since populate — one cache op per block instead of the probe pass's two. Entries not
+// known complete take the probe-first path (the mostly-missing amplification bail needs the
+// up-front missing count) and are promoted to complete after a successful full assembly, so
+// they pay the probe pass at most once. It returns served=false, without writing anything, when
+// the blocks cannot be produced — the caller then falls through to the miss path. A block-mode
+// meta always has ContentLength >= BlockSize >= 1, so there is no zero-byte case to handle here.
 func (s *Service) serveFullObjectFromBlockCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -188,6 +651,30 @@ func (s *Service) serveFullObjectFromBlockCache(
 	startTime time.Time,
 ) (served bool, err error) {
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+
+	// Probe-free fast path for complete entries. The first-block buffer (<= one block) is
+	// reserved against the serve-staging byte budget like the assembled-range path; on
+	// decline the probe-first path below still serves.
+	if meta.BlocksComplete {
+		firstLen := min(meta.BlockSize, meta.ContentLength)
+		weight := s.stagingWeight(firstLen)
+		if s.serveStagingBudget == nil || s.serveStagingBudget.tryAcquireReadMiss(weight) {
+			served, err = s.serveCompleteFromBlocks(ctx, w, bucket, key, accessKey, secretKey, meta, startTime)
+			if s.serveStagingBudget != nil {
+				s.serveStagingBudget.release(weight)
+			}
+			// Any pre-commit failure (including a budget-declined first-block fetch) returns
+			// served=false with the response untouched and the caller forwards upstream — the
+			// probe path's fetches draw on the same populate budget, so retrying there could
+			// only repeat the outcome.
+			return served, err
+		}
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve buffer budget declined - serving via probe path")
+	}
+
+	// Stamp the promotion's write-start BEFORE the assembly work below: any invalidation that
+	// lands during it is then provably newer and blocks the promoted meta write.
+	writeStartTime := startTime.UnixNano()
 
 	// A full GET must produce every block. bailIfMostlyMissing=true asks ensureBlocksCached to
 	// fall through (rather than assemble) when most blocks are absent — e.g. only a footer range
@@ -209,11 +696,123 @@ func (s *Service) serveFullObjectFromBlockCache(
 		return false, ferr
 	}
 
+	// Every block is now present: promote the entry to complete (async, tombstone-aware with
+	// the pre-assembly timestamp, so a racing invalidation blocks the write) — later full GETs
+	// then take the probe-free path instead of re-probing every block. The rewrite carries the
+	// entry's REMAINING TTL, never a fresh one: promotion does not consult upstream, so
+	// extending the lifetime would reset the staleness clock (up to doubling the configured
+	// bound after an out-of-band overwrite) and guarantee a window where the meta outlives
+	// every block. Best-effort: a skipped or failed promotion only means the next full GET
+	// probes again.
+	if !meta.BlocksComplete {
+		if remaining := s.remainingMetaTTL(meta); remaining > 0 {
+			promoted := *meta
+			promoted.BlocksComplete = true
+			go func() {
+				pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
+				defer cancel()
+				if _, perr := s.cache.PutMetaTombstoneAware(pctx, bucket, key, &promoted, remaining, writeStartTime); perr != nil {
+					log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
+				}
+			}()
+		}
+	}
+
 	meta.WriteHeaders(w)
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(meta.StatusCode)
 
-	if _, berr := s.streamBlockRange(ctx, w, bucket, key, meta, 0, meta.ContentLength-1); berr != nil {
+	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, 0, meta.ContentLength-1); berr != nil {
+		return true, berr
+	}
+	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	return true, nil
+}
+
+// remainingMetaTTL returns the seconds left of meta's original TTL, from its CachedAt stamp.
+// Returns 0 — meaning "do not rewrite" — when the entry is already past its TTL or its age is
+// unknown (CachedAt == 0: entries written before the field existed).
+func (s *Service) remainingMetaTTL(meta *cache.CachedObjectMeta) int {
+	if meta.CachedAt <= 0 {
+		return 0
+	}
+	rem := int64(s.config.Cache.TTL.Seconds()) - (time.Now().Unix() - meta.CachedAt)
+	if rem <= 0 {
+		return 0
+	}
+	return int(rem)
+}
+
+// serveCompleteFromBlocks serves a full-object GET from a BlocksComplete entry with one cache
+// op per block and no probe pass. The first block is read into a pooled buffer BEFORE headers
+// commit: if it is absent (evicted since populate) it is fetched pre-commit, and if that fails
+// the response is untouched — (false, nil) lets the caller fall through to the miss path, and a
+// definitive stale signal invalidates the entry first. After commit, the remaining blocks
+// stream with an inline fetch recovering any absent one; only a fetch failure there truncates
+// (headers are already sent), which is the same terminal behavior the probe path has for a
+// block evicted between probe and stream. Hit/miss metrics count inline-fetched blocks as
+// misses, recorded once the serve outcome is known.
+func (s *Service) serveCompleteFromBlocks(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key, accessKey, secretKey string,
+	meta *cache.CachedObjectMeta,
+	startTime time.Time,
+) (served bool, err error) {
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+	_, firstEnd := blockBounds(0, meta.BlockSize, meta.ContentLength)
+	firstLen := firstEnd + 1
+
+	bufp := getBlockBuf(firstLen)
+	defer putBlockBuf(bufp)
+	buf := (*bufp)[:firstLen]
+
+	// Pre-commit first block via the shared read/recover protocol (uncapped fetch — this
+	// doubles as the existence check, and a failure here falls through with the response
+	// untouched; a stale signal has already invalidated the entry inside fetchBlocksToCache).
+	firstFetched, rerr := s.readBlockSlice(ctx, bucket, key, accessKey, secretKey, meta, 0, 0, firstEnd, buf, nil)
+	if rerr != nil {
+		return false, rerr
+	}
+
+	meta.WriteHeaders(w)
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(meta.StatusCode)
+	out := streamOutcome{}
+	if firstFetched {
+		out.fetched++
+	} else {
+		out.fromCache++
+	}
+	n, werr := w.Write(buf)
+	if n > 0 {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+	}
+	var berr error
+	if werr != nil {
+		berr = werr
+	} else if lastBlock > 0 {
+		var rest streamOutcome
+		rest, berr = s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, firstEnd+1, meta.ContentLength-1)
+		out.fromCache += rest.fromCache
+		out.fetched += rest.fetched
+	}
+	// Hit/miss reflects what actually happened: blocks read from cache are hits; inline
+	// fetches, remainder-streamed bytes, and blocks never reached on an aborted serve all
+	// count against the entry — never as hits for blocks that were never read.
+	total := lastBlock + 1
+	metrics.CacheBlockHits.Add(float64(out.fromCache))
+	if miss := total - out.fromCache; miss > 0 {
+		metrics.CacheBlockMisses.Add(float64(miss))
+	}
+	if berr == nil {
+		if out.fromCache == total {
+			metrics.CacheBlockRangeServed.WithLabelValues("full_hit").Inc()
+		} else {
+			metrics.CacheBlockRangeServed.WithLabelValues("partial_hit").Inc()
+		}
+	}
+	if berr != nil {
 		return true, berr
 	}
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
@@ -255,9 +854,28 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 	}
 	_ = g.Wait()
 	if stale != nil {
+		// A definitive stale signal means the cached meta describes a version upstream no
+		// longer serves. Invalidate HERE — every block fetch flows through this point — so no
+		// caller can forget it and leave the stale meta to fail again until TTL.
+		// invalidateStaleBlockMeta is ETag-guarded and idempotent, so central invocation is
+		// safe for every caller.
+		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
+		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
 		return stale
 	}
 	return transient
+}
+
+// recordBlockServeMetrics records per-block hit/miss counts and the full/partial serve
+// counter for a committed block serve of total covering blocks, missed of which were fetched.
+func recordBlockServeMetrics(total, missed int64) {
+	metrics.CacheBlockHits.Add(float64(total - missed))
+	if missed == 0 {
+		metrics.CacheBlockRangeServed.WithLabelValues("full_hit").Inc()
+	} else {
+		metrics.CacheBlockMisses.Add(float64(missed))
+		metrics.CacheBlockRangeServed.WithLabelValues("partial_hit").Inc()
+	}
 }
 
 // fetchOneBlock fetches a single block from upstream (an aligned range GET) and writes it to
@@ -354,8 +972,12 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		// (truncated response) streamed straight into PutBlockStream could persist a short block,
 		// which BlockExists can't distinguish from a complete one — so it would later serve
 		// truncated bytes. io.ReadFull errors on a short body, so a partial block is never stored.
-		// blockLen <= block_size, bounded by maxConcurrentBlockFetches concurrent fetches.
-		blockBuf := make([]byte, blockLen)
+		// blockLen <= block_size, bounded by maxConcurrentBlockFetches concurrent fetches. The
+		// buffer is pooled and safely returned on exit: PutBlockStream consumes the reader
+		// fully before returning, so nothing references it afterwards.
+		bufp := getBlockBuf(blockLen)
+		defer putBlockBuf(bufp)
+		blockBuf := (*bufp)[:blockLen]
 		if _, rerr := io.ReadFull(resp.Body, blockBuf); rerr != nil {
 			return nil, fmt.Errorf("block %d fetch: short body (%w), want %d bytes", blockIdx, rerr, blockLen)
 		}
@@ -429,27 +1051,18 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		return errBlockAssemblyWouldAmplify
 	}
 	if len(missing) == 0 {
-		metrics.CacheBlockHits.Add(float64(total))
-		metrics.CacheBlockRangeServed.WithLabelValues("full_hit").Inc()
+		recordBlockServeMetrics(total, 0)
 		return nil
 	}
 	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); err != nil {
-		// A definitive "stale entry" signal — the cached version was overwritten (ETag
-		// mismatch) or the object is gone/forbidden (404/403) out of band — means the cached
-		// block-mode meta is stale. Invalidate it so the caller's fall-through re-establishes
-		// the current state, instead of repeating this failure on every read until the meta
-		// TTL expires. Transient failures (budget shed, 5xx, upstream blip) leave the
-		// still-valid meta in place to retry later.
-		if errors.Is(err, errBlockETagMismatch) || errors.Is(err, errBlockUpstreamGone) {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
-			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
-		}
+		// A definitive stale signal has already invalidated the entry inside
+		// fetchBlocksToCache, so the caller's fall-through re-establishes the current state.
+		// Transient failures (budget shed, 5xx, upstream blip) leave the still-valid meta in
+		// place to retry later.
 		return err
 	}
 	// Committed partial-hit serve: the covering blocks are now all present.
-	metrics.CacheBlockHits.Add(float64(total - int64(len(missing))))
-	metrics.CacheBlockMisses.Add(float64(len(missing)))
-	metrics.CacheBlockRangeServed.WithLabelValues("partial_hit").Inc()
+	recordBlockServeMetrics(total, int64(len(missing)))
 	return nil
 }
 
@@ -489,7 +1102,11 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 			_, _ = io.Copy(io.Discard, r)
 		}
 	}()
-	buf := make([]byte, meta.BlockSize)
+	// Pooled and safely returned on exit: each PutBlockStream consumes its reader fully
+	// before returning, so no block write outlives the loop iteration that staged it.
+	bufp := getBlockBuf(meta.BlockSize)
+	defer putBlockBuf(bufp)
+	buf := (*bufp)[:meta.BlockSize]
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
 	for idx := int64(0); idx <= lastBlock; idx++ {
 		bStart, bEnd := blockBounds(idx, meta.BlockSize, meta.ContentLength)
@@ -509,6 +1126,9 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 	if _, err := io.ReadFull(r, probe[:]); err != io.EOF {
 		return fmt.Errorf("block split: upstream body longer than Content-Length %d", meta.ContentLength)
 	}
+	// Every block was just written, so stamp the meta complete: full-object serves can skip
+	// the per-block probe pass and stream optimistically.
+	meta.BlocksComplete = true
 	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime); err != nil {
 		return err
 	}
