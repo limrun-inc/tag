@@ -16,6 +16,7 @@ require (
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
 	github.com/tigrisdata/ocache/client v1.9.0
+	github.com/tigrisdata/ocache/coordinator v1.9.0
 	github.com/tigrisdata/ocache/embedded v1.9.0
 	github.com/tigrisdata/ocache/storage v1.9.0
 	golang.org/x/sync v0.16.0
@@ -78,7 +79,6 @@ require (
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	github.com/tigrisdata/ocache/common v1.9.0 // indirect
-	github.com/tigrisdata/ocache/coordinator v1.9.0 // indirect
 	github.com/tigrisdata/ocache/coordinator/proto v1.9.0 // indirect
 	github.com/tigrisdata/ocache/proto v1.9.0 // indirect
 	github.com/tigrisdata/ocache/server v1.9.0 // indirect

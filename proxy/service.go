@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
@@ -22,7 +24,7 @@ const (
 	XCacheHeader      = "X-Cache"
 	XCacheHit         = "HIT"
 	XCacheMiss        = "MISS"
-	XCacheBypass      = "BYPASS"      // Cache-Control: no-store bypassed cache
+	XCacheBypass      = "BYPASS"      // Request policy bypassed cache
 	XCacheDisabled    = "DISABLED"    // Cache is disabled
 	XCacheRevalidated = "REVALIDATED" // Object revalidated with upstream
 )
@@ -584,6 +586,17 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 
+	if auth.IsPresignedRequest(r) && !isCacheEligiblePresignedRequest(r) {
+		writeCacheStatus(w, XCacheBypass)
+		err = s.forwarder.Forward(ctx, w, r)
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.RecordRequest("HeadObject", status, time.Since(start).Seconds())
+		return err
+	}
+
 	// Try to serve from cached metadata (no body needed)
 	// Anonymous requests can also read from cache if the object's ACL is public-read.
 	isAnonymous := isAnonymousRequest(r, result, err)
@@ -830,6 +843,10 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 // ParseBucketKey extracts bucket and key from request path.
 func ParseBucketKey(r *http.Request) (bucket, key string) {
+	if virtualBucket, ok := PresignedVirtualHostBucket(r); ok {
+		return virtualBucket, strings.TrimPrefix(r.URL.Path, "/")
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	parts := strings.SplitN(path, "/", 2)
 	if len(parts) >= 1 {
@@ -841,11 +858,145 @@ func ParseBucketKey(r *http.Request) (bucket, key string) {
 	return
 }
 
-// hasNoAuthCredentials returns true if the request carries no SigV4 credentials
-// (no Authorization header and no X-Amz-Credential query parameter).
+// PresignedVirtualHostBucket extracts the bucket from Tigris virtual-hosted
+// presigned URLs. Native Tigris hosts use <bucket>.t3.tigrisfiles.io; Limrun
+// bucket domains use <bucket>.s3.<domain>.
+func PresignedVirtualHostBucket(r *http.Request) (string, bool) {
+	if !auth.IsPresignedRequest(r) {
+		return "", false
+	}
+
+	host := strings.ToLower(r.Host)
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+
+	const tigrisSuffix = ".t3.tigrisfiles.io"
+	if strings.HasSuffix(host, tigrisSuffix) {
+		bucket := strings.TrimSuffix(host, tigrisSuffix)
+		return bucket, bucket != ""
+	}
+
+	if index := strings.Index(host, ".s3."); index > 0 {
+		return host[:index], true
+	}
+
+	return "", false
+}
+
+// isCacheEligiblePresignedRequest reports whether a presigned read can safely
+// share TAG's path-keyed object cache. Variants and headers whose semantics TAG
+// does not implement are delegated to the upstream.
+func isCacheEligiblePresignedRequest(r *http.Request) bool {
+	if hasSessionToken(r) ||
+		hasUnsupportedPresignedHeaders(r) ||
+		r.Header.Get("Cache-Control") != "" {
+		return false
+	}
+
+	for key, values := range r.URL.Query() {
+		if auth.IsQueryAuthenticationParameter(key) {
+			continue
+		}
+		switch key {
+		case "X-Amz-Checksum-Mode":
+			if r.Method != http.MethodGet || len(values) == 0 {
+				return false
+			}
+			for _, value := range values {
+				if value != "ENABLED" {
+					return false
+				}
+			}
+		case "x-id":
+			expectedOperation := ""
+			switch r.Method {
+			case http.MethodGet:
+				expectedOperation = "GetObject"
+			case http.MethodHead:
+				expectedOperation = "HeadObject"
+			}
+			for _, value := range values {
+				if value != expectedOperation {
+					return false
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func requestsChecksumMode(r *http.Request) bool {
+	values, ok := r.URL.Query()["X-Amz-Checksum-Mode"]
+	if !ok || len(values) == 0 {
+		return false
+	}
+	for _, value := range values {
+		if value != "ENABLED" {
+			return false
+		}
+	}
+	return true
+}
+
+func cachedMetaSatisfiesRequest(r *http.Request, meta *cache.CachedObjectMeta) bool {
+	return meta != nil &&
+		(!requestsChecksumMode(r) || meta.ChecksumMode || len(meta.ChecksumHeaders) > 0)
+}
+
+func hasUnsupportedPresignedHeaders(r *http.Request) bool {
+	if authInfo, err := auth.ParseAuthInfo(r); err == nil {
+		for _, header := range authInfo.SignedHeaders {
+			if strings.EqualFold(header, "range") {
+				return true
+			}
+		}
+	}
+	if r.Header.Get("Origin") != "" {
+		return true
+	}
+	if r.Method == http.MethodHead && r.Header.Get("Range") != "" {
+		return true
+	}
+
+	for _, key := range []string{
+		"If-Match",
+		"If-None-Match",
+		"If-Modified-Since",
+		"If-Unmodified-Since",
+		"If-Range",
+	} {
+		if r.Header.Get(key) != "" {
+			return true
+		}
+	}
+
+	for key := range r.Header {
+		lowerKey := strings.ToLower(key)
+		if !strings.HasPrefix(lowerKey, "x-amz-") {
+			continue
+		}
+		switch lowerKey {
+		case "x-amz-content-sha256", "x-amz-date", "x-amz-security-token":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func hasSessionToken(r *http.Request) bool {
+	return r.Header.Get("X-Amz-Security-Token") != "" ||
+		r.URL.Query().Has("X-Amz-Security-Token")
+}
+
+// hasNoAuthCredentials returns true if the request carries no SigV4 auth attempt.
 func hasNoAuthCredentials(r *http.Request) bool {
 	return r.Header.Get("Authorization") == "" &&
-		r.URL.Query().Get("X-Amz-Credential") == ""
+		!auth.HasQueryAuthentication(r)
 }
 
 // isAnonymousRequest returns true if the request has no SigV4 authentication
