@@ -291,12 +291,16 @@ func TestCacheBlockMetaOnWrite(t *testing.T) {
 	})
 }
 
-// A metadata-only entry must survive a full-object GET. The full-GET path bails when
-// most blocks are absent and invalidates the entry, which is right when it holds
-// cached blocks that could serve stale bytes — but an entry with NO blocks has no
-// such hazard, and wiping it would make the full GET destroy exactly what
-// meta-on-write (and a footer warm before its first read) just established.
-func TestFullGet_PreservesMetadataOnlyEntry(t *testing.T) {
+// The hazard: an entry whose blocks are all absent outliving the object it describes.
+// The full-GET bail decides from a probe and never contacts upstream, so it cannot
+// know the object is gone — and a surviving metadata-only entry answers later HEADs
+// with 200 and stale headers until the TTL.
+//
+// Deleting the object upstream is what makes this deterministic. An earlier version
+// primed a live object and polled for the entry to disappear, which raced the miss
+// path re-populating it: correct behaviour could fail the assertion purely on
+// timing. With upstream gone there is nothing to re-populate, so absence is stable.
+func TestFullGet_DoesNotLeaveEntryForDeletedObject(t *testing.T) {
 	const (
 		blockSize = 4
 		bucket    = "b"
@@ -304,9 +308,6 @@ func TestFullGet_PreservesMetadataOnlyEntry(t *testing.T) {
 		etag      = `"v1"`
 	)
 	object := make([]byte, blockSize*10)
-	for i := range object {
-		object[i] = byte('a' + i%26)
-	}
 
 	mock := newBlockMock(object, etag)
 	svc, c := newBlockService(t, mock)
@@ -317,15 +318,15 @@ func TestFullGet_PreservesMetadataOnlyEntry(t *testing.T) {
 	h.Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
 	mustPrimeMeta(t, c, bucket, key, svc.buildBlockMeta(bucket, key, h, int64(len(object))))
 
+	// The object is deleted at the origin, without TAG seeing the delete.
+	mock.blockGet404 = true
+
 	rec := httptest.NewRecorder()
 	if err := svc.HandleGetObject(rec, fullGet(bucket, key)); err != nil {
 		t.Fatalf("full GET: %v", err)
 	}
-	if rec.Code != 200 || rec.Body.Len() != len(object) {
-		t.Fatalf("full GET served status=%d len=%d, want 200 and %d bytes", rec.Code, rec.Body.Len(), len(object))
-	}
 
-	if _, found, _ := c.GetMeta(context.Background(), bucket, key); !found {
-		t.Fatal("full GET destroyed the metadata-only entry that later range reads were meant to reuse")
+	if _, found, _ := c.GetMeta(context.Background(), bucket, key); found {
+		t.Fatal("entry for a deleted object survived an unvalidated full GET; a later HEAD would answer 200 with stale headers until TTL")
 	}
 }
