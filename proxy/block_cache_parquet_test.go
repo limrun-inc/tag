@@ -13,11 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
-	"github.com/tigrisdata/tag/metrics"
 )
 
 // parquetTailBlock builds an object tail that a parquet reader would recognise:
@@ -132,29 +130,6 @@ func TestReadParquetFooterLength(t *testing.T) {
 	})
 }
 
-// Precision accounting must count blocks, not reads: a prefetched block served
-// repeatedly is one useful prefetch, not many.
-func TestPrefetchAttribution_CountsEachBlockOnce(t *testing.T) {
-	cfg := config.NewDefault()
-	cfg.Cache.ParquetOptimization = true
-	s := NewService(nil, nil, cfg)
-	const blockSize = 1024
-
-	s.notePrefetchedBlock("b", "a.parquet", `"v1"`, blockSize, 7, triggerWriteWarm)
-	key := cache.MakeBlockKey("b", "a.parquet", `"v1"`, blockSize, 7)
-	if _, ok := s.prefetchedBlocks.Get(key); !ok {
-		t.Fatal("prefetched block was not recorded")
-	}
-
-	s.notePrefetchHit("b", "a.parquet", `"v1"`, blockSize, 7)
-	if _, ok := s.prefetchedBlocks.Get(key); ok {
-		t.Fatal("attribution left the block recorded, so a re-read would count twice")
-	}
-	// A second hit on the same block must be a no-op rather than a panic or a
-	// second attribution.
-	s.notePrefetchHit("b", "a.parquet", `"v1"`, blockSize, 7)
-}
-
 // parquetFooterForwarder serves ranged reads out of a full object body and
 // records what was asked for, which is what the prefetch is judged on.
 type parquetFooterForwarder struct {
@@ -238,18 +213,19 @@ func TestPrefetchParquetFooterBlocks_FetchesTheSpannedBlocks(t *testing.T) {
 
 	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta, nil)
 
+	// Fetched concurrently, so compare as a set: ordering is not part of the contract.
 	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
-	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
 		t.Fatalf("upstream ranges = %v, want %v", got, want)
 	}
 	for _, idx := range []int64{3, 4} {
 		if !store.BlockExists(context.Background(), bucket, key, etag, blockSize, idx) {
 			t.Errorf("block %d was not cached by the prefetch", idx)
 		}
-		if _, ok := s.prefetchedBlocks.Get(cache.MakeBlockKey(bucket, key, etag, blockSize, idx)); !ok {
-			t.Errorf("block %d was not recorded for attribution", idx)
-		}
 	}
+	_ = s
 }
 
 // Metadata that fits inside the tail block is already cached by the read that
@@ -347,8 +323,11 @@ func TestServeRangeFromBlockCache_TrailerProbeTriggersFooterPrefetch(t *testing.
 		}
 	}
 
+	// Concurrent fetches, so compare as a set.
 	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
-	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
 		t.Fatalf("prefetched ranges = %v, want %v", got, want)
 	}
 }
@@ -391,7 +370,9 @@ func TestPrefetchParquetFooterBlocks_UsesServedTrailerWhenTailNotYetCached(t *te
 	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta, trailer)
 
 	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
-	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
 		t.Fatalf("prefetched ranges = %v, want %v (served trailer was ignored)", got, want)
 	}
 }
@@ -445,7 +426,7 @@ func TestParquetFooterBlocks(t *testing.T) {
 	t.Run("spans metadata through the tail", func(t *testing.T) {
 		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 6 * blockSize}
 		// metadata starts at 6144-8-2644 = 3492, inside block 3; tail is block 5.
-		got := parquetFooterBlocks(meta, 2644)
+		got := parquetFooterBlocks(meta, 2644, false)
 		if !slices.Equal(got, []int64{3, 4, 5}) {
 			t.Fatalf("blocks = %v, want [3 4 5]", got)
 		}
@@ -453,14 +434,14 @@ func TestParquetFooterBlocks(t *testing.T) {
 
 	t.Run("footer inside the tail block is just that block", func(t *testing.T) {
 		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 6 * blockSize}
-		if got := parquetFooterBlocks(meta, 100); !slices.Equal(got, []int64{5}) {
+		if got := parquetFooterBlocks(meta, 100, false); !slices.Equal(got, []int64{5}) {
 			t.Fatalf("blocks = %v, want [5]", got)
 		}
 	})
 
 	t.Run("stays bounded for a pathological footer", func(t *testing.T) {
 		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 5000 * blockSize}
-		got := parquetFooterBlocks(meta, 4000*blockSize)
+		got := parquetFooterBlocks(meta, 4000*blockSize, false)
 		if len(got) != maxParquetFooterPrefetchBlocks {
 			t.Fatalf("blocks = %d, want the %d cap", len(got), maxParquetFooterPrefetchBlocks)
 		}
@@ -689,43 +670,40 @@ func (f *noStoreForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _
 	}, nil
 }
 
-// Attribution must survive concurrent serves of the same prefetched block. This
-// regressed once already: recovering the trigger label requires reading the LRU
-// value, which turned an atomic Remove into a Get-then-Remove pair, and two racing
-// serves could both observe the entry and both count it -- pushing precision above
-// 1 in the metric that decides whether these triggers stay on.
-//
-// It drives notePrefetchHit itself and asserts on the counter that ships. An
-// earlier version of this test reimplemented the lock-and-clear inline, which
-// exercised a copy of the logic rather than the function, and so would have stayed
-// green if the production path lost its mutex -- the exact regression it exists to
-// catch.
-func TestPrefetchAttribution_ConcurrentServesCountOnce(t *testing.T) {
-	cfg := config.NewDefault()
-	cfg.Cache.ParquetOptimization = true
-	s := NewService(nil, nil, cfg)
+// The cap must bound the blocks a caller actually fetches. Applying it to a span
+// that still contains the tail, then dropping the tail, silently gives the read
+// trigger one block less than the write trigger from the same configured limit.
+func TestParquetFooterBlocks_CapAppliesAfterTailIsDropped(t *testing.T) {
 	const blockSize = 1024
+	meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 5000 * blockSize}
+	huge := int64(4000 * blockSize)
 
-	counter := metrics.CacheBlockPrefetchUsed.WithLabelValues(triggerWriteWarm)
-	before := testutil.ToFloat64(counter)
+	write := parquetFooterBlocks(meta, huge, false)
+	read := parquetFooterBlocks(meta, huge, true)
 
-	const rounds = 200
-	for round := 0; round < rounds; round++ {
-		key := fmt.Sprintf("a-%d.parquet", round)
-		s.notePrefetchedBlock("b", key, `"v1"`, blockSize, 7, triggerWriteWarm)
-
-		var wg sync.WaitGroup
-		for racer := 0; racer < 8; racer++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				s.notePrefetchHit("b", key, `"v1"`, blockSize, 7)
-			}()
-		}
-		wg.Wait()
+	if len(write) != maxParquetFooterPrefetchBlocks {
+		t.Fatalf("write trigger got %d blocks, want the %d cap", len(write), maxParquetFooterPrefetchBlocks)
 	}
+	if len(read) != maxParquetFooterPrefetchBlocks {
+		t.Fatalf("read trigger got %d blocks, want the %d cap — the tail was dropped after capping", len(read), maxParquetFooterPrefetchBlocks)
+	}
+	if read[len(read)-1] != write[len(write)-1]-1 {
+		t.Fatalf("read range should end one block before the tail: read ends %d, write ends %d", read[len(read)-1], write[len(write)-1])
+	}
+}
 
-	if got := testutil.ToFloat64(counter) - before; got != rounds {
-		t.Fatalf("attributed %v blocks across %d races, want exactly %d - a block counted more than once inflates precision above 1", got, rounds, rounds)
+// A block-aligned object has a FULL tail block, not a zero-length remainder, so its
+// metadata has to exceed a whole block before anything needs prefetching.
+func TestParquetFooterBlocks_BlockAlignedObjectHasFullTail(t *testing.T) {
+	const blockSize = 1024
+	meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 4 * blockSize}
+
+	// Footer smaller than a full block fits the tail; nothing to fetch beyond it.
+	if got := parquetFooterBlocks(meta, blockSize-parquetTrailerSize-1, true); len(got) != 0 {
+		t.Fatalf("aligned object with a sub-block footer wanted %v, want nothing", got)
+	}
+	// Footer larger than the tail block does spill into the previous one.
+	if got := parquetFooterBlocks(meta, blockSize+10, true); len(got) == 0 {
+		t.Fatal("aligned object with a footer larger than one block should need a prefetch")
 	}
 }

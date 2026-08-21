@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -145,45 +144,56 @@ func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey 
 		// it as complete and stop re-examining the object on every tail read.
 		return true
 	}
+	return s.ensureParquetFooterBlocks(ctx, bucket, key, accessKey, secretKey, meta, footerLen, true /*tailServedByCaller*/, triggerReadPrefetch)
+}
+
+// ensureParquetFooterBlocks makes the object's metadata blocks present, and is the
+// single place that decides which blocks those are, fetches them, and counts them.
+// Both triggers funnel through here: they differ only in how they learn the footer
+// length (a served/cached trailer on read, a suffix-range GET on write), never in
+// what they then do about it. Keeping that one implementation is deliberate — the
+// two paths previously diverged in exactly the bookkeeping that decides whether the
+// feature is judged to work.
+//
+// It reports whether the work completed. A caller may use that to suppress repeat
+// scans, which must not happen after a retryable failure.
+func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, footerLen int64, tailServedByCaller bool, trigger string) bool {
 	metrics.CacheParquetFooterBytes.Observe(float64(footerLen))
 
-	// The metadata region is the declared length plus the trailer that
-	// describes it; the reader fetches both.
-	metaStart := meta.ContentLength - parquetTrailerSize - footerLen
-	tailBlock := (meta.ContentLength - 1) / meta.BlockSize
-	firstBlock := metaStart / meta.BlockSize
-	if firstBlock >= tailBlock {
-		// Metadata fits the remainder block the triggering read already cached.
-		// Measured: only the small (<2 MB) objects land here. A stable property of
-		// the object, so complete.
+	blocks := parquetFooterBlocks(meta, footerLen, tailServedByCaller)
+	if len(blocks) == 0 {
 		return true
 	}
-	if tailBlock-firstBlock > maxParquetFooterPrefetchBlocks {
-		firstBlock = tailBlock - maxParquetFooterPrefetchBlocks
-		log.Debug().Str("bucket", bucket).Str("key", key).Int64("footer_bytes", footerLen).
-			Msg("Parquet metadata larger than the prefetch bound - prefetching the tail of it")
+
+	// Presence decides the rest of the work, so an object whose metadata blocks are
+	// already cached costs nothing beyond the probes.
+	absent := make([]int64, 0, len(blocks))
+	for _, idx := range blocks {
+		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, idx) {
+			absent = append(absent, idx)
+		}
+	}
+	if len(absent) == 0 {
+		return true
 	}
 
-	for i := firstBlock; i < tailBlock; i++ {
-		if ctx.Err() != nil {
-			return false // timed out mid-scan; retryable
-		}
-		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, i) {
-			continue
-		}
-		// fetchOneBlock coalesces against any in-flight fetch of the same block
-		// and acquires the populate budget non-blocking, so a prefetch is shed
-		// rather than queued when the budget is contended by real reads.
-		if err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, i); err != nil {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", i).
-				Msg("Parquet footer prefetch failed")
-			// A budget shed or transient upstream error. Retryable, and specifically
-			// must NOT start a cooldown: shedding happens under load, which is when a
-			// later read most wants this to have another go.
-			return false
-		}
-		metrics.CacheBlockPrefetched.WithLabelValues(triggerReadPrefetch).Inc()
-		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, i, triggerReadPrefetch)
+	// fetchBlocksToCache fetches concurrently, acquires the populate budget
+	// non-blocking (so a prefetch sheds rather than queues against real reads), and
+	// centralises the stale-meta invalidation that a per-block loop here used to
+	// miss: an ETag mismatch means the entry describes a version upstream no longer
+	// serves, and leaving it would fail every later read until TTL.
+	// Volume, not precision: how much speculative fetching this trigger is doing.
+	// Counted before the fetch because that is what was asked for; a block another
+	// caller happened to transfer first is close enough for a cost signal, and
+	// pinning it exactly cost more than it was worth (see the metric's doc comment).
+	metrics.CacheBlockPrefetched.WithLabelValues(trigger).Add(float64(len(absent)))
+
+	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, absent); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Str("trigger", trigger).
+			Msg("Parquet footer blocks not fully cached")
+		// Retryable: a shed happens under load, which is when a later read most wants
+		// another attempt. Never start a cooldown on this.
+		return false
 	}
 	return true
 }
@@ -231,64 +241,6 @@ func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key strin
 		return 0, false
 	}
 	return parseParquetTrailer(buf, meta.ContentLength)
-}
-
-// notePrefetchedBlock records a speculatively fetched block so that a later
-// serve of it can be attributed. The set is bounded and TTL-expiring: an entry
-// that ages out simply stops being attributable, which understates precision
-// rather than overstating it.
-func (s *Service) notePrefetchedBlock(bucket, key, etag string, blockSize, idx int64, trigger string) {
-	if s.prefetchedBlocks == nil {
-		return
-	}
-	// The trigger is stored, not just counted: precision is only meaningful per
-	// trigger, and it cannot be recovered at hit time otherwise.
-	s.prefetchedBlocks.Add(cache.MakeBlockKey(bucket, key, etag, blockSize, idx), trigger)
-}
-
-// notePrefetchHit attributes a cache hit to an earlier prefetch, exactly once.
-// Clearing the entry keeps the ratio a count of blocks rather than of reads, so a
-// block read many times cannot inflate precision.
-//
-// The lookup and the removal must be ONE atomic step. expirable.LRU.Remove is
-// atomic but discards the value, and the trigger label is only recoverable from
-// that value — so a Get-then-Remove pair is the obvious shape and is wrong: two
-// serves racing on the same block both observe it and both increment, letting
-// precision exceed 1. The mutex buys back the atomicity that reading the value
-// costs. It is only taken when the feature is on, since prefetchedBlocks is nil
-// otherwise.
-func (s *Service) notePrefetchHit(bucket, key, etag string, blockSize, idx int64) {
-	if s.prefetchedBlocks == nil {
-		return
-	}
-	k := cache.MakeBlockKey(bucket, key, etag, blockSize, idx)
-
-	s.prefetchAttributionMu.Lock()
-	trigger, ok := s.prefetchedBlocks.Get(k)
-	if ok {
-		s.prefetchedBlocks.Remove(k)
-	}
-	s.prefetchAttributionMu.Unlock()
-
-	if ok {
-		metrics.CacheBlockPrefetchUsed.WithLabelValues(trigger).Inc()
-	}
-}
-
-// noteAssembledPrefetchHits attributes the covering blocks that an assembled serve
-// read straight from cache. missing lists the blocks it had to fetch, which by
-// definition were not prefetch hits. The slice holds at most two entries, so the
-// linear scan is cheaper than building a set.
-func (s *Service) noteAssembledPrefetchHits(bucket, key string, meta *cache.CachedObjectMeta, b0, bK int64, missing []int64) {
-	if s.prefetchedBlocks == nil {
-		return
-	}
-	for i := b0; i <= bK; i++ {
-		if slices.Contains(missing, i) {
-			continue
-		}
-		s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
-	}
 }
 
 // Write-time footer warming (RFC 0002).
@@ -359,47 +311,15 @@ func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey stri
 	if !ok {
 		return
 	}
-	metrics.CacheParquetFooterBytes.Observe(float64(footerLen))
-
-	blocks := parquetFooterBlocks(meta, footerLen)
-	if len(blocks) == 0 {
+	if !s.ensureParquetFooterBlocks(ctx, bucket, key, accessKey, secretKey, meta, footerLen, false /*tailServedByCaller*/, triggerWriteWarm) {
+		// Blocks did not land, so publishing the entry would advertise a block-mode
+		// object with nothing behind it that this write put there.
 		return
-	}
-	// The shared populate path refuses a fan-out above this, and a silent refusal
-	// after the counters had already moved would report warms that never happened.
-	// Check it here so the skip is explicit and unmeasured.
-	if int64(len(blocks)) > maxRangeBlockFanout {
-		log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", len(blocks)).
-			Msg("Parquet footer warm skipped - metadata spans more blocks than the populate fan-out allows")
-		return
-	}
-
-	// Which blocks this warm will actually fetch. fetchBlocksToCache silently skips
-	// ones already cached -- by a prior warm, a read-triggered prefetch, or a retried
-	// write -- and crediting those would report work that never happened and score
-	// them as hits on the next read, inflating the very ratio the rollout decision
-	// rests on. The read-triggered path tests presence before counting; match it.
-	absent := make([]int64, 0, len(blocks))
-	for _, idx := range blocks {
-		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, idx) {
-			absent = append(absent, idx)
-		}
-	}
-
-	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, blocks); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Parquet footer warm - block fetch failed")
-		return
-	}
-
-	// Counted only once the blocks are cached, and only those this warm fetched.
-	for _, idx := range absent {
-		metrics.CacheBlockPrefetched.WithLabelValues(triggerWriteWarm).Inc()
-		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx, triggerWriteWarm)
 	}
 
 	// Meta last, tombstone-aware -- the RFC 0001 visibility gate. Blocks stay useful
 	// even if this backs off, since they are keyed by ETag.
-	s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(blocks), writeStartTime)
+	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, writeStartTime)
 }
 
 // readParquetTrailerFromUpstream fetches the object's last 8 bytes. A suffix range is
@@ -476,19 +396,33 @@ func (s *Service) readParquetTrailerFromUpstream(ctx context.Context, bucket, ke
 	return s.buildBlockMeta(bucket, key, resp.Header, contentLength), footerLen, true
 }
 
-// parquetFooterBlocks returns the block indices the metadata region spans, including
-// the tail block. Empty when the object is degenerate.
-func parquetFooterBlocks(meta *cache.CachedObjectMeta, footerLen int64) []int64 {
+// parquetFooterBlocks returns the block indices this caller should fetch for the
+// metadata region. Empty when there is nothing to do.
+//
+// tailServedByCaller drops the tail block: the read that fired the prefetch already
+// produced it and may still be writing it, so re-fetching would duplicate that
+// transfer on every cold open. The cap is applied AFTER that, so it bounds the
+// blocks actually fetched rather than a span one of them is about to be removed
+// from — otherwise the read trigger would silently prefetch one block fewer than
+// the write trigger from the same limit.
+func parquetFooterBlocks(meta *cache.CachedObjectMeta, footerLen int64, tailServedByCaller bool) []int64 {
 	tailBlock := (meta.ContentLength - 1) / meta.BlockSize
+	lastWanted := tailBlock
+	if tailServedByCaller {
+		lastWanted--
+	}
 	firstBlock := (meta.ContentLength - parquetTrailerSize - footerLen) / meta.BlockSize
 	if firstBlock < 0 {
 		firstBlock = 0
 	}
-	if tailBlock-firstBlock+1 > maxParquetFooterPrefetchBlocks {
-		firstBlock = tailBlock - maxParquetFooterPrefetchBlocks + 1
+	if lastWanted < firstBlock {
+		return nil
 	}
-	blocks := make([]int64, 0, tailBlock-firstBlock+1)
-	for i := firstBlock; i <= tailBlock; i++ {
+	if lastWanted-firstBlock+1 > maxParquetFooterPrefetchBlocks {
+		firstBlock = lastWanted - maxParquetFooterPrefetchBlocks + 1
+	}
+	blocks := make([]int64, 0, lastWanted-firstBlock+1)
+	for i := firstBlock; i <= lastWanted; i++ {
 		blocks = append(blocks, i)
 	}
 	return blocks

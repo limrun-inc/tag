@@ -358,7 +358,6 @@ func (s *Service) serveAssembledRange(
 	// Committed serve: record hit/miss + serve metrics (only here, never on a fall-through),
 	// then write the response.
 	recordBlockServeMetrics(bK-b0+1, int64(len(missing)))
-	s.noteAssembledPrefetchHits(bucket, key, meta, b0, bK, missing)
 	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
@@ -545,7 +544,6 @@ func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWri
 		}
 		if !br.fetchedIt {
 			out.fromCache++
-			s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 		}
 		_, werr := cw.Write((*br.bufp)[:br.n])
 		putBlockBuf(br.bufp)
@@ -695,7 +693,6 @@ func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWr
 		}
 		if !wasFetched {
 			out.fromCache++
-			s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 		}
 	}
 	return out, nil
@@ -902,7 +899,6 @@ func (s *Service) serveCompleteFromBlocks(
 		out.fetched++
 	} else {
 		out.fromCache++
-		s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, 0)
 	}
 	n, werr := w.Write(buf)
 	if n > 0 {
