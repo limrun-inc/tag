@@ -46,6 +46,14 @@ var errBlockUpstreamGone = errors.New("block upstream gone")
 // as "fall through to the miss path", not a real error.
 var errBlockAssemblyWouldAmplify = errors.New("block assembly would amplify")
 
+// errNoRequestedBlocksCached is the amplify bail for a request whose covering blocks
+// are ALL absent. The predicate is per-request, not per-entry: only a full-object
+// serve spans every block, so only there does it mean the entry itself holds nothing.
+// It wraps errBlockAssemblyWouldAmplify, so callers that only care about "fall
+// through" match it unchanged, while the full-object path uses the distinction to skip
+// an invalidation that would protect nothing (see serveCompleteFromBlocks).
+var errNoRequestedBlocksCached = fmt.Errorf("%w: none of the requested blocks are cached", errBlockAssemblyWouldAmplify)
+
 // maxInlineFetchesPerServe bounds how many absent blocks one COMMITTED block serve recovers via
 // individual aligned upstream fetches. BlocksComplete is a hint: blocks and meta evict/expire
 // independently, so a surviving meta over mass-evicted blocks would otherwise turn one full GET
@@ -786,12 +794,21 @@ func (s *Service) serveFullObjectFromBlockCache(
 	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock, true, 0); ferr != nil {
 		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
-			// Don't leave the mostly-missing entry in place: the bail skips the per-block staleness
+			// Don't leave a mostly-missing entry in place: the bail skips the per-block staleness
 			// check, so if the object was deleted/overwritten out of band its already-cached blocks
 			// would keep serving stale bytes on later range reads until TTL. Invalidate it (only if
 			// still this version, so a concurrently re-established entry isn't wiped) and let the
 			// miss path re-establish the current version via a single streaming re-split.
-			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			//
+			// An entry holding NO blocks is exempt: there are no cached bytes to serve stale, so
+			// the invalidation protects nothing, and wiping it would discard a metadata-only entry
+			// (meta-on-write) that later range reads are meant to reuse — making this full GET
+			// destructive rather than merely slow. Note a footer-warmed entry holds blocks and is
+			// NOT exempt: it still takes the invalidating branch, since those cached blocks are
+			// exactly the stale-serve hazard this guards.
+			if !errors.Is(ferr, errNoRequestedBlocksCached) {
+				s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			}
 			return false, nil
 		}
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
@@ -1381,6 +1398,9 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 	// avoiding a hit-ratio skew (failed fetches correlate with more-missing requests).
 	if (bailIfMostlyMissing && int64(len(missing))*2 > total) ||
 		(maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout) {
+		if int64(len(missing)) == total {
+			return errNoRequestedBlocksCached
+		}
 		return errBlockAssemblyWouldAmplify
 	}
 	if len(missing) == 0 {
@@ -1493,21 +1513,32 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
 			return
 		}
-		// Re-check that no entry was established concurrently before stamping block-mode meta.
-		// The schedule-time !found gate can go stale during the block fetch above: a racing
-		// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
-		// would demote a complete whole-mode entry to a partial one, so back off and let it win
-		// (the touched blocks we fetched are harmless orphans that age out).
-		if _, found, _ := s.cache.GetMeta(ctx, bucket, key); found {
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode meta write skipped - entry established concurrently")
-			return
-		}
-		ttl := int(s.config.Cache.TTL.Seconds())
-		wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime)
-		if err != nil || !wrote {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
-			return
-		}
-		log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", len(touched)).Int64("block_size", meta.BlockSize).Msg("Block-mode entry populated")
+		s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(touched), writeStartTime)
 	}()
+}
+
+// finalizeBlockModeMeta stamps the block-mode meta once its blocks have landed — the
+// "blocks first, meta last" visibility gate from RFC 0001. Split out so callers that
+// need to act between the two steps (write-time footer warming records per-block
+// attribution there) share this logic instead of re-deriving its race handling.
+//
+// writeStartTime must be stamped BEFORE the blocks were fetched, so an invalidation
+// landing mid-populate is newer and blocks the meta write.
+func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, writeStartTime int64) {
+	// Re-check that no entry was established concurrently before stamping block-mode meta.
+	// The schedule-time !found gate can go stale during the block fetch: a racing
+	// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
+	// would demote a complete whole-mode entry to a partial one, so back off and let it win
+	// (the blocks we fetched are keyed by ETag, so a matching entry still resolves them).
+	if _, found, _ := s.cache.GetMeta(ctx, bucket, key); found {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode meta write skipped - entry established concurrently")
+		return
+	}
+	ttl := int(s.config.Cache.TTL.Seconds())
+	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime)
+	if err != nil || !wrote {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
+		return
+	}
+	log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", blockCount).Int64("block_size", meta.BlockSize).Msg("Block-mode entry populated")
 }
