@@ -205,7 +205,7 @@ type CacheConfig struct {
 	// object's tail is a reliable signal that the whole metadata region is about to
 	// be read. When the metadata spans more than the (partial) tail block, TAG
 	// fetches the remaining metadata blocks in the background instead of letting the
-	// reader discover them as misses. Measured on production parseable data, footers
+	// reader discover them as misses. Measured on a production analytics workload, footers
 	// run ~1.25% of object size, so a 300 MB object carries ~3.5 MB of metadata --
 	// several blocks at a 1 MiB block_size. Off by default: it reads 8 bytes of
 	// object content to size the footer, which is format-specific behavior an
@@ -635,6 +635,10 @@ func applyEnvOverrides(cfg *Config) {
 		// Override the block granularity from environment (0/unset keeps the default).
 		if n, ok := envInt64("TAG_CACHE_BLOCK_SIZE"); ok && n > 0 {
 			cfg.Cache.BlockSize = n
+		}
+		// Override the max cacheable object size from environment (0/unset keeps the default).
+		if n, ok := envInt64("TAG_CACHE_SIZE_THRESHOLD"); ok && n > 0 {
+			cfg.Cache.SizeThreshold = n
 		}
 		// Override the warm-on-write populate reservation fraction from environment.
 		// f != 0 mirrors the sibling budget overrides: an env "0" means "use the
