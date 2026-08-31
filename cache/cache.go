@@ -162,6 +162,19 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	return nil
 }
 
+// countingReader counts what actually reached storage, so a body that ended early can be told
+// apart from a complete one once the stream is over.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // PutWithMetaStreamIfVersion is like PutWithMetaStream but commits the
 // metadata under the caller's decision-time version precondition (see
 // putMetaVersioned): body first, then the meta write that makes the entry
@@ -216,7 +229,8 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 	}
 
 	// Stream body to cache
-	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
+	counted := &countingReader{r: body}
+	if err := c.client.PutStream(ctx, bodyKey, counted, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
 		return false, err
 	}
@@ -229,6 +243,21 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 	// a reader streaming this exact body key, and deleting it would truncate
 	// that reader. Without a visible meta entry the orphaned body is
 	// unreachable and harmless until it expires.
+
+	// A body that ended early must never become a visible entry. The metadata is built from
+	// upstream's headers, so it claims the full size no matter how much arrived: publishing it
+	// over a short body serves that key as a complete hit that truncates every reader until it
+	// expires, and a client that verifies length refetches it from origin every single time.
+	// The block path refuses this already; this is the whole-body path it converges with.
+	if meta.ContentLength > 0 && counted.n != meta.ContentLength {
+		log.Warn().Str("bucket", bucket).Str("key", key).
+			Int64("written", counted.n).Int64("content_length", meta.ContentLength).
+			Msg("Skipping meta write - body ended before its content length")
+		// The orphaned body is left to TTL for the same reason as the tombstone branch below:
+		// a concurrent populate of this ETag may have a reader on this exact body key.
+		return false, fmt.Errorf("cache body for %s/%s ended after %d of %d bytes",
+			bucket, key, counted.n, meta.ContentLength)
+	}
 
 	// Write metadata AFTER body (makes entry visible), under the version
 	// precondition. A lost precondition leaves the newer entry in place and the
