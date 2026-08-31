@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -102,6 +103,50 @@ func bodyGone(err error) bool {
 	return true
 }
 
+// stallReader tracks when a stream last moved bytes, so a populate can tell a slow transfer from
+// a stopped one.
+//
+// The populate reads from the same broadcast the clients read from, and the client that started
+// the fetch paces it: one slow reader drags the whole stream down to its speed. A total time
+// budget cannot tell that apart from a hang, so it expires on transfers that are merely slow and
+// healthy. Progress is the signal that survives both.
+type stallReader struct {
+	r    io.Reader
+	last atomic.Int64 // unix nanos of the last read that moved bytes
+}
+
+func newStallReader(r io.Reader) *stallReader {
+	s := &stallReader{r: r}
+	s.last.Store(time.Now().UnixNano())
+	return s
+}
+
+func (s *stallReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 {
+		s.last.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+// cancelWhenStalled cancels the populate once the stream has delivered nothing for limit. It
+// returns when the context ends, so it dies with the write it guards.
+func cancelWhenStalled(ctx context.Context, cancel context.CancelFunc, s *stallReader, limit time.Duration) {
+	ticker := time.NewTicker(limit / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if time.Since(time.Unix(0, s.last.Load())) > limit {
+				cancel()
+				return
+			}
+		}
+	}
+}
+
 // cacheWriteTimeoutForSize returns a timeout scaled to contentLength.
 // Returns at least cacheWriteTimeout (60s), scaling up for large objects.
 func cacheWriteTimeoutForSize(contentLength int64) time.Duration {
@@ -192,14 +237,21 @@ func (s *Service) setupCacheListener(
 		}
 
 		// Use a detached context for cache writes to avoid cancellation when HTTP request completes.
-		// Scale timeout by content length so large objects have enough time to write.
-		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
+		// The write is bounded by progress rather than by total time: see stallReader. A budget
+		// derived from size assumes a floor throughput the stream does not control, and expiring
+		// mid-write is how a partial body used to reach storage.
+		cacheCtx, cacheCancel := context.WithCancel(context.Background())
 		defer cacheCancel()
 
 		ttl := int(s.config.Cache.TTL.Seconds())
 
 		// Wrap pipeReader with signaling reader to know when cache reader is ready
 		sigReader := newSignalingReader(pipeReader)
+		// A stream that has stopped still has to fail, or a wedged populate would hold its slot
+		// forever. cacheWriteTimeout is now how long silence is tolerated, not how long the whole
+		// object gets.
+		stalled := newStallReader(sigReader)
+		go cancelWhenStalled(cacheCtx, cacheCancel, stalled, cacheWriteTimeout)
 
 		// Intermediate buffer absorbs chunks while cache writer initializes.
 		// Sized as 1/4 of the broadcaster's channel buffer to balance memory savings
@@ -222,9 +274,9 @@ func (s *Service) setupCacheListener(
 			// keep the single whole-body write.
 			if s.isBlockEligibleSize(meta.ContentLength) {
 				meta.BlockSize = s.config.Cache.BlockSize
-				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, stalled, ttl, writeStartTime)
 			} else {
-				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, stalled, ttl, writeStartTime)
 			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
