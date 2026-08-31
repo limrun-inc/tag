@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/pprof"
 	"regexp"
@@ -121,6 +122,9 @@ func (s *Server) setupRouter() *mux.Router {
 
 	// Apply connection tracking middleware
 	r.Use(s.connectionTrackingMiddleware)
+
+	// Bound transfers by progress rather than by total time.
+	r.Use(progressDeadlines)
 
 	// Bound concurrently-served S3 requests (sheds with 503 SlowDown when full)
 	r.Use(s.admissionMiddleware)
@@ -277,6 +281,69 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	log.Info().Msg("Stopping HTTP server")
 	return s.httpServer.Shutdown(ctx)
+}
+
+// stallTimeout is how long a transfer may deliver nothing before its connection is closed. It
+// replaces the server's total read and write budgets, which cut healthy transfers: a multi-GB
+// archive over a slow link legitimately takes longer than any fixed budget, and the object gets
+// larger every release while the budget does not.
+const stallTimeout = 2 * time.Minute
+
+// progressDeadlines pushes the connection's deadlines forward as bytes move, so a transfer is
+// bounded by stalling rather than by how long it runs. A client that goes silent still loses its
+// connection; one that is merely slow keeps it.
+func progressDeadlines(next http.Handler) http.Handler {
+	return withProgressDeadlines(next, stallTimeout)
+}
+
+func withProgressDeadlines(next http.Handler, window time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		// A connection whose deadlines cannot be set (HTTP/2, and some test writers) keeps the
+		// server's configured budgets. Nothing here is worth failing a request over.
+		if err := rc.SetWriteDeadline(time.Now().Add(window)); err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		_ = rc.SetReadDeadline(time.Now().Add(window))
+		if r.Body != nil {
+			r.Body = &progressBody{ReadCloser: r.Body, rc: rc, window: window}
+		}
+		next.ServeHTTP(&progressWriter{ResponseWriter: w, rc: rc, window: window}, r)
+	})
+}
+
+// progressWriter renews the write deadline before each chunk of the response.
+type progressWriter struct {
+	http.ResponseWriter
+	rc     *http.ResponseController
+	window time.Duration
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	// Renew before the write, so the chunk gets the whole window to drain.
+	_ = p.rc.SetWriteDeadline(time.Now().Add(p.window))
+	return p.ResponseWriter.Write(b)
+}
+
+func (p *progressWriter) Flush() {
+	_ = p.rc.Flush()
+}
+
+// Unwrap lets an http.ResponseController reach the real writer through this one.
+func (p *progressWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
+
+// progressBody renews the read deadline as an upload arrives, so publishing a large archive
+// through the gateway is bounded the same way serving one is.
+type progressBody struct {
+	io.ReadCloser
+	rc     *http.ResponseController
+	window time.Duration
+}
+
+func (p *progressBody) Read(b []byte) (int, error) {
+	_ = p.rc.SetReadDeadline(time.Now().Add(p.window))
+	return p.ReadCloser.Read(b)
 }
 
 // responseTracker wraps http.ResponseWriter to track whether headers have been
