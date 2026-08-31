@@ -185,8 +185,16 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 				MaxIdleConnsPerHost: maxIdleConnsPerHost,
 				IdleConnTimeout:     90 * time.Second,
 				DisableCompression:  true, // Proxy must never auto-decompress upstream responses
+				// Bounds the wait for a reply, which is the part that has no reason to grow.
+				// Streaming the body afterwards takes as long as the object needs.
+				ResponseHeaderTimeout: 60 * time.Second,
 			},
-			Timeout: 5 * time.Minute,
+			// No total budget: http.Client.Timeout covers reading the body, so any cap here is a
+			// cap on object size over link speed. A multi-GB archive routinely outruns five
+			// minutes, and cancelling mid-body cuts the client and the populate together. The
+			// wait for headers is bounded above; a body that stalls is caught by the request
+			// context and the write deadline on the client's own connection.
+			Timeout: 0,
 		},
 	}
 }
