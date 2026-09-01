@@ -341,6 +341,11 @@ func (s *Service) setupCacheListener(
 	chunkLoop:
 		for chunk := range listener.Chunks() {
 			if chunk.Err != nil {
+				// The upstream stream failed, so the client and this populate both lose the
+				// body. Worth a warning: from the outside it looks like a truncated read with
+				// no cache entry to show for it.
+				log.Warn().Err(chunk.Err).Str("bucket", bucket).Str("key", key).
+					Msg("Cache populate abandoned - the upstream stream ended early")
 				chunkErr = chunk.Err
 				earlyExit = true
 				break
