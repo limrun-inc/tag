@@ -111,8 +111,12 @@ func bodyGone(err error) bool {
 // budget cannot tell that apart from a hang, so it expires on transfers that are merely slow and
 // healthy. Progress is the signal that survives both.
 type stallReader struct {
-	r    io.Reader
-	last atomic.Int64 // unix nanos of the last read that moved bytes
+	r     io.Reader
+	last  atomic.Int64 // unix nanos of the last read that moved bytes
+	total atomic.Int64
+	// done marks the end of the stream. Reads stop there while the storage layer is still
+	// committing, and that quiet tail is not a stall.
+	done atomic.Bool
 }
 
 func newStallReader(r io.Reader) *stallReader {
@@ -125,6 +129,10 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	n, err := s.r.Read(p)
 	if n > 0 {
 		s.last.Store(time.Now().UnixNano())
+		s.total.Add(int64(n))
+	}
+	if err != nil {
+		s.done.Store(true)
 	}
 	return n, err
 }
@@ -139,7 +147,14 @@ func cancelWhenStalled(ctx context.Context, cancel context.CancelFunc, s *stallR
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if time.Since(time.Unix(0, s.last.Load())) > limit {
+			// Once the stream has ended there is nothing left to stall: cancelling here would
+			// abort the commit of a body that arrived in full.
+			if s.done.Load() {
+				return
+			}
+			if idle := time.Since(time.Unix(0, s.last.Load())); idle > limit {
+				log.Warn().Dur("idle", idle).Int64("bytes", s.total.Load()).
+					Msg("Cancelling cache write - the stream delivered nothing for the stall window")
 				cancel()
 				return
 			}
