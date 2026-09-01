@@ -252,11 +252,14 @@ func (s *Server) setupRouter() *mux.Router {
 // If TLS is configured via SetTLS, the server listens with HTTPS.
 func (s *Server) Start() error {
 	s.httpServer = &http.Server{
-		Addr:         s.bindAddr,
-		Handler:      s.router,
-		ReadTimeout:  5 * time.Minute,
-		WriteTimeout: 5 * time.Minute,
-		IdleTimeout:  120 * time.Second,
+		Addr:    s.bindAddr,
+		Handler: s.router,
+		// No total read or write budget: both are caps on object size over link speed, and a
+		// multi-gigabyte archive outruns any of them. progressDeadlines bounds each transfer by
+		// progress instead. Only the wait for request headers keeps a fixed bound, since it has
+		// no reason to grow.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
@@ -305,7 +308,6 @@ func withProgressDeadlines(next http.Handler, window time.Duration) http.Handler
 			next.ServeHTTP(w, r)
 			return
 		}
-		_ = rc.SetReadDeadline(time.Now().Add(window))
 		if r.Body != nil {
 			r.Body = &progressBody{ReadCloser: r.Body, rc: rc, window: window}
 		}
@@ -321,6 +323,11 @@ type progressWriter struct {
 }
 
 func (p *progressWriter) Write(b []byte) (int, error) {
+	// Once the response starts, the request has been read and the read deadline has no work left to
+	// do. It has to be cleared rather than renewed: the server reads the connection in the
+	// background to notice a client hanging up, and it aborts that read by moving the read deadline
+	// itself. A deadline we set behind its back surfaces as a read error, which the server takes for
+	// a dead client and cancels the request mid-response.
 	// Renew before the write, so the chunk gets the whole window to drain.
 	_ = p.rc.SetWriteDeadline(time.Now().Add(p.window))
 	return p.ResponseWriter.Write(b)
@@ -342,6 +349,8 @@ type progressBody struct {
 }
 
 func (p *progressBody) Read(b []byte) (int, error) {
+	// Safe to renew here: the handler is doing this read itself, so the server has no background
+	// read of its own in flight to disturb.
 	_ = p.rc.SetReadDeadline(time.Now().Add(p.window))
 	return p.ReadCloser.Read(b)
 }
