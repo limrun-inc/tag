@@ -55,6 +55,101 @@ func TestSlowResponseOutlivesTheWriteBudget(t *testing.T) {
 	}
 }
 
+// TestBodylessResponseOutlivesTheWindow pins that a response outlives the stall window itself when
+// there is no request body to renew anything.
+//
+// The server reads the connection in the background to notice a client hanging up. A GET has no
+// body, so nothing on the read side ever renews its deadline; when it expires the background read
+// fails, the server takes the client for gone, and the request context is cancelled mid-response.
+// Writing is progress too, so it has to renew both.
+func TestBodylessResponseOutlivesTheWindow(t *testing.T) {
+	const window = 200 * time.Millisecond
+	const chunks = 10
+	const pause = 50 * time.Millisecond // 500ms total, well past the window
+
+	handler := withProgressDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for i := 0; i < chunks; i++ {
+			if _, err := w.Write([]byte("x")); err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(pause)
+		}
+	}), window)
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read the body: %v (the read deadline cancelled the request mid-response)", err)
+	}
+	if len(body) != chunks {
+		t.Errorf("got %d bytes, want %d: the response was truncated", len(body), chunks)
+	}
+}
+
+// TestDrippingClientKeepsItsResponse is the shape a rate-limited restore has: the server blocks on
+// writes because the client takes the bytes slowly, and the whole transfer runs many windows long.
+func TestDrippingClientKeepsItsResponse(t *testing.T) {
+	// Sized like production: a chunk drains in a fraction of the window, while the whole transfer
+	// runs for several windows.
+	const window = time.Second
+	const chunk = 64 << 10
+	const chunks = 64
+
+	served := make(chan error, 1)
+	handler := withProgressDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload := make([]byte, chunk)
+		for i := 0; i < chunks; i++ {
+			if _, err := w.Write(payload); err != nil {
+				served <- err
+				return
+			}
+		}
+		served <- nil
+	}), window)
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	// Drip: slow enough that the transfer spans several windows, never so slow that it stalls.
+	var total int
+	buf := make([]byte, 4<<10)
+	for {
+		n, err := res.Body.Read(buf)
+		total += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read after %d bytes: %v (the response was cut mid-body)", total, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := <-served; err != nil {
+		t.Errorf("the handler could not finish writing: %v", err)
+	}
+	if total != chunk*chunks {
+		t.Errorf("got %d bytes, want %d", total, chunk*chunks)
+	}
+}
+
 // TestSlowUploadOutlivesTheReadBudget is the same guarantee for the other direction: publishing an
 // archive through the gateway takes as long as it takes.
 func TestSlowUploadOutlivesTheReadBudget(t *testing.T) {
