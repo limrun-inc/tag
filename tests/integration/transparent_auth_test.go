@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/tag/auth"
+	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/proxy"
 )
 
@@ -207,6 +208,66 @@ func TestTransparentAuth_DifferentKeyAuthorizesCachedObjectUpstream(t *testing.T
 	require.Equal(t, proxy.XCacheHit, resp2.Header.Get(proxy.XCacheHeader))
 	require.Equal(t, int32(2), env.GetUpstreamRequestCount(), "second request should use one-byte auth probe")
 	require.Equal(t, int32(1), atomic.LoadInt32(&probeCount))
+}
+
+// A block-mode entry must not enter the unknown-key authorization path. That path serves
+// through the whole-body helpers, which cannot read block-mode bodies: they would report the
+// body missing and delete a valid entry. The request falls through to the miss path instead,
+// so no authorization probe is issued.
+func TestTransparentAuth_DifferentKeyBlockModeEntrySkipsProbe(t *testing.T) {
+	content := []byte("block-mode cached content")
+	etag := `"block-mode-etag"`
+	var probeCount int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		if r.Header.Get("Range") == "bytes=0-0" {
+			atomic.AddInt32(&probeCount, 1)
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(content[:1])
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	env := NewTestEnvironmentWithTransparentAuth(t, handler)
+	defer env.Close()
+
+	ctx := context.Background()
+	bucket := "block-mode-bucket"
+	key := "object.bin"
+	const blockSize = int64(4 * 1024 * 1024)
+
+	// Pre-store a block-mode entry whose identity matches upstream, so the only thing that
+	// can keep it out of the authorization path is the block-mode guard itself.
+	require.NoError(t, env.Cache.PutBlockStream(ctx, bucket, key, etag, blockSize, 0, bytes.NewReader(content), 300))
+	meta := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, ETag: etag,
+		ContentType:   "application/octet-stream",
+		ContentLength: int64(len(content)),
+		StatusCode:    http.StatusOK,
+		BlockSize:     blockSize,
+		LastModified:  time.Now().Unix(),
+	}
+	wrote, err := env.Cache.PutMetaTombstoneAware(ctx, bucket, key, meta, 300, time.Now().UnixNano())
+	require.NoError(t, err)
+	require.True(t, wrote, "block-mode meta write skipped")
+
+	req, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, content, body)
+	require.Equal(t, int32(0), atomic.LoadInt32(&probeCount),
+		"block-mode entry must not be authorized through the whole-body serve path")
 }
 
 func TestTransparentAuth_DifferentKeyChecksumModeHitsCache(t *testing.T) {

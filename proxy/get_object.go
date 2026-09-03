@@ -139,8 +139,12 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 		!bypassCache &&
 		s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+		// authorizePresignedAndServeCached serves through the whole-body helpers, which
+		// don't understand block-mode entries: they would report the body missing and
+		// delete a valid entry. A block-mode entry falls through to the miss path instead.
 		if cacheErr == nil &&
 			found &&
+			meta.BlockSize == 0 &&
 			cachedMetaSatisfiesRequest(r, meta) {
 			handled, authorizeErr := s.authorizePresignedAndServeCached(
 				ctx,
