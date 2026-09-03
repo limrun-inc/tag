@@ -210,6 +210,58 @@ func TestTransparentAuth_DifferentKeyAuthorizesCachedObjectUpstream(t *testing.T
 	require.Equal(t, int32(1), atomic.LoadInt32(&probeCount))
 }
 
+// A probe that reports the object gone must invalidate the entry. Otherwise a later read
+// that validates locally is still served from cache after the object was deleted upstream.
+func TestTransparentAuth_DifferentKeyProbeNotFoundInvalidates(t *testing.T) {
+	content := []byte("object that gets deleted upstream")
+	var deleted atomic.Bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if deleted.Load() {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("<Error><Code>NoSuchKey</Code></Error>"))
+			return
+		}
+		w.Header().Set("ETag", `"deleted-object-etag"`)
+		if r.Header.Get("Range") == "bytes=0-0" {
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(content[:1])
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	env := NewTestEnvironmentWithTransparentAuth(t, handler)
+	defer env.Close()
+
+	bucket := "probe-404-bucket"
+	key := "object.bin"
+
+	req1, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	require.NoError(t, err)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	deleted.Store(true)
+
+	req2, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	resp2.Body.Close()
+
+	require.Equal(t, http.StatusNotFound, resp2.StatusCode)
+	require.True(t, env.WaitForNotCached(bucket, key, 2*time.Second),
+		"entry for an object deleted upstream must not survive the probe")
+}
+
 // A block-mode entry must not enter the unknown-key authorization path. That path serves
 // through the whole-body helpers, which cannot read block-mode bodies: they would report the
 // body missing and delete a valid entry. The request falls through to the miss path instead,

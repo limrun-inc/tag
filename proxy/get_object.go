@@ -368,6 +368,12 @@ func (s *Service) authorizePresignedAndServeCached(
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		// The object is gone upstream, so the entry is stale and a later read that
+		// validates locally would serve it. Other failures describe the caller, not
+		// the object: a 403 must not let an unauthorized key evict a live entry.
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+			s.cache.Delete(context.Background(), bucket, key)
+		}
 		copyHeaders(w.Header(), resp.Header)
 		writeCacheStatus(w, XCacheMiss)
 		w.WriteHeader(resp.StatusCode)
