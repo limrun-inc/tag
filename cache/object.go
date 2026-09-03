@@ -121,12 +121,19 @@ type WriteHeaderOption func(http.Header)
 
 // WithRangeHeaders overrides Content-Length for the range size and adds
 // Content-Range and Accept-Ranges headers for 206 Partial Content responses.
+// Stored checksums describe the whole object, so they are dropped: a client
+// validating one against a partial body would see a spurious mismatch.
 func WithRangeHeaders(start, end, totalSize int64) WriteHeaderOption {
 	return func(h http.Header) {
 		contentLength := end - start + 1
 		h.Set("Content-Length", strconv.FormatInt(contentLength, 10))
 		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
 		h.Set("Accept-Ranges", "bytes")
+		for name := range h {
+			if strings.HasPrefix(strings.ToLower(name), "x-amz-checksum-") {
+				h.Del(name)
+			}
+		}
 	}
 }
 

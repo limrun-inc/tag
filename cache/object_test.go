@@ -111,6 +111,32 @@ func TestCachedObjectMeta_WriteHeaders(t *testing.T) {
 	}
 }
 
+// A stored checksum covers the whole object, so a range response must not carry it.
+func TestCachedObjectMeta_WriteHeaders_RangeDropsChecksums(t *testing.T) {
+	obj := &CachedObjectMeta{
+		ETag:          `"abc123"`,
+		ContentType:   "application/octet-stream",
+		ContentLength: 1024,
+		ChecksumHeaders: map[string]string{
+			"X-Amz-Checksum-Crc32c": "checksum-value",
+		},
+		StatusCode: http.StatusPartialContent,
+	}
+
+	w := httptest.NewRecorder()
+	obj.WriteHeaders(w, WithRangeHeaders(0, 99, 1024))
+
+	if got := w.Header().Get("X-Amz-Checksum-Crc32c"); got != "" {
+		t.Errorf("X-Amz-Checksum-Crc32c = %q, want it dropped on a range response", got)
+	}
+	if got := w.Header().Get("Content-Range"); got != "bytes 0-99/1024" {
+		t.Errorf("Content-Range = %q, want bytes 0-99/1024", got)
+	}
+	if got := w.Header().Get("Content-Length"); got != "100" {
+		t.Errorf("Content-Length = %q, want 100", got)
+	}
+}
+
 func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 	tests := []struct {
 		name         string

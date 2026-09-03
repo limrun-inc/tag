@@ -743,12 +743,13 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 
 	if (result == AuthValidated || isAnonymous) && !bypassCache && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
-		cacheHit := cacheErr == nil && found && meta != nil
+		cacheHit := cacheErr == nil && found && cachedMetaSatisfiesRequest(r, meta)
 		if cacheHit && isAnonymous && !meta.IsPublicRead() {
 			cacheHit = false
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping HEAD cache for anonymous request - object not public")
 		}
 		if cacheHit {
+			hideUnrequestedChecksums(r, meta)
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			if forceRevalidate && meta.ETag != "" {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD cache hit requires revalidation (client-triggered)")
@@ -1049,7 +1050,10 @@ func isCacheEligiblePresignedRequest(r *http.Request) bool {
 		}
 		switch key {
 		case "X-Amz-Checksum-Mode":
-			if r.Method != http.MethodGet || len(values) == 0 {
+			// HeadObject takes a checksum mode as well, and the cache serves it the
+			// same way it serves GET: only from an entry that carries the checksums.
+			if len(values) == 0 ||
+				(r.Method != http.MethodGet && r.Method != http.MethodHead) {
 				return false
 			}
 			for _, value := range values {
@@ -1077,8 +1081,24 @@ func isCacheEligiblePresignedRequest(r *http.Request) bool {
 	return true
 }
 
+// hideUnrequestedChecksums drops stored checksums when the caller did not ask for them.
+// S3 returns x-amz-checksum-* only for a checksum-mode read, and a cache entry populated
+// in checksum mode is shared with callers that did not request it. Meta is decoded per
+// request, so clearing it affects only this response.
+func hideUnrequestedChecksums(r *http.Request, meta *cache.CachedObjectMeta) {
+	if meta != nil && !requestsChecksumMode(r) {
+		meta.ChecksumHeaders = nil
+	}
+}
+
+// requestsChecksumMode reports whether the caller asked for the object's checksums.
+// SDKs send x-amz-checksum-mode as a header and presigning moves it into the query
+// string, so the same request arrives either way and both must be recognised.
 func requestsChecksumMode(r *http.Request) bool {
 	values, ok := r.URL.Query()["X-Amz-Checksum-Mode"]
+	if !ok {
+		values, ok = r.Header["X-Amz-Checksum-Mode"]
+	}
 	if !ok || len(values) == 0 {
 		return false
 	}

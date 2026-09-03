@@ -244,6 +244,12 @@ func TestIsCacheEligiblePresignedRequest(t *testing.T) {
 			name:   "HEAD with checksum mode",
 			method: http.MethodHead,
 			target: "/bucket/key?X-Amz-Checksum-Mode=ENABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			want:   true,
+		},
+		{
+			name:   "PUT with checksum mode",
+			method: http.MethodPut,
+			target: "/bucket/key?X-Amz-Checksum-Mode=ENABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
 			want:   false,
 		},
 		{
@@ -369,6 +375,46 @@ func TestCachedMetaSatisfiesChecksumRequest(t *testing.T) {
 	if !cachedMetaSatisfiesRequest(plainRequest, withoutChecksum) {
 		t.Error("plain request rejected otherwise valid cached metadata")
 	}
+}
+
+func TestHideUnrequestedChecksums(t *testing.T) {
+	checksumRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/bucket/key?X-Amz-Checksum-Mode=ENABLED",
+		nil,
+	)
+	headerRequest := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	headerRequest.Header.Set("X-Amz-Checksum-Mode", "ENABLED")
+	plainRequest := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	newMeta := func() *cache.CachedObjectMeta {
+		return &cache.CachedObjectMeta{
+			ETag: `"etag"`,
+			ChecksumHeaders: map[string]string{
+				"x-amz-checksum-crc32c": "checksum-value",
+			},
+		}
+	}
+
+	kept := newMeta()
+	hideUnrequestedChecksums(checksumRequest, kept)
+	if len(kept.ChecksumHeaders) != 1 {
+		t.Errorf("ChecksumHeaders = %#v, want the checksum kept for a checksum-mode request", kept.ChecksumHeaders)
+	}
+
+	keptForHeader := newMeta()
+	hideUnrequestedChecksums(headerRequest, keptForHeader)
+	if len(keptForHeader.ChecksumHeaders) != 1 {
+		t.Errorf("ChecksumHeaders = %#v, want the checksum kept for a header-signed checksum-mode request",
+			keptForHeader.ChecksumHeaders)
+	}
+
+	dropped := newMeta()
+	hideUnrequestedChecksums(plainRequest, dropped)
+	if len(dropped.ChecksumHeaders) != 0 {
+		t.Errorf("ChecksumHeaders = %#v, want no checksum for a request that did not ask", dropped.ChecksumHeaders)
+	}
+
+	hideUnrequestedChecksums(plainRequest, nil) // must not panic
 }
 
 func TestResponseCapture_ContentLength(t *testing.T) {

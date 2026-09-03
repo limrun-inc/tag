@@ -146,6 +146,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			found &&
 			meta.BlockSize == 0 &&
 			cachedMetaSatisfiesRequest(r, meta) {
+			hideUnrequestedChecksums(r, meta)
 			handled, authorizeErr := s.authorizePresignedAndServeCached(
 				ctx,
 				w,
@@ -166,6 +167,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	if (result == AuthValidated || isAnonymous) && !bypassCache && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 		cacheHit := cacheErr == nil && found && cachedMetaSatisfiesRequest(r, meta)
+		if cacheHit {
+			hideUnrequestedChecksums(r, meta)
+		}
 		// Anonymous requests can only be served from cache if the object's ACL allows it
 		if cacheHit && isAnonymous && !meta.IsPublicRead() {
 			cacheHit = false
@@ -304,10 +308,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	}
 
 	// Full object request: use broadcast manager for streaming coalescing
-	bcastKey := makeBroadcastKey(bucket, key, rangeHeader)
-	if auth.IsPresignedRequest(r) {
-		bcastKey += ":presigned:" + presignedCoalescingKey(r)
-	}
+	bcastKey := requestBroadcastKey(r, bucket, key, rangeHeader)
 	broadcaster, isFirstCaller := s.broadcastManager.GetOrCreate(bcastKey)
 
 	// Update active broadcasts metric
@@ -422,6 +423,21 @@ func probeTotalSize(contentRange string) (int64, bool) {
 	}
 	total, err := strconv.ParseInt(contentRange[slash+1:], 10, 64)
 	return total, err == nil && total >= 0
+}
+
+// requestBroadcastKey names the upstream fetch that a request may share with others.
+// Callers coalesce onto one response, so requests that would receive different bytes or
+// different headers from S3 must not share a key: checksum mode changes the headers, and
+// a presigned URL carries its own authority and variant parameters.
+func requestBroadcastKey(r *http.Request, bucket, key, rangeHeader string) string {
+	bcastKey := makeBroadcastKey(bucket, key, rangeHeader)
+	if requestsChecksumMode(r) {
+		bcastKey += ":checksum"
+	}
+	if auth.IsPresignedRequest(r) {
+		bcastKey += ":presigned:" + presignedCoalescingKey(r)
+	}
+	return bcastKey
 }
 
 func presignedCoalescingKey(r *http.Request) string {
