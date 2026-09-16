@@ -236,6 +236,49 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 	}
 }
 
+func TestBroadcasterRequiredConsumerAppliesBackpressure(t *testing.T) {
+	b := NewBroadcaster(1)
+	listener := b.SubscribeRequired()
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	b.Broadcast([]byte("first"))
+
+	secondSent := make(chan struct{})
+	go func() {
+		b.Broadcast([]byte("second"))
+		close(secondSent)
+	}()
+
+	select {
+	case <-secondSent:
+		t.Fatal("required consumer with a full buffer must apply backpressure")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	first := <-listener.Chunks()
+	if string(first.Data) != "first" {
+		t.Fatalf("first chunk = %q, want %q", first.Data, "first")
+	}
+	first.Release()
+
+	select {
+	case <-secondSent:
+	case <-time.After(time.Second):
+		t.Fatal("broadcast did not resume after required consumer drained")
+	}
+
+	second := <-listener.Chunks()
+	if string(second.Data) != "second" {
+		t.Fatalf("second chunk = %q, want %q", second.Data, "second")
+	}
+	second.Release()
+
+	if listener.disconnected {
+		t.Fatal("required consumer must not be disconnected when its buffer fills")
+	}
+	b.Complete(nil)
+}
+
 func TestBroadcasterContextCancellation(t *testing.T) {
 	b := NewBroadcaster(DefaultChannelBuffer)
 

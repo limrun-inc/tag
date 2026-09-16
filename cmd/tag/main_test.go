@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/tigrisdata/ocache/coordinator"
 )
 
 // tagBinary returns the path to the pre-built TAG binary.
@@ -88,5 +90,17 @@ func TestUnknownFlag(t *testing.T) {
 	err := cmd.Run()
 	if err == nil {
 		t.Error("tag --unknown-flag should exit with non-zero status")
+	}
+}
+
+func TestCacheGRPCKeepalivePolicyMatchesOCacheClient(t *testing.T) {
+	clientKeepalive := coordinator.DefaultRouterConfig().KeepaliveTime
+	policy := cacheGRPCKeepalivePolicy()
+
+	if !policy.PermitWithoutStream {
+		t.Fatal("OCache clients ping idle peer connections, so the server must permit pings without streams")
+	}
+	if policy.MinTime > clientKeepalive {
+		t.Fatalf("server minimum ping interval %s exceeds OCache client interval %s", policy.MinTime, clientKeepalive)
 	}
 }
