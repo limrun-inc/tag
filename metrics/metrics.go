@@ -27,7 +27,9 @@ var (
 			// DefBuckets plus extra resolution in the 1-10s tail (1.5, 2, 3, 4, 7.5):
 			// the default 1 -> 2.5 -> 5 -> 10 jumps are too coarse to localize p99 during
 			// tail investigations — quantiles interpolate across whole seconds.
-			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10},
+			// The buckets past 10s separate a slow transfer from a stalled one: an app
+			// download that trickles for minutes otherwise lands in +Inf with the rest.
+			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 15, 30, 60, 120, 300, 600, 900},
 		},
 		[]string{"operation"},
 	)
@@ -133,6 +135,17 @@ var (
 			Help: "Total cache populates skipped due to the concurrent-cache-write limit, by source",
 		},
 		[]string{"source"},
+	)
+
+	// BodyCopyFailures counts streamed responses that ended short, by the side
+	// that failed. The request itself still counts as a success, because the
+	// headers already went out, so this is the only record of a cut transfer.
+	BodyCopyFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_body_copy_failures_total",
+			Help: "Streamed responses cut short, by the side that failed: upstream read or client write",
+		},
+		[]string{"side"},
 	)
 
 	// BytesTransferred tracks bytes transferred.
