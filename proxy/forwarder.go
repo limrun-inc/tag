@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -222,6 +224,15 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
 
+	// The upstream address tells a bad Tigris endpoint apart from a bad path,
+	// and only the connection knows it once DNS and host aliases have resolved.
+	var upstreamAddr atomic.Value
+	fwdReq = fwdReq.WithContext(httptrace.WithClientTrace(fwdReq.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			upstreamAddr.Store(info.Conn.RemoteAddr().String())
+		},
+	}))
+
 	upstreamStart := time.Now()
 	resp, err := b.httpClient.Do(fwdReq)
 	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
@@ -246,14 +257,54 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 	// Stream response back to client
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	n, copyErr := io.Copy(w, resp.Body)
+	body := &readErrRecorder{r: resp.Body}
+	bodyStart := time.Now()
+	n, copyErr := io.Copy(w, body)
+	elapsed := time.Since(bodyStart)
+	addr, _ := upstreamAddr.Load().(string)
 	if copyErr != nil {
-		log.Warn().Err(copyErr).Msg("Failed to copy response body to client")
+		side := "client"
+		if body.err != nil {
+			side = "upstream"
+		}
+		metrics.BodyCopyFailures.WithLabelValues(side).Inc()
+		log.Warn().Err(copyErr).Str("side", side).Str("path", fwdReq.URL.Path).Str("upstream_addr", addr).
+			Int64("bytes", n).Int64("elapsed_ms", elapsed.Milliseconds()).Msg("Failed to copy response body to client")
+	} else if isSlowTransfer(n, elapsed) {
+		log.Warn().Str("path", fwdReq.URL.Path).Str("upstream_addr", addr).Int64("bytes", n).
+			Int64("elapsed_ms", elapsed.Milliseconds()).Msg("Slow upstream transfer")
 	}
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
 	return resp.StatusCode, respHeaders, nil
+}
+
+// A healthy transfer runs at tens of MB/s, so one that is both long and under
+// 2 MiB/s is a trickle worth a log line, while a large archive that simply
+// takes a while is not.
+const (
+	slowTransferMinDuration = 10 * time.Second
+	slowTransferMaxRate     = 2 << 20 // bytes per second
+)
+
+func isSlowTransfer(bytes int64, elapsed time.Duration) bool {
+	return elapsed >= slowTransferMinDuration && float64(bytes)/elapsed.Seconds() < slowTransferMaxRate
+}
+
+// readErrRecorder keeps the upstream read error, because io.Copy reports one
+// error for both sides and the side decides who to blame for a cut transfer.
+type readErrRecorder struct {
+	r   io.Reader
+	err error
+}
+
+func (r *readErrRecorder) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		r.err = err
+	}
+	return n, err
 }
 
 // executeAndCapture executes the request, streams to client, and captures the response.
