@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
@@ -78,9 +77,19 @@ func teeObjectSize(r *http.Request) int64 {
 // threshold, and the populate budget admits it without blocking — it tees the decoded body
 // so the caller can populate the cache without a read-back warm GET. It returns a non-nil
 // *teeState only when a tee was attempted; the caller must then route it through
-// writeThroughCache (which releases the reserved budget). Otherwise it performs a plain
-// forward and returns nil, and the caller falls back to warm-on-write.
-func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string) (*teeState, error) {
+// writeThroughCache (which releases the reserved budget). A PUT request policy that
+// conclusively rejects shared caching takes the plain-forward path before tee admission and
+// returns requestRejectsCache=true so the caller also skips the read-back warm. Other plain
+// forwards return nil, false and fall back to warm-on-write.
+func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string) (teed *teeState, requestRejectsCache bool, err error) {
+	if s.config.Cache.WarmOnWrite && s.cache.IsEnabled() {
+		// net/http canonicalizes incoming header keys. Avoid parsing a policy on the
+		// common cacheable path, which has no Cache-Control field at all.
+		if cacheControls := r.Header["Cache-Control"]; len(cacheControls) > 0 && hasNoCacheDirectives(cacheControls) {
+			return nil, true, s.forwarder.Forward(ctx, w, r)
+		}
+	}
+
 	tf, ok := s.forwarder.(bodyTeeingForwarder)
 	size := teeObjectSize(r)
 	eligible := ok &&
@@ -110,7 +119,7 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		size <= s.config.Cache.SizeThreshold
 
 	if !eligible {
-		return nil, s.forwarder.Forward(ctx, w, r)
+		return nil, false, s.forwarder.Forward(ctx, w, r)
 	}
 
 	// Non-blocking admission: the tee runs on the client PUT path, so it must never block
@@ -118,18 +127,21 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 	// without blocking; on denial we fall back to a plain forward + (async, blocking)
 	// warm-on-write, so the object still gets cached under budget pressure.
 	if !s.acquireCacheSlot(ctx, size, priorityReadMiss) {
-		return nil, s.forwarder.Forward(ctx, w, r)
+		return nil, false, s.forwarder.Forward(ctx, w, r)
 	}
 
 	// Preallocate to the exact known size to avoid repeated append reallocations on the
 	// write hot path.
-	ts := &teeState{buf: &cappedBuffer{buf: make([]byte, 0, int(size)), cap: int(size)}, weight: size}
+	ts := &teeState{
+		buf:    &cappedBuffer{buf: make([]byte, 0, int(size)), cap: int(size)},
+		weight: size,
+	}
 	status, headers, accessKey, secretKey, err := tf.ForwardTeeingBody(ctx, w, r, ts.buf)
 	ts.statusCode = status
 	ts.respHeaders = headers
 	ts.accessKey = accessKey
 	ts.secretKey = secretKey
-	return ts, err
+	return ts, false, err
 }
 
 // writeThroughCache populates the cache from a teed PutObject body without a full-object
@@ -137,9 +149,10 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 // headers a GET would, minus the body), so the cached entry can never diverge from an origin
 // GET, then writes that meta with the bytes already teed.
 //
-// Returns true when the write was handed off to the async path (which caches the object or,
-// if the HEAD can't confirm it, falls back to a read-back warm), false when it declined
-// synchronously (over-cap body, missing ETag, or no usable credentials) so the caller warms.
+// Returns true when the tee was handed off to the async path (which caches the object or,
+// if the HEAD can't confirm it, falls back to a read-back warm). It returns false only when
+// it declined synchronously (over-cap body, missing ETag, or no usable credentials) so the
+// caller warms.
 // The reserved populate budget is always released: synchronously on decline, or when the
 // async work completes.
 func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
@@ -178,8 +191,14 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		// Holding the tee reservation across this doesn't stall the warm: triggerBackgroundCacheFetch
 		// only SPAWNS the fetch and returns, so this goroutine returns and its deferred release frees
 		// the slot, which the warm's (separate) blocking acquire then observes.
+		// Token at trigger time, like warmOnWrite: repairs exactly the state
+		// this write left (absence, or the survivor of a failed invalidation).
+		warmTok, ok := s.warmToken(bucket, key)
+		if !ok {
+			return
+		}
 		metrics.WarmOnWriteTriggered.Inc()
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
+		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
 	}()
 	return true
 }
@@ -199,13 +218,19 @@ const (
 // authoritatively shows the object should not be cached (so warming is pointless), and
 // teeFallbackWarm when it couldn't confirm/write the version (so a read-back warm may help).
 func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte, accessKey, secretKey string) teeOutcome {
-	// Stamp the tombstone reference BEFORE the HEAD (mirroring warm-on-write, which stamps
-	// before its fetch), so the whole HEAD-to-write window is guarded: a competing overwrite
-	// whose invalidation lands after this point is newer than writeStartTime and skips our
-	// write, while one that landed earlier is caught by the ETag-consistency check below. It
-	// is still newer than this PUT's own post-forward invalidation (stamped before this
-	// goroutine ran), so our own invalidation doesn't block us.
-	writeStartTime := time.Now().UnixNano()
+	// Decision-time token BEFORE the HEAD (mirroring the populate paths), so
+	// the whole HEAD-to-write window is ordered: a competing overwrite whose
+	// invalidation lands after this read bumps the fence past this token and
+	// the write loses, while one that landed earlier is caught by the
+	// ETag-consistency check below. Read after this PUT's own post-forward
+	// invalidation (this goroutine runs after it), so our own fence doesn't
+	// block us.
+	_, expected, _, tokErr := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+	if tokErr != nil {
+		// No token, no ordered commit: fall back to the warm, which reads its
+		// own token (and skips likewise if the store is still failing).
+		return teeFallbackWarm
+	}
 
 	headCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 	defer cancel()
@@ -245,14 +270,16 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	ttl := int(s.config.Cache.TTL.Seconds())
 	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
 	defer cacheCancel()
-	wrote, err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime)
+	// Put-if-absent: this tee follows the PUT's own invalidation; a racer that
+	// re-established the entry (a warm) caches the current version and wins.
+	wrote, err := s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through cache tee write failed")
 		return teeFallbackWarm
 	}
 	if !wrote {
-		// A newer tombstone (competing DELETE/overwrite) superseded our teed version, so
-		// nothing was cached. Warm instead: its own writeStartTime is newer than that tombstone,
+		// A newer fence or write (competing DELETE/overwrite) superseded our teed version, so
+		// nothing was cached. Warm instead: its own decision-time token postdates that change,
 		// so it caches the CURRENT version (or no-ops on a delete) rather than our stale body.
 		return teeFallbackWarm
 	}

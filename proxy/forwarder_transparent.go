@@ -32,6 +32,8 @@ type transparentForwarder struct {
 	validator       *auth.RequestValidator
 	keyUnwrapper    *auth.KeyUnwrapper
 	authzCache      *auth.AuthzCache
+	credentialStore *auth.CredentialStore
+	credentialAuth  *auth.RequestValidator
 }
 
 // initInterceptor sets the response interceptor on the base forwarder.
@@ -48,9 +50,33 @@ func (f *transparentForwarder) interceptResponse(resp *http.Response, originalRe
 	f.handleAuthzRevocation(resp, originalReq)
 }
 
+// shallowHeaderCopy gives the forwarded request its own header map while
+// reusing the immutable value slices owned by the client request. Header.Set
+// and Header.Del replace or remove entries, so the values for headers changed
+// by this forwarder do not alias the inbound map. The unchanged slices are
+// read-only for the lifetime of the outbound request, as required by the
+// net/http RoundTripper contract.
+func shallowHeaderCopy(header http.Header) http.Header {
+	if header == nil {
+		return make(http.Header)
+	}
+
+	copied := make(http.Header, len(header)+4)
+	for key, values := range header {
+		if values != nil {
+			// Keep the data borrowed but prevent an append on the forwarded
+			// entry from reusing the inbound slice's spare capacity.
+			values = values[:len(values):len(values)]
+		}
+		copied[key] = values
+	}
+	return copied
+}
+
 // buildTransparentRequest creates a forwarded request for transparent proxy mode.
-// Copies ALL headers from the original request (including Authorization, X-Amz-Date, etc.)
-// and adds the 4 proxy headers. The body is streamed as-is without decoding.
+// Copies the header map while borrowing unchanged header-value slices. The body
+// is streamed as-is without decoding. Headers changed for the upstream request
+// remain private to the forwarded request.
 //
 // For AWS chunked transfer encoding (streaming SigV4), ensures the required
 // Content-Encoding: aws-chunked header is present per the S3 spec. Some clients
@@ -90,9 +116,15 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Clone ALL headers from the original request (preserving Authorization, X-Amz-Date, etc.)
-	// Clone avoids mutating the original request headers when adding proxy headers below.
-	fwdReq.Header = r.Header.Clone()
+	// Keep the map itself private so proxy credentials and any synthesized
+	// headers are never visible through the inbound request. Unchanged value
+	// slices are borrowed and must not be mutated by the transport.
+	fwdReq.Header = shallowHeaderCopy(r.Header)
+	if _, ok := PresignedVirtualHostBucket(r); ok {
+		// Keep dialing the configured upstream endpoint for TLS and connection
+		// policy, but route the HTTP request through the original bucket host.
+		fwdReq.Host = r.Host
+	}
 
 	// Ensure X-Amz-Date is present for Tigris's proxy validation path.
 	// Some SDK versions (botocore 1.42+) sign with "date" in SignedHeaders
@@ -198,6 +230,25 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		return AuthNotValidated, mapAuthError(err)
 	}
 
+	bucket, _ := ParseBucketKey(r)
+	if authInfo.IsPresigned && hasSessionToken(r) {
+		metrics.RecordLocalAuthValidation("temporary_credentials")
+		return AuthNotValidated, nil
+	}
+
+	if f.credentialStore != nil && f.credentialStore.HasCredential(authInfo.AccessKey) {
+		if _, err := f.credentialAuth.ValidateRequest(r); err != nil {
+			metrics.RecordLocalAuthValidation("signature_mismatch")
+			return AuthNotValidated, nil
+		}
+		if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
+			metrics.RecordLocalAuthValidation("authz_expired")
+			return AuthNotValidated, nil
+		}
+		metrics.RecordLocalAuthValidation("success")
+		return AuthValidated, nil
+	}
+
 	// Check if we have any signing key for this access key
 	if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
 		metrics.RecordLocalAuthValidation("unknown_key")
@@ -215,7 +266,6 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 	}
 
 	// Check authorization cache
-	bucket, _ := ParseBucketKey(r)
 	if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
 		metrics.RecordLocalAuthValidation("authz_expired")
 		log.Debug().Str("bucket", bucket).Msg("Local auth: authz expired for bucket")
@@ -259,6 +309,28 @@ func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.R
 	return f.executeRequest(fwdReq, r.ContentLength, r)
 }
 
+func (f *transparentForwarder) AuthorizePresignedRequest(
+	ctx context.Context,
+	r *http.Request,
+	accessKey, secretKey string,
+	rangeProbe bool,
+) (*http.Response, error) {
+	probe := r.Clone(ctx)
+	probe.Body = nil
+	probe.ContentLength = 0
+	if rangeProbe {
+		probe.Header.Set("Range", "bytes=0-0")
+	} else {
+		probe.Header.Del("Range")
+	}
+
+	fwdReq, err := f.buildTransparentRequest(ctx, probe)
+	if err != nil {
+		return nil, err
+	}
+	return f.executeRequest(fwdReq, 0, probe)
+}
+
 // learnSigningKeys extracts and caches derived signing keys from the Tigris response.
 // The signing keys header is always stripped before the response reaches the client.
 func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Request) {
@@ -270,6 +342,23 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 		return
 	}
 
+	var authInfo *auth.AuthInfo
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var err error
+		authInfo, err = auth.ParseAuthInfo(r)
+		if err == nil {
+			bucket, _ := ParseBucketKey(r)
+			if authInfo.IsPresigned && hasSessionToken(r) {
+				log.Debug().Str("bucket", bucket).Msg("Skipping local auth learning for temporary credentials")
+				return
+			}
+			if f.credentialStore != nil && f.credentialStore.HasCredential(authInfo.AccessKey) {
+				f.authzCache.Grant(authInfo.AccessKey, bucket)
+				metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+			}
+		}
+	}
+
 	// Header may be absent on 2xx if feature is disabled on Tigris side, or non-proxy request
 	if headerVal == "" || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if headerVal == "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -278,10 +367,13 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 		return
 	}
 
-	authInfo, err := auth.ParseAuthInfo(r)
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to parse auth info for signing key learning")
-		return
+	if authInfo == nil {
+		var err error
+		authInfo, err = auth.ParseAuthInfo(r)
+		if err != nil {
+			log.Debug().Err(err).Msg("Failed to parse auth info for signing key learning")
+			return
+		}
 	}
 
 	entries, err := f.keyUnwrapper.Unwrap(headerVal, authInfo.AccessKey)

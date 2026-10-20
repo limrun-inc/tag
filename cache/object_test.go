@@ -18,6 +18,7 @@ func TestMetaFromHTTPHeaders(t *testing.T) {
 	headers.Set("X-Amz-Meta-Custom", "custom-value")
 	headers.Set("X-Amz-Storage-Class", "STANDARD")
 	headers.Set("X-Amz-Acl", "public-read")
+	headers.Set("X-Amz-Checksum-Crc32c", "checksum-value")
 
 	obj := MetaFromHTTPHeaders("test-bucket", "test-key", http.StatusOK, headers)
 
@@ -52,6 +53,9 @@ func TestMetaFromHTTPHeaders(t *testing.T) {
 	if obj.ACL != "public-read" {
 		t.Errorf("ACL = %q, want %q", obj.ACL, "public-read")
 	}
+	if obj.ChecksumHeaders["x-amz-checksum-crc32c"] != "checksum-value" {
+		t.Errorf("ChecksumHeaders = %#v, want CRC32C checksum", obj.ChecksumHeaders)
+	}
 
 	if obj.StatusCode != http.StatusOK {
 		t.Errorf("StatusCode = %d, want %d", obj.StatusCode, http.StatusOK)
@@ -73,6 +77,9 @@ func TestCachedObjectMeta_WriteHeaders(t *testing.T) {
 		StorageClass:  "STANDARD",
 		UserMetadata: map[string]string{
 			"X-Amz-Meta-Custom": "custom-value",
+		},
+		ChecksumHeaders: map[string]string{
+			"X-Amz-Checksum-Crc32c": "checksum-value",
 		},
 		StatusCode: http.StatusOK,
 	}
@@ -96,8 +103,15 @@ func TestCachedObjectMeta_WriteHeaders(t *testing.T) {
 		t.Errorf("Cache-Control header = %q, want %q", w.Header().Get("Cache-Control"), "max-age=3600")
 	}
 
-	if w.Header().Get("X-Amz-Meta-Custom") != "custom-value" {
-		t.Errorf("X-Amz-Meta-Custom header = %q, want %q", w.Header().Get("X-Amz-Meta-Custom"), "custom-value")
+	// User metadata is written via the raw map so the WIRE name stays lowercase
+	// (S3's convention; botocore derives Metadata keys from the case-preserved
+	// wire name). Header.Get canonicalizes its lookup and cannot see raw keys, so
+	// assert the map directly — real clients re-canonicalize on their own side.
+	if got := w.Header()["x-amz-meta-custom"]; len(got) != 1 || got[0] != "custom-value" {
+		t.Errorf("x-amz-meta-custom = %v, want [custom-value]", got)
+	}
+	if w.Header().Get("X-Amz-Checksum-Crc32c") != "checksum-value" {
+		t.Errorf("X-Amz-Checksum-Crc32c = %q, want checksum-value", w.Header().Get("X-Amz-Checksum-Crc32c"))
 	}
 }
 
@@ -320,13 +334,18 @@ func TestCachedObjectMeta_WriteHeaders_MetadataLowercase(t *testing.T) {
 	w := httptest.NewRecorder()
 	meta.WriteHeaders(w)
 
-	// Metadata headers should be written with lowercase keys
-	// http.Header.Get is case-insensitive, so it will find headers regardless of case
-	if w.Header().Get("x-amz-meta-custom") != "custom-value" {
-		t.Errorf("x-amz-meta-custom = %q, want %q", w.Header().Get("x-amz-meta-custom"), "custom-value")
+	// Metadata headers must land on the wire with LOWERCASE names — this test's
+	// original intent, now literal: the raw map is asserted because Header.Get
+	// canonicalizes its lookup and a canonical entry here would mean the wire
+	// carries X-Amz-Meta-..., which botocore surfaces as key "Custom" not "custom".
+	if got := w.Header()["x-amz-meta-custom"]; len(got) != 1 || got[0] != "custom-value" {
+		t.Errorf("x-amz-meta-custom = %v, want [custom-value]", got)
 	}
-	if w.Header().Get("x-amz-meta-foo") != "foo-value" {
-		t.Errorf("x-amz-meta-foo = %q, want %q", w.Header().Get("x-amz-meta-foo"), "foo-value")
+	if got := w.Header()["x-amz-meta-foo"]; len(got) != 1 || got[0] != "foo-value" {
+		t.Errorf("x-amz-meta-foo = %v, want [foo-value]", got)
+	}
+	if canonical := w.Header()["X-Amz-Meta-Custom"]; len(canonical) != 0 {
+		t.Errorf("canonical-cased duplicate present: %v", canonical)
 	}
 }
 

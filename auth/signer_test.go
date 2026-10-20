@@ -6,9 +6,20 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
+
+func newReservedCanonicalQueryValues() url.Values {
+	return url.Values{
+		"prefix/with space": {"one/two", "a b", "100%"},
+		"x+y":               {"日本", ""},
+	}
+}
+
+const reservedCanonicalQueryString = "prefix%2Fwith%20space=100%25&prefix%2Fwith%20space=a%20b&prefix%2Fwith%20space=one%2Ftwo&x%2By=&x%2By=%E6%97%A5%E6%9C%AC"
 
 func TestRequestSigner_SignRequest(t *testing.T) {
 	signer := NewRequestSigner("https://s3.amazonaws.com", "us-east-1")
@@ -137,6 +148,91 @@ func TestRequestSigner_SignRequest(t *testing.T) {
 	}
 }
 
+func TestRequestSigner_ResignPresignedRequest(t *testing.T) {
+	signingTime := time.Now().UTC().Truncate(time.Second)
+	source := newPresignedTestRequest(
+		t,
+		http.MethodGet,
+		"/test-bucket/test-key",
+		signingTime,
+		15*time.Minute,
+		url.Values{"response-content-type": {"text/plain"}},
+	)
+	source.Header.Set("Origin", "https://app.example.com")
+	source.Header.Set("Accept", "text/plain;   q=1")
+	sourceQuery := source.URL.Query()
+	sourceQuery.Set("X-Amz-SignedHeaders", "accept;host")
+	source.URL.RawQuery = sourceQuery.Encode()
+	sourceInfo, err := ParseAuthInfo(source)
+	if err != nil {
+		t.Fatalf("ParseAuthInfo() error = %v", err)
+	}
+	sourceSigningKey := deriveSigningKey(
+		testSecretKey,
+		signingTime.Format(shortTimeFormat),
+		testRegion,
+	)
+	sourceSignature := NewRequestValidator(NewCredentialStore()).computePresignedSignature(
+		source,
+		sourceInfo,
+		sourceSigningKey,
+		unsignedPayload,
+		signingTime,
+	)
+	sourceQuery.Set("X-Amz-Signature", sourceSignature)
+	source.URL.RawQuery = sourceQuery.Encode()
+
+	originalDate := source.URL.Query().Get("X-Amz-Date")
+	originalExpires := source.URL.Query().Get("X-Amz-Expires")
+	originalSignature := source.URL.Query().Get("X-Amz-Signature")
+
+	signer := NewRequestSigner("https://upstream.example.com", "us-west-2")
+	req, err := signer.ResignPresignedRequest(
+		t.Context(),
+		source,
+		testAccessKey,
+		testSecretKey,
+	)
+	if err != nil {
+		t.Fatalf("ResignPresignedRequest() error = %v", err)
+	}
+
+	query := req.URL.Query()
+	if req.URL.Host != "upstream.example.com" {
+		t.Errorf("Host = %q, want %q", req.URL.Host, "upstream.example.com")
+	}
+	if req.Header.Get("Authorization") != "" {
+		t.Error("Authorization header must be absent on a query-signed request")
+	}
+	if req.Header.Get("Origin") != "https://app.example.com" {
+		t.Errorf("Origin = %q, want preserved", req.Header.Get("Origin"))
+	}
+	if req.Header.Get("Accept") != "text/plain;   q=1" {
+		t.Errorf("Accept = %q, want signed header preserved", req.Header.Get("Accept"))
+	}
+	if query.Get("X-Amz-Date") != originalDate {
+		t.Errorf("X-Amz-Date = %q, want original %q", query.Get("X-Amz-Date"), originalDate)
+	}
+	if query.Get("X-Amz-Expires") != originalExpires {
+		t.Errorf("X-Amz-Expires = %q, want original %q", query.Get("X-Amz-Expires"), originalExpires)
+	}
+	if query.Get("X-Amz-Signature") == originalSignature {
+		t.Error("upstream signature must differ after host and region change")
+	}
+	if query.Get("response-content-type") != "text/plain" {
+		t.Errorf("response-content-type = %q, want preserved", query.Get("response-content-type"))
+	}
+	if !strings.Contains(query.Get("X-Amz-Credential"), "/us-west-2/s3/aws4_request") {
+		t.Errorf("X-Amz-Credential = %q, want upstream region", query.Get("X-Amz-Credential"))
+	}
+
+	store := NewCredentialStore()
+	store.AddCredential(testAccessKey, testSecretKey)
+	if _, err := NewRequestValidator(store).ValidateRequest(req); err != nil {
+		t.Errorf("upstream ValidateRequest() error = %v", err)
+	}
+}
+
 func TestBuildCanonicalQueryString(t *testing.T) {
 	signer := NewRequestSigner("https://s3.amazonaws.com", "us-east-1")
 
@@ -174,6 +270,27 @@ func TestBuildCanonicalQueryString(t *testing.T) {
 
 			if result != tt.expected {
 				t.Errorf("buildCanonicalQueryString() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCanonicalQueryStringReservedBytes(t *testing.T) {
+	signer := NewRequestSigner("https://s3.amazonaws.com", "us-east-1")
+	validator := NewRequestValidator(NewCredentialStore())
+
+	tests := []struct {
+		name  string
+		build func(url.Values) string
+	}{
+		{name: "signer", build: signer.buildCanonicalQueryString},
+		{name: "validator", build: validator.buildCanonicalQueryString},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.build(newReservedCanonicalQueryValues()); got != reservedCanonicalQueryString {
+				t.Errorf("buildCanonicalQueryString() = %q, want %q", got, reservedCanonicalQueryString)
 			}
 		})
 	}
@@ -223,6 +340,17 @@ func TestShouldCopyHeader(t *testing.T) {
 				t.Errorf("shouldCopyHeader(%q) = %v, want %v", tt.header, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestShouldCopyPresignedHeader(t *testing.T) {
+	for _, header := range []string{"If-Range", "Origin"} {
+		if !shouldCopyPresignedHeader(header) {
+			t.Errorf("shouldCopyPresignedHeader(%q) = false, want true", header)
+		}
+	}
+	if shouldCopyPresignedHeader("Random-Header") {
+		t.Error("shouldCopyPresignedHeader(Random-Header) = true, want false")
 	}
 }
 

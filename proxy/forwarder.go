@@ -27,7 +27,7 @@ const (
 
 // RequestForwarder is the interface for forwarding requests to the upstream Tigris server.
 // Two implementations exist: signingForwarder (validate + re-sign) and
-// transparentForwarder (clone headers + proxy headers).
+// transparentForwarder (copy the header map, borrow unchanged values + proxy headers).
 type RequestForwarder interface {
 	// Forward forwards a request to Tigris and writes the response to the client.
 	Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error
@@ -45,6 +45,11 @@ type RequestForwarder interface {
 	// Returns the raw response for streaming. Caller is responsible for closing the response body.
 	DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error)
 
+	// AuthorizePresignedRequest sends a minimal ranged request using the
+	// client's original presigned capability. It is used to authorize serving
+	// an already-cached object when local signature verification is unavailable.
+	AuthorizePresignedRequest(ctx context.Context, r *http.Request, accessKey, secretKey string, rangeProbe bool) (*http.Response, error)
+
 	// DoFullObjectRequest executes a full object GET request (no Range header).
 	// Used for background cache population after a Range request cache miss.
 	// Caller is responsible for closing the response body.
@@ -57,6 +62,14 @@ type RequestForwarder interface {
 	// a genuine anonymous read rather than inferring it from a (public-write) write.
 	// Caller is responsible for closing the response body.
 	DoAnonymousFullObjectRequest(ctx context.Context, bucket, key string) (*http.Response, error)
+
+	// DoObjectDeleteRequest executes a synthetic DELETE for one object, signed with
+	// the given credentials. Used by tiered mode's cross-tier cleanup when a small
+	// (local) write replaces an object whose prior version lives upstream. A
+	// non-empty etag is sent as If-Match so the delete only removes the displaced
+	// version — never a newer object a concurrent write put in its place.
+	// Caller is responsible for closing the response body.
+	DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error)
 
 	// DoConditionalGetRequest executes a conditional GET for cache revalidation.
 	// Sends If-None-Match and/or If-Modified-Since headers.
@@ -180,8 +193,16 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 				MaxIdleConnsPerHost: maxIdleConnsPerHost,
 				IdleConnTimeout:     90 * time.Second,
 				DisableCompression:  true, // Proxy must never auto-decompress upstream responses
+				// Bounds the wait for a reply, which is the part that has no reason to grow.
+				// Streaming the body afterwards takes as long as the object needs.
+				ResponseHeaderTimeout: 60 * time.Second,
 			},
-			Timeout: 5 * time.Minute,
+			// No total budget: http.Client.Timeout covers reading the body, so any cap here is a
+			// cap on object size over link speed. A multi-GB archive routinely outruns five
+			// minutes, and cancelling mid-body cuts the client and the populate together. The
+			// wait for headers is bounded above; a body that stalls is caught by the request
+			// context and the write deadline on the client's own connection.
+			Timeout: 0,
 		},
 	}
 }
@@ -190,7 +211,7 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) error {
-	_, _, err := b.executeAndStreamReturningMeta(w, fwdReq, inContentLength, originalReq)
+	_, _, err := b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, false)
 	return err
 }
 
@@ -199,6 +220,12 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 // tee path, which needs the response ETag to build cache metadata for the just-written
 // object without a read-back GET. On a transport error it returns (0, nil, err).
 func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (int, http.Header, error) {
+	return b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, true)
+}
+
+// executeAndStreamWithMeta streams an upstream response and optionally retains an
+// owned copy of its headers for a caller that needs metadata after streaming.
+func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, captureMeta bool) (int, http.Header, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
@@ -217,9 +244,12 @@ func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwd
 		b.responseInterceptor(resp, originalReq)
 	}
 
-	// Clone response headers before streaming so callers can read the upstream ETag
-	// after the body is consumed.
-	respHeaders := resp.Header.Clone()
+	var respHeaders http.Header
+	if captureMeta {
+		// The write-through tee reads the ETag after the body is consumed, so it
+		// needs independent header ownership.
+		respHeaders = resp.Header.Clone()
+	}
 
 	// Stream response back to client
 	copyHeaders(w.Header(), resp.Header)
@@ -317,10 +347,9 @@ func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int
 // (from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) are valid Tigris credentials
 // that can sign requests directly.
 func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
-	path := "/" + bucket + "/" + key
-
-	// Create request without Range header - just a simple GET for the full object
-	fwdReq, err := b.signer.SignRequest(ctx, "GET", path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
+	// SignObjectRequest takes the key literally: a key containing '?' must not
+	// be split into path + query (it would fetch a truncated sibling key).
+	fwdReq, err := b.signer.SignObjectRequest(ctx, "GET", bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +393,38 @@ func (b *baseForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket
 	return resp, nil
 }
 
+// DoObjectDeleteRequest executes a synthetic DELETE for one object. Standard
+// SigV4 signing, like every TAG-initiated request. A non-empty etag becomes an
+// If-Match precondition: a 412 means the object was already replaced and must
+// be left alone. Tigris enforces If-Match on DELETE (conditional deletes are
+// ordered against the object's current version); because other backends may
+// silently ignore it, tiered mode issues this delete on Tigris only (the
+// cleanup is disabled elsewhere — see deleteUpstreamObjectAsync).
+func (b *baseForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
+	var extraHeaders http.Header
+	if etag != "" {
+		extraHeaders = http.Header{}
+		extraHeaders.Set("If-Match", etag)
+	}
+	// SignObjectRequest takes the key literally: splitting a '?'-bearing key
+	// into path + query would aim this DESTRUCTIVE request at a truncated
+	// sibling key.
+	fwdReq, err := b.signer.SignObjectRequest(ctx, http.MethodDelete, bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(http.MethodDelete, time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cross-tier delete failed")
+		return nil, err
+	}
+
+	return resp, nil
+}
+
 // DoConditionalGetRequest executes a conditional GET request to upstream.
 // Used for cache revalidation: sends If-None-Match and/or If-Modified-Since headers
 // to check if a cached object is still fresh.
@@ -386,8 +447,6 @@ func (b *baseForwarder) DoConditionalHeadRequest(ctx context.Context, bucket, ke
 // Sends If-None-Match and/or If-Modified-Since headers for cache revalidation.
 // Uses standard SigV4 signing because these are synthetic requests initiated by TAG.
 func (b *baseForwarder) doConditionalRequest(ctx context.Context, method, bucket, key, accessKey, secretKey, etag string, lastModified int64, rangeHeader string) (*http.Response, error) {
-	path := "/" + bucket + "/" + key
-
 	extraHeaders := http.Header{}
 	if etag != "" {
 		extraHeaders.Set("If-None-Match", etag)
@@ -400,7 +459,8 @@ func (b *baseForwarder) doConditionalRequest(ctx context.Context, method, bucket
 		extraHeaders.Set("Range", rangeHeader)
 	}
 
-	fwdReq, err := b.signer.SignRequest(ctx, method, path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	// SignObjectRequest takes the key literally — see DoObjectDeleteRequest.
+	fwdReq, err := b.signer.SignObjectRequest(ctx, method, bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -441,6 +501,8 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 			f.validator = localAuth.Validator
 			f.keyUnwrapper = localAuth.KeyUnwrapper
 			f.authzCache = localAuth.AuthzCache
+			f.credentialStore = credStore
+			f.credentialAuth = auth.NewRequestValidator(credStore)
 		}
 		f.initInterceptor()
 		return f

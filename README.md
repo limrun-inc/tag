@@ -12,6 +12,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 - **Block-Aligned Caching** *(default)*: Caches large objects as fixed-size blocks (RFC 0001) so a small range read fetches and caches only the covering blocks instead of the whole object — ideal for sparse reads of large files (Parquet footers/row-groups, SST blocks). Enabled by default at 1 MiB blocks; size `block_size` to your read granularity, or set `block_caching_enabled: false` to cache whole objects.
 - **Conditional Requests**: Supports If-None-Match and If-Modified-Since for efficient cache validation
 - **AWS SigV4 Authentication**: Full AWS Signature Version 4 validation and re-signing
+- **Presigned URL Caching**: Serves validated presigned GET and HEAD requests from cache
 - **Prometheus Metrics**: Comprehensive metrics for monitoring cache efficiency and performance
 - **Kubernetes Ready**: Includes deployment manifests for production use
 
@@ -44,7 +45,7 @@ Each release publishes the install script, run script, and a matching `config.ya
 curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
 # A specific release
-curl -fsSL https://tag-releases.t3.storage.dev/v1.17.0/install.sh | bash
+curl -fsSL https://tag-releases.t3.storage.dev/v1.19.0/install.sh | bash
 ```
 
 The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
@@ -99,6 +100,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 
 - Objects larger than `size_threshold` are not cached
 - Objects with `Cache-Control: no-store` or `private` are not cached
+- CopyObject requests with `Cache-Control: no-store` or `private` still invalidate the destination but skip post-copy cache warming
 - Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
 - PUT/DELETE operations invalidate the cache entry
@@ -123,6 +125,7 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 - **Kubernetes** — StatefulSet, HPA, and services in [`deploy/kubernetes/`](deploy/kubernetes/); high availability, scaling, and probes in [docs/deploy.md](docs/deploy.md).
 - **Docker** — single-node and cluster Compose in [`deploy/docker/`](deploy/docker/); see [docs/docker.md](docs/docker.md).
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
+- **Parquet workloads** — caching parquet metadata ahead of the reader that needs it; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture
@@ -183,7 +186,7 @@ See [docs/security.md](docs/security.md) for authentication, access control, and
 
 ### Prerequisites
 
-- Go 1.24 or later
+- Go 1.27 or later
 - Tigris account with access credentials (for running TAG and integration tests)
 
 All dependencies, including Tigris's [`ocache`](https://github.com/tigrisdata/ocache) modules, are public and fetched normally by the Go toolchain — no extra configuration required.

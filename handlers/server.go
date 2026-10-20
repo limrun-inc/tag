@@ -122,6 +122,8 @@ func (s *Server) setupRouter() *mux.Router {
 	// Apply connection tracking middleware
 	r.Use(s.connectionTrackingMiddleware)
 
+	// Bound transfers by progress rather than by total time.
+
 	// Bound concurrently-served S3 requests (sheds with 503 SlowDown when full)
 	r.Use(s.admissionMiddleware)
 
@@ -248,11 +250,20 @@ func (s *Server) setupRouter() *mux.Router {
 // If TLS is configured via SetTLS, the server listens with HTTPS.
 func (s *Server) Start() error {
 	s.httpServer = &http.Server{
-		Addr:         s.bindAddr,
-		Handler:      s.router,
-		ReadTimeout:  5 * time.Minute,
-		WriteTimeout: 5 * time.Minute,
-		IdleTimeout:  120 * time.Second,
+		Addr:    s.bindAddr,
+		Handler: s.router,
+		// No total read or write budget. Both are caps on object size over link speed, and a
+		// multi-gigabyte archive outruns any of them: the five-minute pair they replaced cut
+		// healthy restores mid-body. Only the wait for request headers keeps a fixed bound,
+		// since it has no reason to grow, and idle keep-alive connections still expire.
+		//
+		// Deliberately no per-connection deadline of our own either. Arming one costs more than
+		// it protects: an expired read deadline surfaces through the server's background read as
+		// a dead client, and the request context is cancelled mid-transfer. That cancels the
+		// upstream fetch, which the broadcast then reports to the client and the cache write
+		// alike, so a slow reader loses its body and the object stays uncached.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
@@ -340,6 +351,9 @@ func handleError(w http.ResponseWriter, r *http.Request, err error) {
 
 // getBucketName extracts the bucket name from request path variables.
 func getBucketName(r *http.Request) string {
+	if bucket, ok := proxy.PresignedVirtualHostBucket(r); ok {
+		return bucket
+	}
 	vars := mux.Vars(r)
 	return vars["bucket"]
 }
@@ -483,6 +497,12 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 
 // handleBucket handles basic bucket operations.
 func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request) {
+	if _, ok := proxy.PresignedVirtualHostBucket(r); ok &&
+		strings.TrimPrefix(r.URL.Path, "/") != "" {
+		s.handleObject(w, r)
+		return
+	}
+
 	if !validateBucketName(w, r) {
 		return
 	}

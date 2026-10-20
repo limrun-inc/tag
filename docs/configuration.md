@@ -16,13 +16,19 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
 | `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
 | `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
+| `TAG_CACHE_COMPACTION_BPS`        | Shared read budget (bytes/second) for ocache background compaction, recompaction, and the liveness walks that gate reclaim; protects serving reads on throughput-capped volumes. `0` disables (also via env override); unset keeps YAML/default; set to a small fraction of the volume cap (e.g. `33554432` = 32 MiB/s on a 240 MB/s volume) | unthrottled              |
 | `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
 | `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `true`                   |
 | `TAG_CACHE_BLOCK_SIZE`             | Block granularity **and** the read-side whole-vs-block boundary (bytes): a read miss below this is whole-cached, at/above it is block-cached; must stay below ocache's 64 MB compaction threshold | `1048576` (1 MiB)        |
+| `TAG_CACHE_SIZE_THRESHOLD`         | Max object size to cache (bytes); larger bodies pass through uncached                                                                                                                          | `1073741824` (1 GiB)     |
+| `TAG_CACHE_META_ON_WRITE`          | Cache an object's metadata (not its body) when TAG proxies its write, so the first read resolves it from cache instead of a round trip. Closes the multipart gap, where write-through cannot tee a body TAG never sees (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
+| `TAG_CACHE_PARQUET_OPTIMIZATION`   | Cache a parquet object's metadata blocks ahead of the reader that needs them, so opening the file does not discover them as serial misses. Two triggers: a read reaching the object's tail (helps second and later opens) and a write through TAG (helps the first). Only fires when the metadata spans more than the tail block (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
+| `TAG_CACHE_LEGACY_COORDINATION`    | Meta invalidation/populate coordination mechanism. `true` (default) = legacy tombstones, compatible with any cluster mix including nodes upgrading straight from ≤v1.20. Fail-safe parsing: only an explicit `false`/`0` selects the fenced-CAS coordinator; any other value keeps legacy. Flip only once every node in the cluster is CAS-capable, then rolling-restart briskly | `true`                   |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
+| `TAG_CACHE_GRPC_AUTH`             | Authenticate cross-node gRPC cache traffic. Fail-closed: only `false` or `0` disables it, so a typo leaves auth **on** | `true`                   |
 | `TAG_CACHE_ADVERTISE_ADDR`        | Address advertised to other nodes                                               | (defaults to GRPC addr)  |
 | `TAG_CACHE_SEED_NODES`            | Comma-separated seed nodes for cluster discovery                                | (none)                   |
 | `TAG_CACHE_DELETE_BATCH_SIZE`     | File deletions processed per deletion-queue batch                               | `1000`                   |
@@ -30,9 +36,11 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_MAX_CONCURRENT_WRITES` | Max concurrent cache-populate operations                                        | `256`                    |
 | `TAG_CACHE_MAX_POPULATE_MEMORY`   | Aggregate memory budget (bytes) for all cache buffering — populate + block-serve staging (one honest total) | `2147483648` (2 GiB)     |
 | `TAG_MAX_INFLIGHT_REQUESTS`       | Max concurrently-served S3 requests before shedding with 503 SlowDown           | `1024`                   |
+| `TAG_HTTP_PORT`                   | Port for the S3 API                                                             | `8080`                   |
 | `TAG_LOG_LEVEL`                   | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
 | `TAG_LOG_FORMAT`                  | Log format: `json` or `console`                                                 | `json`                   |
-| `TAG_TRANSPARENT_PROXY`           | Disable transparent proxy mode (`false` or `0`)                                 | `true`                   |
+| `TAG_MODE`                        | Operating mode: `transparent`, `signing`, or `tiered` (see [tiered-mode.md](tiered-mode.md)) | `transparent`            |
+| `TAG_TRANSPARENT_PROXY`           | **Deprecated** — use `TAG_MODE`. Disable transparent proxy mode (`false` or `0`); conflicts with an explicit `TAG_MODE` are startup-fatal | `true`                   |
 | `TAG_TLS_CERT_FILE`               | Path to TLS certificate file (PEM format)                                       | (none)                   |
 | `TAG_TLS_KEY_FILE`                | Path to TLS private key file (PEM format)                                       | (none)                   |
 | `TAG_PPROF_ENABLED`               | Enable pprof endpoints (`true` or `1`)                                          | `false`                  |
@@ -48,6 +56,13 @@ The configuration file uses YAML format. Specify the path with the `--config` fl
 ### Full Configuration Reference
 
 ```yaml
+# Operating mode: transparent (default), signing, or tiered.
+# transparent forwards client signatures as-is with proxy headers; signing
+# validates client signatures and re-signs for upstream; tiered serves small
+# objects entirely from the local cache with authoritative misses (see
+# tiered-mode.md). Supersedes upstream.transparent_proxy.
+mode: transparent
+
 # Server configuration
 server:
   # HTTP port for the S3 API
@@ -94,9 +109,10 @@ upstream:
   # Default: 100
   max_idle_conns_per_host: 100
 
-  # Enable transparent proxy mode
+  # Deprecated: use the top-level `mode` instead.
   # When true (default), client requests are forwarded as-is with proxy headers.
   # When false, TAG validates and re-signs requests (signing mode).
+  # Setting both this and `mode` inconsistently is a startup-fatal error.
   # Default: true
   transparent_proxy: true
 
@@ -133,6 +149,17 @@ cache:
   # Override with TAG_CACHE_EVICTION_POLICY env var
   eviction_policy: lru
 
+  # Shared read budget (bytes/second) for ocache's background file compaction,
+  # segment recompaction, and the liveness walks that gate reclaim. Protects
+  # serving reads on throughput-capped volumes: unthrottled compaction bursts
+  # can saturate the disk and stall foreground GETs. 0/unset = unthrottled (the ocache library
+  # default); size it to a small fraction of the volume's throughput cap
+  # (e.g. 33554432 = 32 MiB/s on a 240 MB/s volume). Populate writes are
+  # never throttled — only compaction's own reads (writes follow implicitly).
+  # Override with TAG_CACHE_COMPACTION_BPS env var (explicit 0 disables a
+  # YAML-set value).
+  compaction_bytes_per_second: 0
+
   # Warm the cache after a successful write (PutObject / CompleteMultipartUpload /
   # CopyObject) by triggering a background full-object fetch, so a read soon after a
   # write hits cache. This is cache-warm-on-write (write-around plus async warming),
@@ -161,12 +188,44 @@ cache:
   # default; set false to cache whole objects instead.
   block_caching_enabled: true
 
+  # Meta invalidation/populate coordination. true (default) = legacy tombstone mechanism,
+  # compatible with any cluster mix — including nodes upgrading directly from <=v1.20. false =
+  # fenced-CAS coordination (stronger ordering; requires every node in the cluster to be
+  # CAS-capable BEFORE flipping, then a brisk rolling restart). Standalone deployments may flip
+  # immediately. Override with TAG_CACHE_LEGACY_COORDINATION (fail-safe: only an explicit
+  # "false"/"0" selects CAS).
+  legacy_coordination: true
+
   # Block granularity AND the whole-vs-block boundary for every populate path: an object
   # smaller than one block is whole-cached, one this size or larger is block-cached. Size it to
   # your workload's read granularity — an oversized block over-fetches on every miss. Must stay
   # below ocache's 64 MB compaction threshold so blocks pack into shared segments. 0/unset =
   # default (1 MiB). Override with TAG_CACHE_BLOCK_SIZE env var.
   block_size: 1048576
+
+  # Cache object METADATA on write (opt-in, prototype). TAG invalidates on write and
+  # caches nothing, so the first read of a freshly written object pays an upstream
+  # round trip purely to establish metadata before block mode can engage. Write-through
+  # already caches meta+body for a teed PutObject; this closes the multipart gap, where
+  # TAG never sees the assembled body. Metadata only -- the body stays uncached and
+  # blocks are fetched on demand, exactly as block mode already does for evicted blocks.
+  # Override with TAG_CACHE_META_ON_WRITE env var.
+  meta_on_write: false
+
+  # Parquet-aware footer caching (opt-in). Full guide: docs/parquet-optimization.md Drives two triggers: a read that reaches an
+  # object's trailer prefetches the rest of its metadata, and a parquet object written
+  # through TAG has its metadata warmed before the first read (RFC 0002).
+  # A parquet reader must read the file's metadata
+  # before any data, and that metadata sits at the end of the object. Block caching already
+  # covers metadata that fits in the tail block; this fetches the earlier blocks when it does
+  # not, using the length the file itself declares rather than a guess. Costs one speculative
+  # fetch per spanned block, shed under populate pressure like any other prefetch. Watch
+  # tag_cache_parquet_footer_bytes to see whether it applies to your data: footer
+  # size scales with row groups and columns, so a wide schema can put several MB of
+  # metadata on a few-hundred-MB object -- several blocks at a 1 MiB block_size --
+  # while a narrow schema keeps it inside the tail block and this does nothing.
+  # Override with TAG_CACHE_PARQUET_OPTIMIZATION env var.
+  parquet_optimization: false
 
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
@@ -210,12 +269,17 @@ cache:
 
   # Aggregate memory budget for ALL cache buffering — cache-populate and block-serve
   # staging share this one pool, so the value is an honest total (buffering never
-  # exceeds it). Each populate reserves its object size (capped at the per-populate
-  # buffer ceiling, ~(channel_buffer + max(channel_buffer/4, 64)) x chunk_size); when
-  # it can't fit, the object is served from upstream uncached. Block-serve staging
-  # draws from the same budget, capped at half of it so it can't starve populates.
-  # Applied independently of max_concurrent_writes (both limits apply). This is what
-  # actually bounds populate memory — a byte-unaware count can pin many GB.
+  # exceeds it). Foreground coalesced populates reserve their object size, capped at
+  # the broadcast listener plus relay queue, ~(channel_buffer + max(channel_buffer/4,
+  # 64)) x chunk_size. Direct background full-object populates reserve the clustered cache
+  # client's retained 1 MiB sender buffer and destination gRPC first-chunk buffer, the
+  # embedded storage writer's retained 1 MiB first-read buffer and 1 MiB file-copy buffer,
+  # plus one configured block scratch buffer when block mode can select it. When a populate cannot fit,
+  # the object is served from upstream uncached.
+  # Block-serve staging draws from the same budget, capped at half of it so it can't
+  # starve populates. Applied independently of max_concurrent_writes (both limits
+  # apply). This is what actually bounds populate memory — a byte-unaware count can
+  # pin many GB.
   # Default: 2147483648 (2 GiB) (0 or unset = default; negative = budget disabled)
   # Override with TAG_CACHE_MAX_POPULATE_MEMORY env var
   max_populate_memory_bytes: 2147483648
@@ -266,7 +330,7 @@ Configures the connection to upstream Tigris storage.
 | `endpoint`                | string | `"https://t3.storage.dev"` | Tigris S3 endpoint URL                           |
 | `region`                  | string | `"auto"`                   | AWS region for request signing                   |
 | `max_idle_conns_per_host` | int    | `100`                      | HTTP connection pool size per host               |
-| `transparent_proxy`       | bool   | `true`                     | Forward client requests as-is with proxy headers |
+| `transparent_proxy`       | bool   | `true`                     | **Deprecated** — use top-level `mode`. Forward client requests as-is with proxy headers |
 
 **Endpoint Validation:**
 
@@ -340,10 +404,13 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `block_caching_enabled` | bool     | `true`           | Enable block-aligned caching for large objects (RFC 0001)                           |
+| `legacy_coordination`   | bool     | `true`           | Meta coordination mechanism: `true` = legacy tombstones (safe for any cluster mix, incl. direct ≤v1.20 upgrades); `false` = fenced CAS (all nodes must be CAS-capable before flipping) |
 | `block_size`            | int64    | `1048576`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
+| `parquet_optimization`  | bool     | `false`          | Prefetch a parquet object's metadata blocks on a tail read (only when the metadata spans more than the tail block) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |
+| `compaction_bytes_per_second` | int64 | `0`          | Shared source-read budget (bytes/s) for background compaction + recompaction; `0` = unthrottled. Size to a small fraction of the volume's throughput cap |
 | `warm_on_write`         | bool     | `false`          | Warm the cache after a successful write via a background fetch (one extra upstream GET per write) |
 | `warm_on_write_reserved_fraction` | float | `0.5`     | Elastic share of the populate budget reserved for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; `0`/unset = default, negative = disabled) |
 | `node_id`               | string   | `""`             | Unique node identifier for cluster mode                                             |
@@ -354,7 +421,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `delete_batch_size`     | int      | `1000`           | File deletions processed per deletion-queue batch                                   |
 | `recovery_workers`      | int      | `16`             | Parallel workers for startup file recovery                                          |
 | `max_concurrent_writes` | int      | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
-| `max_populate_memory_bytes` | int  | `2147483648`     | Aggregate memory budget for ALL cache buffering — cache-populate and block-serve staging share this one pool, so it is an honest total (buffering never exceeds it). Each populate reserves its size (capped at the buffer ceiling); block-serve staging draws from the same budget capped at half of it, so it can't starve populates. Applied independently of `max_concurrent_writes` (`0`/unset = default 2 GiB, negative = disables the budget) |
+| `max_populate_memory_bytes` | int  | `2147483648`     | Aggregate memory budget for ALL cache buffering — foreground relay populates and direct background populates use path-specific ceilings, while block-serve staging shares the same pool and is capped at half. Direct reservations include clustered sender and destination buffers, embedded storage buffers, and block scratch where applicable. Applied independently of `max_concurrent_writes` (`0`/unset = default 2 GiB, negative = disables the budget) |
 
 **TTL Format:**
 
@@ -390,6 +457,10 @@ Controls request coalescing behavior for concurrent requests.
 ```text
 Memory per broadcast = chunk_size × channel_buffer × num_listeners
 ```
+
+Foreground cache listeners also retain a bounded relay queue. Background full-object
+fetches do not create a broadcast; they retain the cache client's stream buffer and,
+when block caching is selected, one block-sized scratch buffer.
 
 With defaults (64KB chunks, 32 buffer):
 

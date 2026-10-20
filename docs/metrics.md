@@ -27,6 +27,8 @@ Total number of requests processed by TAG.
 | ----------- | -------------------------------------------------------------------- |
 | `operation` | S3 operation: `GetObject`, `PutObject`, `DeleteObject`, `HeadObject` |
 | `status`    | Result: `success`, `error`, `auth_error`, `range_not_satisfiable`    |
+| `mode`      | The process's operating mode (`transparent`, `signing`, `tiered`) — one constant value per instance, for fleet-wide splits |
+| `source`    | Where the response was produced: `local` (TAG's own store or knowledge — cache hits, revalidated-304 serves, authoritative misses, auth errors) or `upstream` (proxied) |
 
 **Example queries:**
 
@@ -36,6 +38,9 @@ rate(tag_requests_total[5m])
 
 # Error rate
 sum(rate(tag_requests_total{status="error"}[5m])) / sum(rate(tag_requests_total[5m]))
+
+# Share of traffic answered without touching upstream (per mode)
+sum(rate(tag_requests_total{source="local"}[5m])) by (mode) / sum(rate(tag_requests_total[5m])) by (mode)
 
 # GetObject success rate
 rate(tag_requests_total{operation="GetObject",status="success"}[5m]) /
@@ -51,8 +56,10 @@ Request duration in seconds.
 | Label       | Description  |
 | ----------- | ------------ |
 | `operation` | S3 operation |
+| `mode`      | Operating mode (constant per instance) |
+| `source`    | `local` or `upstream` — where the response was produced |
 
-**Buckets:** Default Prometheus buckets (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
+**Buckets:** 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10 (the default Prometheus buckets plus extra tail resolution at 1.5, 2, 3, 4 and 7.5 seconds)
 
 **Example queries:**
 
@@ -302,6 +309,103 @@ read (e.g. a Parquet footer) populates and serves only the blocks it touches.
 `tag_cache_block_bytes_populated_total` is the bytes those fetches pulled. Compare the bytes
 against `tag_bytes_transferred_total{direction="out"}` to gauge populate-vs-served amplification.
 
+#### tag_cache_block_populate_failed_total
+
+**Type:** Counter
+
+Blocks that were fetched from upstream and validated but whose cache write failed (either
+the unary byte-write fast path or the streaming fallback). Flood-safe, alertable signal for
+populate-write failures; the per-block error is logged only at Debug. Healthy value is 0 —
+alert on any sustained rate.
+
+#### tag_cache_block_prefetch_windows_total
+
+**Type:** Counter (labeled by `outcome`)
+
+Multi-block serves classified by the prefetch window they were granted from the shared
+staging budget (half of `cache.max_populate_memory_bytes`):
+
+| `outcome`    | Meaning                                                               |
+| ------------ | --------------------------------------------------------------------- |
+| `full`       | The requested window was granted — the fast pipelined path            |
+| `shrunk`     | A smaller window than requested was granted                           |
+| `sequential` | Every window size was declined — the serve degraded to the unbuffered sequential path |
+
+The two non-`full` outcomes have different costs: `shrunk` serves are still pipelined,
+just with less read concurrency (a mild, roughly proportional latency impact), while
+`sequential` serves alone take the unbuffered slow path (one cache read in flight — the
+pre-pipelining latency profile). Track them separately:
+
+```promql
+# Sequential fallback share — the true slow-path traffic. Any sustained non-zero
+# rate under load means tail latency is being served by the sequential path:
+# the signal to raise cache.max_populate_memory_bytes.
+sum(rate(tag_cache_block_prefetch_windows_total{outcome="sequential"}[5m])) /
+sum(rate(tag_cache_block_prefetch_windows_total[5m]))
+
+# Budget-pressure share — serves that could not get their full window (shrunk +
+# sequential). A leading indicator: rising pressure precedes sequential fallback.
+sum(rate(tag_cache_block_prefetch_windows_total{outcome!="full"}[5m])) /
+sum(rate(tag_cache_block_prefetch_windows_total[5m]))
+```
+
+#### tag_cache_block_prefetched_total
+
+**Type:** Counter (labeled by `trigger`)
+
+Blocks fetched speculatively rather than to satisfy a request in flight. This is a
+**volume** signal — how much speculative work each trigger is doing — not a precision
+signal.
+
+Judge the benefit from the block hit ratio (`tag_cache_block_hits_total` /
+`tag_cache_block_misses_total`), which measures the outcome directly. Rising hit ratio
+with modest prefetch volume is what you want; volume with no movement in hit ratio
+means the speculation is not landing where reads go.
+
+There is deliberately no matching `_used_total`. Attributing each serve back to a
+prefetch required a per-block lookup on the serve path, which runs thousands of times
+per second, to re-derive a ratio that is ~98% by construction — a reader that has read
+a parquet trailer cannot do anything except read the metadata region next.
+
+Triggers today: `parquet_footer` (a read reached an object's trailer) and `write_warm`
+(a parquet object was written through TAG), both from `cache.parquet_optimization` —
+see [docs/parquet-optimization.md](parquet-optimization.md).
+
+#### tag_cache_parquet_footer_bytes
+
+**Type:** Histogram
+
+Size of the parquet metadata region, read from the trailer of objects while
+`cache.parquet_optimization` is on. Recorded for **every** parquet object whose trailer is
+read, including ones that are not prefetched, so the distribution describes the whole
+population rather than just the prefetched tail of it.
+
+Note the population depends on which triggers are active. The read trigger observes objects
+as they are read; the write trigger observes them as they are written. With both on, an object
+written and later read through the same node is observed twice, and write-heavy deployments
+will weight the distribution toward recently written objects. Read it as a distribution of
+*observations*, not of distinct objects — that is what makes it useful for drift detection and
+what to keep in mind before comparing across deployments.
+
+The prefetch does work whenever `footer + 8` exceeds the **remainder** block
+(`ContentLength mod block_size`, averaging half a block) — not merely when the footer exceeds
+`block_size`.
+
+Footer size scales with row groups and columns, since the footer carries per-column
+statistics. On a production deployment with a wide schema, footers ran **~1.25% of object
+size** — several MB on a few-hundred-MB object — so at a 1 MiB `block_size` the metadata spans
+several blocks and the prefetch does real work on most objects. A narrow schema keeps the
+footer inside the tail block, where there is nothing to prefetch.
+
+Use the histogram to establish that ratio for your own data, and to detect drift: a schema
+change alters footer size, and a distribution that collapses below the remainder-block size
+means the optimization has stopped earning its keep.
+
+```promql
+# Median footer size — compare against cache.block_size.
+histogram_quantile(0.5, sum(rate(tag_cache_parquet_footer_bytes_bucket[1h])) by (le))
+```
+
 #### tag_cache_block_hits_total / tag_cache_block_misses_total
 
 **Type:** Counter
@@ -351,6 +455,43 @@ rate(tag_cache_populate_skipped_total{source="warm_on_write"}[5m])
 # Total populate shed rate
 sum(rate(tag_cache_populate_skipped_total[5m]))
 ```
+
+#### tag_tiered_cleanup_total
+
+**Type:** Counter
+
+Tiered mode's cross-tier cleanup deletes (issued when a small local write
+displaces an upstream-tier version), by outcome — exactly one per cleanup.
+Cleanup is best-effort: anything other than `deleted` / `already_gone` /
+`replaced` / `marker_repaired` leaves an orphan for the upstream bucket's own
+expiry — failures are Debug-logged, so this counter is the rollout-visibility
+signal.
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped), `unverified_backend` (skipped: non-Tigris endpoint, where If-Match enforcement on DELETE is unverified — cleanup is disabled by construction), `live_marker` (skipped: the key's current metadata is a live marker for this ETag — the body is authoritative again), `marker_repaired` (a same-ETag marker raced in during the delete; the repair removed it, converging on an authoritative miss the caller re-populates), `repair_failed` (the repair could not run or could not remove the raced-in marker — it may stay authoritative over a deleted body until TTL) |
+
+```promql
+# Orphan-producing cleanup rate (should be ~0)
+sum(rate(tag_tiered_cleanup_total{outcome=~"rejected|error|no_etag|repair_failed"}[5m]))
+```
+
+#### tag_tiered_retier_total
+
+**Type:** Counter
+
+Tiered mode's re-tier-on-read attempts: a validated GET that hits an
+upstream-tier marker whose size fits the local tier triggers a one-shot
+background move of the body into the local tier (healing objects mis-placed
+by, e.g., a cold-start PUT forwarded before its key was learned).
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `retiered` (moved into the local tier), `shed` (populate budget refused the buffer), `changed` (object replaced/deleted mid-flight; its newer state wins), `canceled` (a concurrent write claimed the key — normal coordination), `error` (fetch or store failed) |
+
+A sustained `retiered` rate outside restart windows means writes keep landing
+in the wrong tier — check key learning. Per-key dedup skips are not counted.
+
 
 ### Revalidation Metrics
 

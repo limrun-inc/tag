@@ -12,9 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 )
 
 // blockMockForwarder serves range GETs from a backing object, for both the initial
@@ -33,6 +35,7 @@ type blockMockForwarder struct {
 	blockGetNoETag      bool         // if set, per-block 206 fetches omit the ETag header
 	blockGetShortBody   bool         // if set, per-block 206 body is shorter than its Content-Length
 	blockGets           atomic.Int32 // count of per-block DoConditionalGetRequest calls
+	forwards            atomic.Int32 // count of client-range forwards (DoRequestWithCreds)
 }
 
 func newBlockMock(object []byte, etag string) *blockMockForwarder {
@@ -40,6 +43,7 @@ func newBlockMock(object []byte, etag string) *blockMockForwarder {
 	// The client forward serves the requested range, or the whole object for a full GET. A
 	// deleted object (blockGet404) 404s the forward too, not only per-block fetches.
 	m.mockForwarder.doRequestFunc = func(_ context.Context, r *http.Request, _, _ string) (*http.Response, error) {
+		m.forwards.Add(1)
 		if m.blockGet404 {
 			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
 		}
@@ -886,7 +890,7 @@ func TestPutBlocksFromStream_ExactMultipleNoPhantomBlock(t *testing.T) {
 	meta := cache.MetaFromHTTPHeaders(wowBucket, wowKey, http.StatusOK, h)
 	meta.BlockSize = 4
 
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, time.Now().UnixNano()); err != nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, cache.VersionAny); err != nil {
 		t.Fatalf("putBlocksFromStream: %v", err)
 	}
 	for i := int64(0); i <= 1; i++ {
@@ -916,7 +920,7 @@ func TestPutBlocksFromStream_MidStreamErrorLeavesMetaUnwritten(t *testing.T) {
 
 	// One full block, then a read error before the second.
 	r := &errAfterReader{data: []byte("ABCD")}
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, time.Now().UnixNano()); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the mid-stream read failure")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -939,7 +943,7 @@ func TestPutBlocksFromStream_TruncatedStreamLeavesNoShortBlockOrMeta(t *testing.
 	meta.BlockSize = 4
 
 	// ...but the body carries only 6 bytes, ending cleanly (no read error).
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, time.Now().UnixNano()); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the truncated body")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -964,7 +968,7 @@ func TestPutBlocksFromStream_OversizedStreamLeavesMetaUnwritten(t *testing.T) {
 	meta.BlockSize = 4
 
 	// ...but the body carries 6 bytes.
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, time.Now().UnixNano()); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the oversized body")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -989,13 +993,13 @@ func TestBlockCache_InvalidateStaleBlockMetaOnlyMatchingETag(t *testing.T) {
 	}
 
 	// A lagging request that saw v1 as stale must NOT wipe the newer v2 entry.
-	svc.invalidateStaleBlockMeta(wowBucket, wowKey, `"v1"`)
+	svc.invalidateStaleMeta(wowBucket, wowKey, `"v1"`)
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
 		t.Error("v2 entry wrongly deleted by a stale-v1 invalidation")
 	}
 
 	// Invalidating the matching (current) version does delete it.
-	svc.invalidateStaleBlockMeta(wowBucket, wowKey, `"v2"`)
+	svc.invalidateStaleMeta(wowBucket, wowKey, `"v2"`)
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
 		t.Error("v2 entry not deleted by a matching-version invalidation")
 	}
@@ -1681,7 +1685,8 @@ func TestRemainingMetaTTL(t *testing.T) {
 // A warm multi-block serve whose pipeline buffer reservation the budget declines degrades to
 // the direct sequential stream and still serves byte-exact from cache — budget pressure slows
 // a warm serve down, it never surrenders it to upstream. Budget of 5: the complete path's
-// first-block reservation (2) leaves 3, so the pipeline's two-buffer reservation (4) declines.
+// first-block reservation (2) leaves 3, so the smallest two-buffer pipeline reservation (4)
+// declines.
 func TestBlockCache_PipelineBudgetDeclineDegradesToSequential(t *testing.T) {
 	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
 	mock := newBlockMock(object, `"v1"`)
@@ -1770,9 +1775,9 @@ func (f *failAfterWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// A client write failure mid-pipeline must unwind the prefetching reader promptly (returning
-// its in-flight buffer) instead of leaving it blocked on the handoff forever. The serve returns
-// without hanging; -race would flag an unsynchronized unwind.
+// A client write failure mid-pipeline must cancel outstanding cache-read workers promptly and
+// return their buffers instead of leaving them blocked. The serve returns without hanging; -race
+// would flag an unsynchronized unwind.
 func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
 	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
 	mock := newBlockMock(object, `"v1"`)
@@ -1795,7 +1800,7 @@ func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not return after a mid-body client write failure (pipeline reader stuck?)")
+		t.Fatal("serve did not return after a mid-body client write failure (prefetch workers stuck?)")
 	}
 }
 
@@ -1806,8 +1811,8 @@ func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
 func TestBlockCache_SequentialClientWriteFailureDoesNotFetchRemainder(t *testing.T) {
 	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
 	mock := newBlockMock(object, `"v1"`)
-	// Budget 5: the complete path's first-block reservation (2) leaves 3, so the pipeline's
-	// two-buffer reservation (4) declines and the stream takes the sequential path.
+	// Budget 5: the complete path's first-block reservation (2) leaves 3, so the smallest
+	// two-buffer pipeline reservation (4) declines and the stream takes the sequential path.
 	svc, c := newBlockServiceWithBudget(t, mock, 2, 5)
 
 	w := httptest.NewRecorder()
@@ -1823,5 +1828,108 @@ func TestBlockCache_SequentialClientWriteFailureDoesNotFetchRemainder(t *testing
 	_ = svc.HandleGetObject(fw, fullGet(wowBucket, wowKey))
 	if got := mock.blockGets.Load() - before; got != 0 {
 		t.Errorf("client write failure triggered %d upstream requests, want 0 (no remainder salvage)", got)
+	}
+}
+
+// clientForwards reports how many client-range forwards have hit upstream.
+func (m *blockMockForwarder) clientForwards() int32 { return m.forwards.Load() }
+
+// blockPutHookClient fires hook once, synchronously, on the first PutStream of hookKey —
+// letting a test interleave an invalidation with a block assembly in progress.
+type blockPutHookClient struct {
+	cacheclient.CacheClient
+	hookKey string
+	fired   atomic.Bool
+	hook    func()
+}
+
+func (h *blockPutHookClient) PutStream(ctx context.Context, key string, r io.Reader, ttl int64) error {
+	if key == h.hookKey && h.fired.CompareAndSwap(false, true) {
+		h.hook()
+	}
+	return h.CacheClient.PutStream(ctx, key, r, ttl)
+}
+
+// An invalidation landing DURING the full-GET assembly must refuse the
+// blocks-complete promotion: the promotion's token is read before assembly, so
+// the mid-assembly delete + same-ETag re-establishment (whose blocks the
+// promotion knows nothing about) stays !BlocksComplete. Regression test for
+// the post-assembly token read, under the default legacy coordination.
+func TestBlockCache_PromotionRefusedWhenInvalidationRacesAssembly(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	hooked := &blockPutHookClient{
+		CacheClient: cacheclient.NewMemoryCache(),
+		hookKey:     cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 2),
+	}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(hooked, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// The moment assembly writes the missing block: invalidate, then
+	// re-establish the same-ETag entry (as a fresh partial populate would).
+	hooked.hook = func() {
+		ctx := context.Background()
+		prior, found, _ := c.GetMeta(ctx, wowBucket, wowKey)
+		if !found {
+			t.Error("hook: no meta to displace")
+			return
+		}
+		if err := c.DeleteWithMeta(ctx, wowBucket, wowKey); err != nil {
+			t.Errorf("hook: invalidation: %v", err)
+			return
+		}
+		_, tok, _, _ := c.GetMetaWithVersion(ctx, wowBucket, wowKey)
+		fresh := *prior
+		fresh.BlocksComplete = false
+		if wrote, err := c.PutMetaIfVersion(ctx, wowBucket, wowKey, &fresh, 60, tok); err != nil || !wrote {
+			t.Errorf("hook: re-establish: wrote=%v err=%v", wrote, err)
+		}
+	}
+
+	// Partial entry via a cold range miss (blocks 0,1 of 3).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	// The refused promotion is observable as a precondition_lost meta_put — the
+	// only such refusal in this flow (the hook's own re-establishment is checked
+	// to succeed), so waiting on it synchronizes with the fire-and-forget
+	// promotion goroutine instead of racing it with a fixed sleep.
+	lostBefore := testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("meta_put", "precondition_lost"))
+
+	// Full GET assembles block 2 (firing the hook mid-assembly) and serves.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q", w2.Code, w2.Body.String())
+	}
+	if !hooked.fired.Load() {
+		t.Fatal("hook never fired: assembly did not write the missing block")
+	}
+
+	// The displaced assembly's promotion must be attempted AND refused; the
+	// re-established entry stays !BlocksComplete throughout.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+		if found && m.BlocksComplete {
+			t.Fatal("promotion committed over a mid-assembly invalidation")
+		}
+		if testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("meta_put", "precondition_lost")) > lostBefore {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("promotion refusal never observed")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

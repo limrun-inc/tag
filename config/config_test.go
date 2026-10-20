@@ -526,6 +526,39 @@ func TestLoad_BlockSizeDefaultAndOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_SizeThresholdOverrideByEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		env  string
+		want int64
+	}{
+		{"default", "cache:\n  enabled: true\n", "", DefaultCacheSizeThreshold},
+		{"env override honored", "cache:\n  enabled: true\n", "268435456", 268435456}, // 256 MiB
+		{"env overrides yaml", "cache:\n  enabled: true\n  size_threshold: 1048576\n", "268435456", 268435456},
+		{"non-positive env ignored", "cache:\n  enabled: true\n", "-1", DefaultCacheSizeThreshold},
+		{"malformed env ignored", "cache:\n  enabled: true\n", "big", DefaultCacheSizeThreshold},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			// Unconditional: an empty value reads as unset (envInt64 skips
+			// blanks), and it shields the test from an inherited variable.
+			t.Setenv("TAG_CACHE_SIZE_THRESHOLD", tc.env)
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.SizeThreshold != tc.want {
+				t.Errorf("SizeThreshold = %d, want %d", cfg.Cache.SizeThreshold, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_BlockCachingEnabledOverrideByEnv(t *testing.T) {
 	cases := []struct {
 		name string
@@ -855,8 +888,9 @@ func TestIsTigrisEndpoint(t *testing.T) {
 	}{
 		{"tigris.dev domain", "https://fly.storage.tigris.dev", true},
 		{"storage.dev domain", "https://t3.storage.dev", true},
-		{"localhost", "http://localhost:8080", true},
-		{"localhost no port", "http://localhost", true},
+		{"mixed-case tigris host", "https://T3.Storage.Dev", true},
+		{"localhost is not Tigris", "http://localhost:8080", false},
+		{"localhost no port is not Tigris", "http://localhost", false},
 		{"third-party s3", "https://s3.amazonaws.com", false},
 		{"minio", "http://minio.internal:9000", false},
 		{"not a suffix match", "https://nottrigris.dev", false},
@@ -869,6 +903,27 @@ func TestIsTigrisEndpoint(t *testing.T) {
 				t.Errorf("IsTigrisEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.want)
 			}
 		})
+	}
+}
+
+// The transparent-mode allowlist admits Tigris domains and localhost (any
+// case) for local testing, and nothing else.
+func TestIsTransparentEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     bool
+	}{
+		{"https://t3.storage.dev", true},
+		{"http://localhost:8080", true},
+		{"http://Localhost", true},
+		{"http://LOCALHOST:9000", true},
+		{"http://minio.internal:9000", false},
+		{"https://s3.amazonaws.com", false},
+	}
+	for _, tt := range tests {
+		if got := IsTransparentEndpoint(tt.endpoint); got != tt.want {
+			t.Errorf("IsTransparentEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.want)
+		}
 	}
 }
 
@@ -1208,5 +1263,154 @@ func TestLoad_MaxPopulateMemoryNegativeDisables(t *testing.T) {
 	}
 	if cfg.Cache.MaxPopulateMemoryBytes != -1 {
 		t.Errorf("MaxPopulateMemoryBytes = %d, want -1 (negative disables, even whitespace-padded)", cfg.Cache.MaxPopulateMemoryBytes)
+	}
+}
+
+// TestCompactionBPS_OverrideByEnv verifies TAG_CACHE_COMPACTION_BPS plumbs the
+// compaction source-read budget into the cache config, and that non-positive or
+// garbage values leave it unset (unthrottled, matching ocache's 0-disables
+// convention).
+func TestCompactionBPS_OverrideByEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml int64 // value already set (as if from YAML) before the env override
+		env  string
+		want int64
+	}{
+		{"positive value enables throttle", 0, "16777216", 16777216},
+		{"positive value overrides yaml", 1000, "16777216", 16777216},
+		{"explicit zero disables a yaml throttle", 1000, "0", 0},
+		{"whitespace-padded value accepted", 0, " 16777216 ", 16777216},
+		{"negative ignored, yaml kept", 1000, "-1", 1000},
+		{"garbage ignored, yaml kept", 1000, "fast", 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_COMPACTION_BPS", tc.env)
+			cfg := NewDefault()
+			cfg.Cache.CompactionBytesPerSecond = tc.yaml
+			applyEnvOverrides(cfg)
+			if cfg.Cache.CompactionBytesPerSecond != tc.want {
+				t.Errorf("Cache.CompactionBytesPerSecond = %d, want %d", cfg.Cache.CompactionBytesPerSecond, tc.want)
+			}
+		})
+	}
+}
+
+// TestParquetOptimization_OverrideByEnv verifies TAG_CACHE_PARQUET_OPTIMIZATION
+// plumbs the parquet footer prefetch into the cache config. The optimization is
+// speculative work, so an unrecognized value must leave it off rather than
+// guessing the operator meant to enable it.
+func TestParquetOptimization_OverrideByEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml bool // value already set (as if from YAML) before the env override
+		env  string
+		want bool
+	}{
+		{"true enables", false, "true", true},
+		{"one enables", false, "1", true},
+		{"mixed case accepted", false, "True", true},
+		{"whitespace-padded value accepted", false, " true ", true},
+		{"false disables a yaml enable", true, "false", false},
+		{"garbage disables rather than guessing", true, "yes-please", false},
+		{"unset leaves yaml alone", true, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_PARQUET_OPTIMIZATION", tc.env)
+			cfg := NewDefault()
+			cfg.Cache.ParquetOptimization = tc.yaml
+			applyEnvOverrides(cfg)
+			if cfg.Cache.ParquetOptimization != tc.want {
+				t.Errorf("Cache.ParquetOptimization = %v, want %v", cfg.Cache.ParquetOptimization, tc.want)
+			}
+		})
+	}
+}
+
+// TestMetaOnWrite_OverrideByEnv verifies TAG_CACHE_META_ON_WRITE plumbs metadata
+// caching on write into the cache config. It changes what a read-after-write sees,
+// so an unrecognized value must leave it off rather than guessing.
+func TestMetaOnWrite_OverrideByEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml bool
+		env  string
+		want bool
+	}{
+		{"true enables", false, "true", true},
+		{"one enables", false, "1", true},
+		{"mixed case accepted", false, "True", true},
+		{"false disables a yaml enable", true, "false", false},
+		{"garbage disables rather than guessing", true, "maybe", false},
+		{"unset leaves yaml alone", true, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_META_ON_WRITE", tc.env)
+			cfg := NewDefault()
+			cfg.Cache.MetaOnWrite = tc.yaml
+			applyEnvOverrides(cfg)
+			if cfg.Cache.MetaOnWrite != tc.want {
+				t.Errorf("Cache.MetaOnWrite = %v, want %v", cfg.Cache.MetaOnWrite, tc.want)
+			}
+		})
+	}
+}
+
+// The documented contract for both knobs: 0/unset uses the default, a NEGATIVE
+// value disables — the env path must honor it like the yaml path does.
+func TestLoad_NegativeEnvDisablesLimits(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	t.Setenv("TAG_MAX_INFLIGHT_REQUESTS", "-1")
+	t.Setenv("TAG_CACHE_MAX_CONCURRENT_WRITES", "-1")
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.MaxInflightRequests != -1 {
+		t.Errorf("MaxInflightRequests = %d, want -1 (disabled)", cfg.Server.MaxInflightRequests)
+	}
+	if cfg.Cache.MaxConcurrentWrites != -1 {
+		t.Errorf("MaxConcurrentWrites = %d, want -1 (disabled)", cfg.Cache.MaxConcurrentWrites)
+	}
+}
+
+func TestLoad_LegacyCoordinationOverrideByEnv(t *testing.T) {
+	cases := []struct {
+		name       string
+		yaml       string
+		env        string
+		wantLegacy bool
+	}{
+		// Legacy coordination is the default: unset yaml + unset env = legacy.
+		{"default legacy", "cache:\n  enabled: true\n", "", true},
+		{"yaml selects cas", "cache:\n  enabled: true\n  legacy_coordination: false\n", "", false},
+		{"env selects cas", "cache:\n  enabled: true\n", "false", false},
+		{"env 0 selects cas", "cache:\n  enabled: true\n", "0", false},
+		{"env re-enables legacy over yaml", "cache:\n  enabled: true\n  legacy_coordination: false\n", "true", true},
+		// Fail-safe: anything but an explicit "false"/"0" keeps legacy —
+		// a typo must never flip a fleet onto the CAS coordinator.
+		{"unrecognized env keeps legacy", "cache:\n  enabled: true\n", "no", true},
+		{"unrecognized env overrides cas yaml", "cache:\n  enabled: true\n  legacy_coordination: false\n", "False ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_LEGACY_COORDINATION", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.IsLegacyCoordination() != tc.wantLegacy {
+				t.Errorf("IsLegacyCoordination = %v, want %v", cfg.Cache.IsLegacyCoordination(), tc.wantLegacy)
+			}
+		})
 	}
 }

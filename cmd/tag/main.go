@@ -23,6 +23,8 @@ import (
 	"github.com/tigrisdata/tag/handlers"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // Build-time variables set via ldflags.
@@ -41,7 +43,25 @@ const (
 
 	// How often the local cache size is sampled into tag_cache_size_bytes.
 	cacheSizeSampleInterval = 30 * time.Second
+
+	// OCache clients send idle keepalive pings every 30 seconds. grpc-go's
+	// default server policy rejects those pings and eventually closes healthy
+	// peer connections with ENHANCE_YOUR_CALM: too_many_pings.
+	cacheGRPCKeepaliveMinTime = 30 * time.Second
 )
+
+func cacheGRPCServerOptions() []grpc.ServerOption {
+	return []grpc.ServerOption{
+		grpc.KeepaliveEnforcementPolicy(cacheGRPCKeepalivePolicy()),
+	}
+}
+
+func cacheGRPCKeepalivePolicy() keepalive.EnforcementPolicy {
+	return keepalive.EnforcementPolicy{
+		MinTime:             cacheGRPCKeepaliveMinTime,
+		PermitWithoutStream: true,
+	}
+}
 
 func main() {
 	// Parse command line flags
@@ -91,6 +111,9 @@ func main() {
 	} else {
 		cfg = config.NewDefault()
 	}
+
+	// Stamp the operating mode on the request metrics before anything serves.
+	metrics.SetMode(cfg.ResolvedMode())
 
 	// Override cache enabled from command line flag
 	if *disableCache {
@@ -148,7 +171,7 @@ func main() {
 			Str("endpoint", cfg.Upstream.Endpoint).
 			Str("region", cfg.Upstream.Region).
 			Int("max_idle_conns_per_host", cfg.Upstream.MaxIdleConnsPerHost).
-			Bool("transparent_proxy", cfg.Upstream.IsTransparentProxy()),
+			Str("mode", cfg.ResolvedMode()),
 		).
 		Dict("cache", zerolog.Dict().
 			Bool("enabled", cfg.Cache.IsEnabled()).
@@ -188,25 +211,35 @@ func main() {
 		log.Warn().Err(err).Msg("Failed to load credentials from environment")
 	}
 
-	// Initialize proxy signer if transparent proxy is enabled
+	// Initialize the proxy signer for transparent forwarding (proxy headers,
+	// TAG's own creds). Whether tiered forwards transparently or by signing
+	// is decided by its endpoint — see Config.ForwardsTransparently.
 	var proxySigner *auth.ProxySigner
-	if cfg.Upstream.IsTransparentProxy() {
+	if cfg.ForwardsTransparently() {
 		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		if accessKey == "" || secretKey == "" {
-			log.Fatal().Msg("Transparent proxy requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+			log.Fatal().Str("mode", cfg.ResolvedMode()).Msg("This mode requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
 		}
 		proxySigner = auth.NewProxySigner(accessKey, secretKey)
-		log.Info().Msg("Transparent proxy mode enabled")
+		log.Info().Str("mode", cfg.ResolvedMode()).Msg("Proxy mode enabled")
 	} else {
-		log.Info().Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing mode enabled")
+		log.Info().Str("mode", cfg.ResolvedMode()).Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing forwarding enabled")
 		if !config.IsTigrisEndpoint(cfg.Upstream.Endpoint) {
 			log.Warn().Str("endpoint", cfg.Upstream.Endpoint).
 				Msg("Running against a non-Tigris S3 endpoint; transparent-proxy features are unavailable and third-party backends are community-supported")
+			if cfg.IsTiered() {
+				// The cross-tier cleanup DELETE is safe only where If-Match is
+				// enforced (verified on Tigris), so it is disabled here by
+				// construction; say so once so the accumulating displaced
+				// copies are not a surprise.
+				log.Info().Str("endpoint", cfg.Upstream.Endpoint).
+					Msg("Tiered mode on a non-Tigris endpoint: cross-tier cleanup is disabled (If-Match on DELETE is verified on Tigris only); displaced upstream copies age out by bucket expiry")
+			}
 		}
 	}
 
-	if credStore.Count() == 0 && !cfg.Upstream.IsTransparentProxy() {
+	if credStore.Count() == 0 && !cfg.ForwardsTransparently() {
 		log.Warn().Msg("No credentials loaded - TAG will reject all requests")
 	}
 
@@ -222,23 +255,25 @@ func main() {
 			Msg("Initializing embedded cache")
 
 		embeddedCfg := &embedded.Config{
-			DiskPath:      cfg.Cache.DiskPath,
-			TTL:           cfg.Cache.TTL,
-			MaxDiskUsage:  cfg.Cache.MaxDiskUsageBytes,
-			NodeID:        cfg.Cache.NodeID,
-			ClusterAddr:   cfg.Cache.ClusterAddr,
-			GRPCAddr:      cfg.Cache.GRPCAddr,
-			AdvertiseAddr: cfg.Cache.AdvertiseAddr,
-			SeedNodes:     cfg.Cache.SeedNodes,
+			DiskPath:          cfg.Cache.DiskPath,
+			TTL:               cfg.Cache.TTL,
+			MaxDiskUsage:      cfg.Cache.MaxDiskUsageBytes,
+			NodeID:            cfg.Cache.NodeID,
+			ClusterAddr:       cfg.Cache.ClusterAddr,
+			GRPCAddr:          cfg.Cache.GRPCAddr,
+			AdvertiseAddr:     cfg.Cache.AdvertiseAddr,
+			SeedNodes:         cfg.Cache.SeedNodes,
+			GRPCServerOptions: cacheGRPCServerOptions(),
 		}
 
 		// Advanced storage tuning. Defaults are applied by config.applyDefaults;
 		// the top-level embedded.Config fields (DiskPath, TTL, etc.) still take
 		// precedence over anything set here.
 		embeddedCfg.Storage = &ocachestorage.StorageConfig{
-			DeleteBatchSize: cfg.Cache.DeleteBatchSize,
-			RecoveryWorkers: cfg.Cache.RecoveryWorkers,
-			EvictionPolicy:  cfg.Cache.EvictionPolicy,
+			DeleteBatchSize:          cfg.Cache.DeleteBatchSize,
+			RecoveryWorkers:          cfg.Cache.RecoveryWorkers,
+			EvictionPolicy:           cfg.Cache.EvictionPolicy,
+			CompactionBytesPerSecond: cfg.Cache.CompactionBytesPerSecond,
 		}
 
 		// Configure gRPC auth for cache cluster communication
@@ -249,7 +284,7 @@ func main() {
 				log.Fatal().Msg("Cache gRPC auth requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (set TAG_CACHE_GRPC_AUTH=false to disable)")
 			}
 			grpcToken := auth.DeriveGRPCAuthToken(accessKey, secretKey)
-			embeddedCfg.GRPCServerOptions = auth.GRPCServerOptions(grpcToken)
+			embeddedCfg.GRPCServerOptions = append(embeddedCfg.GRPCServerOptions, auth.GRPCServerOptions(grpcToken)...)
 			embeddedCfg.GRPCDialOptions = auth.GRPCDialOptions(grpcToken)
 			log.Info().Msg("Cache gRPC auth enabled")
 		}
@@ -273,8 +308,13 @@ func main() {
 		}
 		readyCancel()
 
-		// Wrap embedded cache with the cache.Cache interface
-		objectCache = cache.NewCacheWithClient(embeddedCache, &cfg.Cache)
+		// Wrap embedded cache with the cache.Cache interface.
+		objectCache = cache.NewCacheWithClient(newEmbeddedBlockCacheClient(embeddedCache), &cfg.Cache)
+		if cfg.Cache.IsLegacyCoordination() {
+			log.Info().Msg("Cache meta coordination: legacy tombstones (set cache.legacy_coordination=false for fenced CAS once all nodes support it)")
+		} else {
+			log.Info().Msg("Cache meta coordination: fenced CAS")
+		}
 
 		// Publish this node's local cache size as tag_cache_size_bytes. ocache keeps
 		// the total live (an atomic), so sampling it is cheap.
@@ -305,9 +345,11 @@ func main() {
 		objectCache = cache.NewDisabledCache()
 	}
 
-	// 3. Initialize local auth for transparent proxy
+	// 3. Initialize local auth (transparent forwarding: derived signing keys
+	// learned from Tigris). Signing forwarding validates against the
+	// credential store inside the forwarder instead.
 	var localAuth *proxy.LocalAuthConfig
-	if cfg.Upstream.IsTransparentProxy() {
+	if cfg.ForwardsTransparently() {
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
 		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)
