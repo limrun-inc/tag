@@ -210,6 +210,18 @@ func (f *signingForwarder) signUpstreamRequest(
 		return f.signer.ResignPresignedRequest(ctx, source, accessKey, secretKey)
 	}
 
+	headers := r.Header
+	if IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+		// The body goes upstream decoded as UNSIGNED-PAYLOAD, so the headers that
+		// describe the aws-chunked framing must not be signed. prepareForwardedRequest
+		// removes them after signing, and the upstream then rejects a signature that
+		// covers a header it never received.
+		headers = r.Header.Clone()
+		headers.Del("X-Amz-Decoded-Content-Length")
+		headers.Del("X-Amz-Trailer")
+		stripAWSChunkedEncoding(&http.Request{Header: headers})
+	}
+
 	return f.signer.SignRequest(
 		ctx,
 		r.Method,
@@ -218,7 +230,7 @@ func (f *signingForwarder) signUpstreamRequest(
 		bodyHash,
 		accessKey,
 		secretKey,
-		r.Header,
+		headers,
 	)
 }
 
