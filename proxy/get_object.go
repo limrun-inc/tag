@@ -327,11 +327,14 @@ func (s *Service) fetchAndBroadcast(
 	// Subscribe ourselves as the first listener
 	listener := broadcaster.Subscribe()
 
-	// Start the upstream fetch in a goroutine
-	go func() {
-		err := s.streamFromUpstream(ctx, r, bucket, key, accessKey, secretKey, broadcaster)
+	// Start the upstream fetch in a service-owned task. It is also bound to
+	// the request context, so client cancellation retains its current behavior.
+	if !s.startBackgroundTask(ctx, func(fetchCtx context.Context) {
+		err := s.streamFromUpstream(fetchCtx, r, bucket, key, accessKey, secretKey, broadcaster)
 		broadcaster.Complete(err)
-	}()
+	}) {
+		broadcaster.Complete(context.Canceled)
+	}
 
 	// Receive chunks like any other listener
 	err := s.writeChunksToResponse(ctx, w, listener, xCache)
@@ -361,7 +364,7 @@ func (s *Service) fetchAndBroadcast(
 		<-broadcaster.Done() // the fetch goroutine above records the upstream outcome
 		if upErr := broadcaster.Error(); upErr == nil ||
 			errors.Is(upErr, context.Canceled) || errors.Is(upErr, context.DeadlineExceeded) {
-			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
+			if _, tok, found, gerr := s.cache.GetMetaWithVersion(s.workers.ctx, bucket, key); gerr == nil && !found {
 				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
 				// the warm is ordered against a fenced delete landing after
 				// this look, where a bare put-if-absent would recreate over it.
@@ -887,14 +890,14 @@ func (s *Service) handleRangeWithBackgroundCache(
 			// collisions → wrong bytes). Existing entries are filled incrementally by the serve
 			// path under their own captured BlockSize instead.
 			defer func() {
-				if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+				if _, found, _ := s.cache.GetMeta(s.workers.ctx, bucket, key); !found {
 					s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, touched)
 				}
 			}()
 		}
 	} else if cacheable {
 		defer func() {
-			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
+			if _, tok, found, gerr := s.cache.GetMetaWithVersion(s.workers.ctx, bucket, key); gerr == nil && !found {
 				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
 				// the warm is ordered against a fenced delete landing after
 				// this look, where a bare put-if-absent would recreate over it.

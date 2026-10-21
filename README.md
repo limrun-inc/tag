@@ -136,6 +136,8 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 - **Parquet workloads** — `cache.parquet_optimization` warms footer blocks and `cache.meta_on_write` caches object metadata before readers need them; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
+On SIGINT or SIGTERM, TAG drains HTTP requests before joining detached cache work and closing embedded storage. A cache operation that does not return after cancellation can extend shutdown; see [Graceful shutdown](docs/deploy.md#graceful-shutdown).
+
 ## Architecture
 
 ```text

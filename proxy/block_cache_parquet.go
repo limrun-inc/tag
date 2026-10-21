@@ -109,21 +109,25 @@ func (s *Service) maybePrefetchParquetFooter(bucket, key, accessKey, secretKey s
 		s.releaseParquetFooterPrefetch()
 		return
 	}
-	go func() {
-		// Delete the marker before freeing capacity so active read markers can
-		// never temporarily exceed the admission limit.
-		defer func() {
-			s.activeBackgroundFetches.Delete(dedupKey)
-			s.releaseParquetFooterPrefetch()
-		}()
+	// Delete the marker before freeing capacity so active read markers can
+	// never temporarily exceed the admission limit. A trigger that Stop refuses
+	// to admit never ran, so it returns both exactly as a finished scan would.
+	finish := func() {
+		s.activeBackgroundFetches.Delete(dedupKey)
+		s.releaseParquetFooterPrefetch()
+	}
+	if !s.startBackgroundTask(nil, func(ctx context.Context) {
+		defer finish()
 		// Cooldown only after a completed scan or a stable negative trailer result.
 		// Recording it unconditionally would apply the full window to a shed or
 		// transient failure, turning one miss under load into minutes of silence --
 		// precisely when the prefetch is most worth retrying.
-		if s.prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey, meta, trailer) && s.recentFooterWork != nil {
+		if s.prefetchParquetFooterBlocksWithContext(ctx, bucket, key, accessKey, secretKey, meta, trailer) && s.recentFooterWork != nil {
 			s.recentFooterWork.Add(versionKey, struct{}{})
 		}
-	}()
+	}) {
+		finish()
+	}
 }
 
 // tryAcquireParquetFooterPrefetch admits one read-triggered scan without
@@ -164,7 +168,11 @@ func (s *Service) parquetFooterPrefetchWanted(key string, meta *cache.CachedObje
 // It reports whether the scan completed or found a stable negative trailer result.
 // A transient cache read or populate failure remains retryable and must not start cooldown.
 func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, trailer []byte) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+	return s.prefetchParquetFooterBlocksWithContext(s.workers.ctx, bucket, key, accessKey, secretKey, meta, trailer)
+}
+
+func (s *Service) prefetchParquetFooterBlocksWithContext(parent context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, trailer []byte) bool {
+	ctx, cancel := context.WithTimeout(parent, backgroundFetchTimeout)
 	defer cancel()
 
 	footerLen, ok, complete := s.parquetFooterLength(ctx, bucket, key, meta, trailer)
@@ -319,16 +327,18 @@ func (s *Service) warmParquetFooterOnWriteWithETag(r *http.Request, bucket, key,
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(dedupKey, struct{}{}); loaded {
 		return
 	}
-	go func() {
+	if !s.startBackgroundTask(nil, func(ctx context.Context) {
 		defer s.activeBackgroundFetches.Delete(dedupKey)
-		s.warmParquetFooterBlocks(bucket, key, accessKey, secretKey, writtenETag)
-	}()
+		s.warmParquetFooterBlocks(ctx, bucket, key, accessKey, secretKey, writtenETag)
+	}) {
+		s.activeBackgroundFetches.Delete(dedupKey)
+	}
 }
 
 // warmParquetFooterBlocks resolves the object's size, ETag and metadata length with a
 // single suffix-range read, then populates the blocks the metadata spans.
-func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey, writtenETag string) {
-	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+func (s *Service) warmParquetFooterBlocks(parent context.Context, bucket, key, accessKey, secretKey, writtenETag string) {
+	ctx, cancel := context.WithTimeout(parent, backgroundFetchTimeout)
 	defer cancel()
 
 	// Stamp BEFORE the upstream trailer read, not after: an invalidation landing

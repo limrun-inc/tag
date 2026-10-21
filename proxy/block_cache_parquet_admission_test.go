@@ -456,3 +456,45 @@ func TestWarmParquetFooterOnWrite_IgnoresReadPrefetchLimit(t *testing.T) {
 		t.Fatalf("write warm after read-limit saturation = (found=%t, err=%v), want metadata", found, err)
 	}
 }
+
+func TestMaybePrefetchParquetFooter_RefusedAfterStopReleasesAdmissionSlot(t *testing.T) {
+	f := newParquetAdmissionFixture(t)
+	f.service.parquetFooterPrefetchSlots = make(chan struct{}, 1)
+	t.Cleanup(f.release)
+	meta := f.seedObject(t, "a.parquet")
+
+	// Nothing is admitted yet, so Stop seals admission and returns at once. A
+	// trigger that arrives afterwards has already taken its permit and marker.
+	f.service.Stop()
+	shedBefore := testutil.ToFloat64(metrics.CacheParquetFooterPrefetchShed)
+	f.service.maybePrefetchParquetFooter(
+		"b", "a.parquet", "access", "secret", meta,
+		meta.ContentLength-parquetTrailerSize, meta.ContentLength-1, nil,
+	)
+
+	if got := len(f.service.parquetFooterPrefetchSlots); got != 0 {
+		t.Fatalf("read-prefetch slots held after a refused trigger = %d, want 0", got)
+	}
+	if !f.service.tryAcquireParquetFooterPrefetch() {
+		t.Fatal("refused trigger leaked the only read-prefetch slot")
+	}
+	f.service.releaseParquetFooterPrefetch()
+	if got := countBackgroundFetchesWithPrefix(f.service, "pq:"); got != 0 {
+		t.Fatalf("refused trigger left %d read-prefetch markers, want 0", got)
+	}
+	if got := len(f.started); got != 0 {
+		t.Fatalf("refused trigger started %d remote probes, want 0", got)
+	}
+	if _, recent := f.service.recentFooterWork.Get("b/a.parquet/\"v1\""); recent {
+		t.Fatal("refused trigger started a cooldown")
+	}
+	if got := testutil.ToFloat64(metrics.CacheParquetFooterPrefetchShed) - shedBefore; got != 0 {
+		t.Fatalf("stop-time refusal counted as a load shed (delta %v)", got)
+	}
+
+	// The write-triggered warm shares the marker map and must drop its marker too.
+	f.service.warmParquetFooterOnWrite(httptest.NewRequest(http.MethodPut, "/b/write.parquet", nil), "b", "write.parquet")
+	if _, held := f.service.activeBackgroundFetches.Load("pqw:b/write.parquet"); held {
+		t.Fatal("refused write warm left its marker installed")
+	}
+}
