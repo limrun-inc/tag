@@ -155,6 +155,8 @@ subscribe before the first upstream body chunk starts:
 3. Those listeners receive the same upstream response as it streams
 4. A GET arriving after streaming starts cannot join that broadcast and starts its own upstream fetch
 
+If an upstream fetch fails before TAG commits the client response while requests are still live, each GET waiting on that broadcast can return TAG's normal S3 error response. After commitment, the stream cannot be replaced by an error document.
+
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
 
 ## Performance
