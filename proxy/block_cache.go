@@ -202,9 +202,11 @@ func touchedBlocks(rangeHeader string, totalSize, blockSize int64) []int64 {
 // (meta.BlockSize > 0). A range no longer than one block — the hot footer/row-group pattern —
 // is assembled probe-free into a pooled buffer (serveAssembledRange): each present block is
 // read exactly once, with the read itself acting as the existence check. A larger range covered
-// by a range-created span certificate stages every requested payload slice before commitment;
-// other larger ranges (and requests whose full-range staging budget declines) take the probe-first
-// path: probe the covering blocks, fetch any missing, then stream.
+// by a range-created span certificate stages every requested payload slice before commitment, and a
+// larger range from a BlocksComplete entry stages its first requested slice before the 206 and then
+// streams the remainder without a probe pass. Other larger ranges (and requests whose staging
+// reservation declines) take the conservative probe-first path: probe the covering blocks, fetch
+// any missing, then stream.
 //
 // It returns served=true when it has produced a complete client response (a 206 body, or a
 // definitive 416). It returns served=false, without having written anything to w, when the
@@ -277,6 +279,25 @@ func (s *Service) serveRangeFromBlockCache(
 		} else {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Certified range staging budget declined - serving via probe path")
 		}
+	}
+
+	// BlocksComplete is a hint that every block was present when the meta was written. For a
+	// larger range, use the same safe optimistic shape as a complete full-object serve: stage the
+	// first requested block slice before committing 206, then let the normal streamer recover or
+	// salvage the remainder. If staging cannot be reserved, keep the probe-first path below so its
+	// existing amplification gate remains the fallback. Incomplete entries always stay probe-first.
+	if rangeLen > meta.BlockSize && meta.BlocksComplete {
+		firstStart, firstEnd := blockLocalRange(b0, rng.start, rng.end, meta.BlockSize, meta.ContentLength)
+		firstLen := firstEnd - firstStart + 1
+		weight := s.stagingWeight(firstLen)
+		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
+			served, err := s.serveCompleteFromBlocks(ctx, w, bucket, key, accessKey, secretKey, meta, &rng, startTime)
+			if s.populateBudget != nil {
+				s.populateBudget.releaseStaging(weight)
+			}
+			return served, err
+		}
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-range buffer budget declined - serving via probe path")
 	}
 
 	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent). Cap the
@@ -686,6 +707,16 @@ type streamOutcome struct {
 
 // streamBlockRange streams object bytes [start,end] (inclusive) from a block-mode entry's
 // cached blocks, in order, into w. The caller must have committed the status line + headers.
+// It preserves the historical footer signal by treating [start,end] as the served range.
+func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (streamOutcome, error) {
+	return s.streamBlockRangeWithFooterRange(ctx, w, bucket, key, accessKey, secretKey, meta, start, end, start, end)
+}
+
+// streamBlockRangeWithFooterRange is streamBlockRange with an explicit complete served range for
+// parquet footer detection. A complete-entry range serve stages the first block slice before
+// calling this function, so the streamer starts later than the range the client actually received.
+// Keeping the footer range separate avoids hiding a tail-triggering read behind that split.
+//
 // A block the cache reports absent (evicted since the caller last saw it) is fetched from
 // upstream (coalesced, budget-gated) and re-read — but at most maxInlineFetchesPerServe times
 // per serve, since a meta surviving mass block eviction would otherwise turn one committed
@@ -699,12 +730,11 @@ type streamOutcome struct {
 // Multi-block serves use a bounded ordered prefetch window. Each cache read lands in its own
 // pooled buffer, so independently routed remote block keys can be in flight together while the
 // write loop still commits their bytes in order. The window admits at most maxRangeBlockFanout
-// buffers and is
-// reserved against the serve-staging byte budget (never the populate budget — see NewService).
-// Under budget pressure it selects the largest window of at least two buffers that fits; when
-// even two buffers do not fit — and for single-block serves, where there is nothing to overlap —
-// it degrades to the direct sequential path.
-func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (out streamOutcome, err error) {
+// buffers and is reserved against the serve-staging byte budget (never the populate budget — see
+// NewService). Under budget pressure it selects the largest window of at least two buffers that
+// fits; when even two buffers do not fit — and for single-block serves, where there is nothing to
+// overlap — it degrades to the direct sequential path.
+func (s *Service) streamBlockRangeWithFooterRange(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end, footerStart, footerEnd int64) (out streamOutcome, err error) {
 	cw := &countingWriter{w: w}
 	defer func() {
 		if cw.written > 0 {
@@ -745,7 +775,7 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 		// opening the file (when the optimization is on and the key says so).
 		// The streaming path has already handed its bytes to the client, so the
 		// trailer has to come from cache here.
-		s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, start, end, nil)
+		s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, footerStart, footerEnd, nil)
 		return out, nil
 	}
 	if errors.Is(err, errBlockStreamDegraded) && ctx.Err() == nil && start+cw.written <= end {
@@ -1065,7 +1095,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 		firstLen := min(meta.BlockSize, meta.ContentLength)
 		weight := s.stagingWeight(firstLen)
 		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
-			served, err = s.serveCompleteFromBlocks(ctx, w, bucket, key, accessKey, secretKey, meta, startTime)
+			served, err = s.serveCompleteFromBlocks(ctx, w, bucket, key, accessKey, secretKey, meta, nil, startTime)
 			if s.populateBudget != nil {
 				s.populateBudget.releaseStaging(weight)
 			}
@@ -1187,41 +1217,58 @@ func (s *Service) remainingMetaTTL(meta *cache.CachedObjectMeta) int {
 	return int(rem)
 }
 
-// serveCompleteFromBlocks serves a full-object GET from a BlocksComplete entry with one cache
-// op per block and no probe pass. The first block is read into a pooled buffer BEFORE headers
-// commit: if it is absent (evicted since populate) it is fetched pre-commit, and if that fails
-// the response is untouched — (false, nil) lets the caller fall through to the miss path, and a
-// definitive stale signal invalidates the entry first. After commit, the remaining blocks
-// stream with an inline fetch recovering any absent one; only a fetch failure there truncates
-// (headers are already sent), which is the same terminal behavior the probe path has for a
-// block evicted between probe and stream. Hit/miss metrics count inline-fetched blocks as
-// misses, recorded once the serve outcome is known.
+// serveCompleteFromBlocks serves either a full object (rng == nil) or a single range from a
+// BlocksComplete entry with one cache read per covering block and no probe pass. The first
+// requested block slice is read into a pooled buffer BEFORE headers commit: if it is absent
+// (evicted since populate) it is fetched pre-commit, and if that fails the response is untouched
+// so the caller can fall through cleanly. After commit, the remaining bytes stream with bounded
+// inline recovery and remainder salvage. Hit/miss metrics count inline-fetched blocks as misses,
+// recorded from the actual stream outcome once the serve has finished.
 func (s *Service) serveCompleteFromBlocks(
 	ctx context.Context,
 	w http.ResponseWriter,
 	bucket, key, accessKey, secretKey string,
 	meta *cache.CachedObjectMeta,
+	rng *byteRange,
 	startTime time.Time,
 ) (served bool, err error) {
-	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
-	_, firstEnd := blockBounds(0, meta.BlockSize, meta.ContentLength)
-	firstLen := firstEnd + 1
+	start, end := int64(0), meta.ContentLength-1
+	partial := rng != nil
+	if partial {
+		start, end = rng.start, rng.end
+	}
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+	blockStart, _ := blockBounds(b0, meta.BlockSize, meta.ContentLength)
+	firstLocalStart, firstLocalEnd := blockLocalRange(b0, start, end, meta.BlockSize, meta.ContentLength)
+	firstAbsEnd := blockStart + firstLocalEnd
+	firstLen := firstLocalEnd - firstLocalStart + 1
 
-	bufp := getBlockBuf(firstLen)
+	// The reservation covers the retained buffer while the remainder streams. Use an exact-sized
+	// buffer so a pooled full-block backing array cannot exceed that reservation for an unaligned
+	// first slice.
+	bufp := getExactBlockBuf(firstLen)
 	defer putBlockBuf(bufp)
 	buf := (*bufp)[:firstLen]
 
-	// Pre-commit first block via the shared read/recover protocol (uncapped fetch — this
-	// doubles as the existence check, and a failure here falls through with the response
-	// untouched; a stale signal has already invalidated the entry inside fetchBlocksToCache).
-	firstFetched, rerr := s.readBlockSlice(ctx, bucket, key, accessKey, secretKey, meta, 0, 0, firstEnd, buf, nil)
+	// Pre-commit the first requested slice via the shared read/recover protocol (uncapped fetch
+	// doubles as the existence check, and a failure leaves the response untouched; a stale signal
+	// has already invalidated the entry inside fetchBlocksToCache).
+	firstFetched, rerr := s.readBlockSlice(ctx, bucket, key, accessKey, secretKey, meta, b0, firstLocalStart, firstLocalEnd, buf, nil)
 	if rerr != nil {
 		return false, rerr
 	}
 
-	meta.WriteHeaders(w)
+	if partial {
+		meta.WriteHeaders(w, cache.WithRangeHeaders(start, end, meta.ContentLength))
+	} else {
+		meta.WriteHeaders(w)
+	}
 	writeCacheStatus(w, XCacheHit)
-	w.WriteHeader(meta.StatusCode)
+	status := meta.StatusCode
+	if partial {
+		status = http.StatusPartialContent
+	}
+	w.WriteHeader(status)
 	out := streamOutcome{}
 	if firstFetched {
 		out.fetched++
@@ -1232,19 +1279,22 @@ func (s *Service) serveCompleteFromBlocks(
 	if n > 0 {
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 	}
+	if werr == nil && n != len(buf) {
+		werr = io.ErrShortWrite
+	}
 	var berr error
 	if werr != nil {
 		berr = werr
-	} else if lastBlock > 0 {
+	} else if firstAbsEnd < end {
 		var rest streamOutcome
-		rest, berr = s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, firstEnd+1, meta.ContentLength-1)
+		rest, berr = s.streamBlockRangeWithFooterRange(ctx, w, bucket, key, accessKey, secretKey, meta, firstAbsEnd+1, end, start, end)
 		out.fromCache += rest.fromCache
 		out.fetched += rest.fetched
 	}
 	// Hit/miss reflects what actually happened: blocks read from cache are hits; inline
 	// fetches, remainder-streamed bytes, and blocks never reached on an aborted serve all
 	// count against the entry — never as hits for blocks that were never read.
-	total := lastBlock + 1
+	total := bK - b0 + 1
 	metrics.CacheBlockHits.Add(float64(out.fromCache))
 	if miss := total - out.fromCache; miss > 0 {
 		metrics.CacheBlockMisses.Add(float64(miss))
@@ -1259,6 +1309,9 @@ func (s *Service) serveCompleteFromBlocks(
 	if berr != nil {
 		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
+	}
+	if partial {
+		metrics.RecordRangeFromCacheHit()
 	}
 	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
