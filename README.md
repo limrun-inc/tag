@@ -107,6 +107,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - A dropped whole-object cache listener or upstream body-read error does not publish the partial body as a new cache entry
 - In tiered mode, a PUT routed to the local tier checks a concrete SigV4 `X-Amz-Content-Sha256` digest after admission and any local precondition pass and the full body passes its declared-length and any Content-MD5 checks; conditional writes against upstream-tier markers, `UNSIGNED-PAYLOAD`, and aws-chunked uploads keep their existing paths
 - PUT/DELETE operations invalidate the cache entry
+- Legacy ordered metadata populates are refused when the tombstone cannot be read or is malformed, rather than assuming no invalidation. The detached metadata warm remains best-effort, so a successful S3 write response is unchanged.
 - If a whole-object cache write returns an error during a successful GET, the upstream response is unchanged and the cache-populate slot becomes available after relay cleanup, so a later eligible GET can retry. A store call that never returns has no completion guarantee.
 
 See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation. For tuning and sizing block caching in production, see [docs/deploy.md](docs/deploy.md#block-aligned-caching).
