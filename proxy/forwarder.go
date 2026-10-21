@@ -172,7 +172,7 @@ type ResponseInterceptor func(resp *http.Response, originalReq *http.Request)
 type baseForwarder struct {
 	signer              *auth.RequestSigner // Both modes need this for DoFullObjectRequest
 	httpClient          *http.Client
-	responseInterceptor ResponseInterceptor // Optional: called before headers are sent to client
+	responseInterceptor ResponseInterceptor // Optional: called before response headers are written.
 }
 
 // newBaseForwarder creates the shared base with HTTP client and signer.
@@ -256,7 +256,8 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 	return resp.StatusCode, respHeaders, copyErr
 }
 
-// executeAndCapture executes the request, streams to client, and captures the response.
+// executeAndCapture executes the request, writes its response to w, and captures it.
+// w may defer committing the response until the caller has processed the capture.
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*ResponseCapture, error) {
@@ -273,7 +274,7 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	}
 	defer resp.Body.Close()
 
-	// Run response interceptor before sending headers to client
+	// Run response interceptor before writing response headers.
 	if b.responseInterceptor != nil {
 		b.responseInterceptor(resp, originalReq)
 	}
@@ -288,7 +289,7 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	// Capture body while streaming to client
+	// Capture body while writing it to the response writer.
 	var readErr error
 	capture.Body, readErr = io.ReadAll(io.TeeReader(resp.Body, w))
 	if readErr != nil {
@@ -298,8 +299,11 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 		capture.Complete = true
 	}
 
-	// Track bytes out from response body
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+	// Track bytes out from response body. A deferred writer counts the bytes
+	// accepted by the client when it later commits the captured response.
+	if _, deferred := w.(responseByteAccountingDeferred); !deferred {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+	}
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
 	return capture, nil
@@ -582,6 +586,13 @@ func logUpstreamResponse(fwdReq *http.Request, originalReq *http.Request, status
 		Int("status", statusCode).
 		Int64("upstream_ms", time.Since(upstreamStart).Milliseconds()).
 		Msg("Upstream response")
+}
+
+// responseByteAccountingDeferred marks a writer that buffers a captured response
+// instead of sending it to the client as the upstream body is read. The writer
+// accounts for outbound bytes when it commits the response.
+type responseByteAccountingDeferred interface {
+	deferResponseByteAccounting()
 }
 
 // ResponseCapture holds captured response data.
