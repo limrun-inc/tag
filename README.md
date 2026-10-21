@@ -102,6 +102,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - CopyObject requests with `Cache-Control: no-store` or `private` still invalidate the destination but skip post-copy cache warming
 - Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
+- In tiered mode, a PUT routed to the local tier checks a concrete SigV4 `X-Amz-Content-Sha256` digest after admission and any local precondition pass and the full body passes its declared-length and any Content-MD5 checks; conditional writes against upstream-tier markers, `UNSIGNED-PAYLOAD`, and aws-chunked uploads keep their existing paths
 - PUT/DELETE operations invalidate the cache entry
 - If a whole-object cache write returns an error during a successful GET, the upstream response is unchanged and the cache-populate slot becomes available after relay cleanup, so a later eligible GET can retry. A store call that never returns has no completion guarantee.
 
