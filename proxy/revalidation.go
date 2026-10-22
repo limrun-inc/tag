@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -290,11 +291,7 @@ func (s *Service) handleRevalidation200(
 		// committed upstream response independent of cache availability.
 		n, copyErr := io.Copy(w, resp.Body)
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-		status := "success"
-		if copyErr != nil {
-			status = "error"
-		}
-		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
+		metrics.RecordRequestResult("GetObject", metrics.SourceUpstream, copyErr, time.Since(start).Seconds())
 		return copyErr
 	}
 
@@ -711,4 +708,74 @@ func shouldForceRevalidate(r *http.Request) bool {
 func shouldBypassCache(r *http.Request) bool {
 	cc := r.Header.Get("Cache-Control")
 	return strings.Contains(cc, "no-store")
+}
+
+// readRepresentationSelectors are the GetObject/HeadObject query parameters
+// that select a representation other than the current object as stored:
+// another version, a single part, or the current body under overridden
+// response headers. The cache holds only the current object under its own
+// headers, so a request carrying any of them can neither be answered from the
+// cache nor populate it. The transparent forwarder's read-authorization check
+// (isReadAuthorizationQuery) shares this list: these are exactly the
+// parameters that still mean "GetObject/HeadObject" rather than another S3
+// operation.
+var readRepresentationSelectors = []string{
+	"versionId", "partNumber",
+	"response-cache-control", "response-content-disposition", "response-content-encoding",
+	"response-content-language", "response-content-type", "response-expires",
+}
+
+// isReadRepresentationSelector reports whether a query parameter name is one
+// of readRepresentationSelectors. S3 query parameter names are case-sensitive.
+func isReadRepresentationSelector(name string) bool {
+	for _, p := range readRepresentationSelectors {
+		if name == p {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRepresentationSelectors reports whether an object GET/HEAD carries any
+// readRepresentationSelectors. Such a request is forwarded upstream as-is:
+// never served from the cache (it would return the current object with the
+// cached headers, ignoring the selector) and never used to populate it.
+// representationSelectorNames returns the representation selector names
+// present in the request query, sorted, for logging. Only the names are
+// returned: the raw query of a presigned request carries its signature and
+// the other fields needed to reuse the URL, which must not reach the logs.
+func representationSelectorNames(r *http.Request) []string {
+	var names []string
+	for name := range r.URL.Query() {
+		if isReadRepresentationSelector(name) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func hasRepresentationSelectors(r *http.Request) bool {
+	if r.URL.RawQuery == "" {
+		return false
+	}
+	for name := range r.URL.Query() {
+		if isReadRepresentationSelector(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// forwardRepresentationSelector is the GET/HEAD path for a request with
+// representation selectors: a plain upstream forward with no cache read, no
+// broadcast coalescing (the broadcast key is bucket/key only, so a
+// ?versionId=old fetch must not be shared with a current-object fetch), and
+// no populate of any kind. X-Cache reports BYPASS, like Cache-Control:
+// no-store.
+func (s *Service) forwardRepresentationSelector(ctx context.Context, w http.ResponseWriter, r *http.Request, operation string, start time.Time) error {
+	writeCacheStatus(w, s.cacheMissStatus(true))
+	err := s.forwarder.Forward(ctx, w, r)
+	metrics.RecordRequestResult(operation, metrics.SourceUpstream, err, time.Since(start).Seconds())
+	return err
 }
