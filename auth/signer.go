@@ -53,15 +53,29 @@ func ParseHTTPDate(dateStr string) (time.Time, error) {
 
 // RequestSigner signs HTTP requests using AWS SigV4.
 type RequestSigner struct {
-	endpoint string
-	region   string
+	endpoint    string
+	endpointURL *url.URL
+	endpointErr error
+	region      string
 }
 
 // NewRequestSigner creates a new request signer.
 func NewRequestSigner(endpoint, region string) *RequestSigner {
+	endpoint = strings.TrimSuffix(endpoint, "/")
+
+	// Build the template once with the same URL parsing and host normalization
+	// that SignRequest previously received from http.NewRequestWithContext.
+	templateRequest, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	var endpointURL *url.URL
+	if err == nil {
+		endpointURL = templateRequest.URL
+	}
+
 	return &RequestSigner{
-		endpoint: strings.TrimSuffix(endpoint, "/"),
-		region:   region,
+		endpoint:    endpoint,
+		endpointURL: endpointURL,
+		endpointErr: err,
+		region:      region,
 	}
 }
 
@@ -79,12 +93,12 @@ func (s *RequestSigner) Endpoint() string {
 func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
 
-	// Build the full URL using url.URL to properly handle encoding
-	// This ensures special characters like % are properly encoded
-	baseURL, err := url.Parse(s.endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
+	if s.endpointErr != nil {
+		return nil, fmt.Errorf("failed to parse endpoint: %w", s.endpointErr)
 	}
+
+	// Copy the immutable endpoint template before applying request-specific fields.
+	baseURL := *s.endpointURL
 
 	// Split path and query string
 	pathPart := path
@@ -97,11 +111,73 @@ func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 	// Set path (Go will properly encode special characters like % when converting to string)
 	baseURL.Path = pathPart
 	baseURL.RawQuery = queryPart
+	return s.signURL(ctx, method, &baseURL, body, bodyHash, accessKey, secretKey, headers)
+}
 
-	fullURL := baseURL.String()
+// SignObjectRequest signs a synthetic single-object request built by TAG
+// itself (background fetches, revalidations, the tiered cross-tier cleanup
+// DELETE). Unlike SignRequest's combined path parameter, the KEY IS TAKEN
+// LITERALLY: it is never split on '?', so a key containing query-reserved
+// characters ('?' is legal in S3 keys) signs and routes to the exact object
+// instead of a truncated sibling — for a DELETE, a destructive request aimed
+// at the wrong key. The URL layer percent-encodes the path on the wire and
+// the canonical URI uses the same encoding, so signature and routing agree.
+func (s *RequestSigner) SignObjectRequest(ctx context.Context, method, bucket, key string,
+	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
 
-	// Create the new request with streaming body
-	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
+	if s.endpointErr != nil {
+		return nil, fmt.Errorf("failed to parse endpoint: %w", s.endpointErr)
+	}
+	baseURL := *s.endpointURL
+	baseURL.Path = "/" + bucket + "/" + key
+	baseURL.RawQuery = ""
+	return s.signURL(ctx, method, &baseURL, body, bodyHash, accessKey, secretKey, headers)
+}
+
+// signURL finishes request construction and SigV4 signing for an already-built
+// URL (path and query set as their decoded forms).
+func (s *RequestSigner) signURL(ctx context.Context, method string, baseURL *url.URL,
+	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
+
+	if baseURL.Opaque != "" {
+		// URL.String ignores Path for opaque URLs, so the old stringify-and-parse
+		// path returned an empty Path as well.
+		baseURL.Path = ""
+		baseURL.RawPath = ""
+	} else {
+		if baseURL.RawPath != "" {
+			unescapedPath, err := url.PathUnescape(baseURL.RawPath)
+			if err != nil || unescapedPath != baseURL.Path {
+				baseURL.RawPath = ""
+			}
+		}
+		// URL.String inserts this slash before a relative path when a host is
+		// present; preserve the URL fields the old parse produced.
+		if baseURL.Host != "" && baseURL.Path != "" && baseURL.Path[0] != '/' {
+			baseURL.Path = "/" + baseURL.Path
+			baseURL.RawPath = ""
+		}
+	}
+	baseURL.ForceQuery = baseURL.ForceQuery && baseURL.RawQuery == ""
+
+	// A raw '#' in a query becomes a fragment when the old URL string was
+	// reparsed. Keep that unusual, accepted request-target behavior while the
+	// ordinary path attaches its completed URL directly.
+	var (
+		req *http.Request
+		err error
+	)
+	if strings.Contains(baseURL.RawQuery, "#") {
+		req, err = http.NewRequestWithContext(ctx, method, baseURL.String(), body)
+	} else {
+		// Use NewRequestWithContext for its method, context, and body setup, then
+		// attach the completed URL directly rather than serializing and reparsing it.
+		req, err = http.NewRequestWithContext(ctx, method, "", body)
+		if err == nil {
+			req.URL = baseURL
+			req.Host = baseURL.Host
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -185,29 +261,85 @@ func (s *RequestSigner) buildCanonicalRequest(req *http.Request, bodyHash string
 }
 
 // buildCanonicalQueryString builds the canonical query string from URL parameters.
-func (s *RequestSigner) buildCanonicalQueryString(query url.Values) string {
+func (*RequestSigner) buildCanonicalQueryString(query url.Values) string {
+	return canonicalQueryString(query)
+}
+
+// canonicalQueryString builds sorted key=value pairs using AWS SigV4 encoding.
+func canonicalQueryString(query url.Values) string {
 	if len(query) == 0 {
 		return ""
 	}
 
-	// Get sorted keys
 	keys := make([]string, 0, len(query))
-	for k := range query {
-		keys = append(keys, k)
+	for key := range query {
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 
-	// Build sorted key=value pairs using AWS SigV4 encoding
-	pairs := make([]string, 0, len(query))
-	for _, k := range keys {
-		values := query[k]
+	// Every byte can become a three-byte escape, plus the pair separators.
+	size := 0
+	for _, key := range keys {
+		values := query[key]
 		sort.Strings(values)
-		for _, v := range values {
-			pairs = append(pairs, awsURIEncode(k, true)+"="+awsURIEncode(v, true))
+		for _, value := range values {
+			size += 3*len(key) + 3*len(value) + 2
 		}
 	}
 
-	return strings.Join(pairs, "&")
+	var result strings.Builder
+	result.Grow(size)
+	pairs := 0
+	for _, key := range keys {
+		for _, value := range query[key] {
+			if pairs > 0 {
+				result.WriteByte('&')
+			}
+			writeAWSURIEncoded(&result, key, true)
+			result.WriteByte('=')
+			writeAWSURIEncoded(&result, value, true)
+			pairs++
+		}
+	}
+
+	return result.String()
+}
+
+// canonicalHeaderValue applies the shared SigV4 header-value normalization.
+// It trims surrounding whitespace and collapses runs of ASCII spaces while
+// preserving other interior whitespace, such as tabs.
+func canonicalHeaderValue(value string) string {
+	value = strings.TrimSpace(value)
+	if !strings.Contains(value, "  ") {
+		return value
+	}
+
+	var normalized strings.Builder
+	normalized.Grow(len(value))
+	previousSpace := false
+	for i := 0; i < len(value); i++ {
+		if value[i] == ' ' {
+			if previousSpace {
+				continue
+			}
+			previousSpace = true
+		} else {
+			previousSpace = false
+		}
+		normalized.WriteByte(value[i])
+	}
+	return normalized.String()
+}
+
+// writeCanonicalHeaderValues normalizes header values in order and joins them
+// with commas without modifying the borrowed values slice.
+func writeCanonicalHeaderValues(builder *strings.Builder, values []string) {
+	for i, value := range values {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(canonicalHeaderValue(value))
+	}
 }
 
 // buildCanonicalHeaders builds canonical headers and signed headers string.
@@ -237,14 +369,9 @@ func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string
 	// Build canonical headers string
 	var canonicalHeaders strings.Builder
 	for _, name := range headerNames {
-		values := headers[name]
-		// Trim and collapse whitespace
-		for i, v := range values {
-			values[i] = strings.TrimSpace(v)
-		}
 		canonicalHeaders.WriteString(name)
 		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(strings.Join(values, ","))
+		writeCanonicalHeaderValues(&canonicalHeaders, headers[name])
 		canonicalHeaders.WriteString("\n")
 	}
 
@@ -325,15 +452,24 @@ func hashSHA256(data []byte) string {
 func awsURIEncode(s string, encodeSlash bool) string {
 	var result strings.Builder
 	result.Grow(len(s) * 3) // Worst case: all chars need encoding
-	for _, c := range []byte(s) {
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-			(c >= '0' && c <= '9') || c == '_' || c == '-' || c == '~' || c == '.' {
-			result.WriteByte(c)
-		} else if c == '/' && !encodeSlash {
-			result.WriteByte(c)
-		} else {
-			result.WriteString(fmt.Sprintf("%%%02X", c))
-		}
-	}
+	writeAWSURIEncoded(&result, s, encodeSlash)
 	return result.String()
+}
+
+const awsURIHex = "0123456789ABCDEF"
+
+func writeAWSURIEncoded(result *strings.Builder, s string, encodeSlash bool) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-' || c == '~' || c == '.' ||
+			(c == '/' && !encodeSlash) {
+			result.WriteByte(c)
+			continue
+		}
+
+		result.WriteByte('%')
+		result.WriteByte(awsURIHex[c>>4])
+		result.WriteByte(awsURIHex[c&0x0F])
+	}
 }

@@ -69,10 +69,18 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.17.0
+    newTag: v1.19.0
 ```
 
 ## Production Considerations
+
+### Graceful shutdown
+
+On SIGINT or SIGTERM, TAG stops admitting HTTP requests and drains admitted handlers for up to 30 seconds. A request that finishes inside the drain window retains its normal response. When the drain deadline passes with handlers still running, TAG cancels their request contexts and closes their HTTP connections, logs a warning with the in-flight count, and then keeps waiting for those handlers and their cache-consistency cleanup to return; a longer request may be aborted, but its handler is still joined before shutdown proceeds.
+
+After the handlers return, TAG cancels the Service lifetime and joins admitted detached cache work before closing embedded storage. This join has no deadline: a cache call that does not return after cancellation can extend process shutdown, and TAG logs a warning with the outstanding task count if the join passes 30 seconds. An admitted tiered cleanup continues under its own timeout so it may finish its conditional S3 delete and metadata repair; the join still waits for it.
+
+The base StatefulSet sets `terminationGracePeriodSeconds: 30`, which is a separate process-termination limit. When that grace expires, Kubernetes sends SIGKILL even if TAG is still waiting for handler cleanup or detached cache work. Set the pod's termination grace to the longest cleanup interval you need to allow; no finite grace can guarantee completion for uncooperative storage.
 
 ### High Availability
 
@@ -86,7 +94,72 @@ images:
 
 **Vertical:** Adjust resource requests/limits in the StatefulSet. The default is 2-4 CPUs and 4-8 GiB memory per pod. SSD storage is recommended for cache performance. If you change the PVC volume size, also update `TAG_CACHE_MAX_DISK_USAGE` in the StatefulSet to match (value is in bytes).
 
-> **Memory note:** high pod memory is expected and healthy — most of it is reclaimable Linux page cache over the on-disk RocksDB cache, not the TAG process (its RSS is typically well under 1 GiB). It plateaus below the pod limit; treat it as page cache, not a leak. Only raise the memory limit (never lower the disk cache) if the working set trends up to the limit.
+#### Sizing memory: measure RSS, not working set
+
+Pod memory has two parts that behave very differently, and the headline number hides the one that matters.
+
+- **Working set** (`container_memory_working_set_bytes`, what `kubectl top` shows) includes reclaimable page cache over the on-disk RocksDB cache. It routinely sits near the limit and that is fine — the kernel reclaims it under pressure.
+- **RSS** (`container_memory_rss`) is anonymous memory. It **cannot** be reclaimed, and it is what the OOM killer acts on.
+
+**Size the limit against RSS.** A pod running at 97% working set with RSS at 45% of the limit is healthy; the same working set with RSS at 90% is one traffic burst from being killed. The two look identical in `kubectl top`.
+
+```promql
+# The number that decides whether you are safe. Watch this, not working set.
+max by (pod) (container_memory_rss{container="tag"}) / max by (pod) (container_spec_memory_limit_bytes{container="tag"})
+```
+
+RSS scales with configuration, not just cache size:
+
+| Contributor | Governed by |
+| --- | --- |
+| Populate + serve staging | `TAG_CACHE_MAX_POPULATE_MEMORY` (a hard cap) |
+| Per-request buffers | `TAG_MAX_INFLIGHT_REQUESTS` — budget roughly **10 MiB per in-flight request** |
+| Go heap + RocksDB cgo | Grows with load, not directly configurable |
+
+`MAX_POPULATE_MEMORY + (MAX_INFLIGHT_REQUESTS × 10 MiB)` is the **worst case**, not a floor — it assumes every admission slot is simultaneously occupied by a request streaming a full buffer. Real deployments sit far below it: the cap is a ceiling that a healthy workload rarely approaches, which is why the shipped 8 GiB default is fine against defaults of a 2 GiB budget and a 1024 cap.
+
+Size against your own measured RSS, and use the worst case to understand how much room a configuration change can consume. The 10 MiB figure comes from one saturated production workload — treat it as an order of magnitude, not a constant.
+
+> **Raising the inflight cap raises the memory floor.** These two settings are sized together. Increasing `TAG_MAX_INFLIGHT_REQUESTS` without matching memory converts reclaimable page cache into non-reclaimable per-request buffers and will OOM the pod — the working set barely moves while RSS climbs, so the change looks safe right up until the kill.
+
+Never lower the disk cache to save memory; raise the limit instead.
+
+### Admission control
+
+`TAG_MAX_INFLIGHT_REQUESTS` (default 1024) bounds concurrently-served S3 requests. Excess is shed with `503 SlowDown`; `/health`, `/metrics`, and `/debug/pprof/*` are exempt. `0` or unset uses the default, negative disables the bound.
+
+```yaml
+env:
+  - name: TAG_MAX_INFLIGHT_REQUESTS
+    value: "1024"
+```
+
+Shedding shows up as a non-zero rate here, with inflight pinned at the cap:
+
+```promql
+sum(rate(tag_admission_shed_total[5m]))        # requests rejected with 503 SlowDown
+max by (pod) (tag_inflight_requests)           # compare against the configured cap
+```
+
+Sustained shedding means the cap is too low for the offered load — but **raise it and the memory limit together**, per the sizing note above. Shedding is the gentler failure: a `503 SlowDown` is retried by S3 clients, while an OOM kill drops every in-flight request on the node and discards the warm cache. Prefer some shedding over a cap the memory cannot support.
+
+### Metadata caching on write
+
+`TAG_CACHE_META_ON_WRITE` caches an object's metadata entry when TAG proxies its write, so the first read does not spend an upstream round trip discovering the object exists. It is most useful where writers and readers overlap — an ingest pipeline feeding queries over recent data.
+
+```yaml
+env:
+  - name: TAG_CACHE_META_ON_WRITE
+    value: "true"
+```
+
+It changes what a read-after-write observes (metadata is served from cache rather than fetched), and is ETag-guarded against concurrent overwrites. Off by default.
+
+> Both this and parquet optimization **require block caching** (on by default). With `TAG_CACHE_BLOCK_CACHING_ENABLED=false`, or a non-positive `block_size`, they are silently inert — the setting reads as enabled and does nothing.
+
+### Parquet optimization
+
+`TAG_CACHE_PARQUET_OPTIMIZATION` caches parquet metadata blocks ahead of the reader that needs them, from both a read trigger and a write trigger. Whether it helps depends on whether your footers exceed the tail block that already gets cached — see [Parquet optimization](parquet-optimization.md) for how to measure that before enabling it, and how to tell afterwards whether it worked.
 
 ### Block-aligned caching
 
@@ -114,6 +187,40 @@ Start near your median read size; the `1048576` (1 MiB) default suits typical an
 - **Serve latency** — `histogram_quantile(0.95, sum(rate(tag_request_duration_seconds_bucket[5m])) by (le))`.
 
 Cache buffering memory (populate + block-serve staging) is bounded by `TAG_CACHE_MAX_POPULATE_MEMORY` — one honest total (default 2 GiB). See the [Configuration Reference](configuration.md).
+
+### Compaction I/O throttling on throughput-capped volumes
+
+Cloud block volumes are usually throughput-capped (e.g. OCI Balanced at 240 MB/s, gp3 baseline at 125 MB/s). ocache's background compaction (raw-file → segment consolidation and segment recompaction) is unthrottled by default and, after heavy cache population, can burst well past such caps — starving foreground serving reads and causing multi-second p95 stalls until the backlog drains.
+
+On capped volumes, set a shared compaction budget:
+
+```yaml
+env:
+  - name: TAG_CACHE_COMPACTION_BPS
+    value: "33554432" # 32 MiB/s
+```
+
+Sizing guidance:
+
+- **Ceiling:** total compaction I/O ≈ 2× the budget (each byte is read then written); keep that well under half the volume cap so serving always has headroom. `32 MiB/s` on a 240 MB/s volume consumes ~27%.
+- **Floor:** the budget must outpace sustained cache churn or raw-file backlog accumulates. One pod at 32 MiB/s drains ~2.7 TB/day.
+- Populate writes (the serving path filling the cache) are **never** throttled — only compaction's own source reads (its writes follow implicitly).
+- The budget also covers the **liveness walks that gate recompaction** (one ~4 KiB page charged per entry examined), so enabling it bounds reclaim's read load too rather than leaving it unaccounted.
+- The throttle deliberately trades slower backlog drain for stable serving latency; watch `rate(ocache_compaction_bytes_compacted_total[5m])` (should plateau near the budget during drain — use a multi-minute window, as the counter advances at batch-commit granularity and short windows read spiky) and serving p95 during post-load consolidation.
+
+### Reclaiming dead space
+
+Objects that are overwritten, deleted, or expired leave dead bytes inside segment files. Those bytes have no metadata pointing at them, so TTL, eviction, and the deletion queue cannot reach them — only segment recompaction frees them, by copying the live entries out and deleting the old segment.
+
+Recompaction decides what to reclaim by **deriving** each cold segment's dead bytes from the segment's own entries checked against metadata ([ocache RFC-009](https://github.com/tigrisdata/ocache/blob/main/docs/rfcs/RFC-009-walk-gated-recompaction.md)), so reclaim does not depend on bookkeeping counters staying perfect. There is nothing to configure; the relevant knobs are ocache defaults (2 h minimum segment age, 0.5 fragmentation threshold).
+
+What to watch:
+
+- `rate(ocache_segment_walks_total[10m])` — segments examined. Should be non-zero on any node with cold segments; flat zero means recompaction is disabled or every segment is younger than the age gate.
+- `increase(ocache_recompaction_segments_total[1h])` and `increase(ocache_recompaction_bytes_freed_total[1h])` — reclaim actually happening.
+- **Physical vs logical divergence is the real health signal**: compare `kubelet_volume_stats_used_bytes` for the cache PVC against `ocache_disk_usage_bytes` (live bytes). A gap that grows and never shrinks means dead space is accumulating faster than it is reclaimed; a gap that stays small means reclaim is keeping up. Expect the gap to spike during heavy population and while a recompaction holds both the old and new segment on disk.
+
+Because segments must pass the age gate first, reclaim begins roughly two hours after a pod restart, not immediately.
 
 ### Health Checks
 
