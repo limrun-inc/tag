@@ -27,7 +27,7 @@ const (
 
 // RequestForwarder is the interface for forwarding requests to the upstream Tigris server.
 // Two implementations exist: signingForwarder (validate + re-sign) and
-// transparentForwarder (clone headers + proxy headers).
+// transparentForwarder (copy the header map, borrow unchanged values + proxy headers).
 type RequestForwarder interface {
 	// Forward forwards a request to Tigris and writes the response to the client.
 	Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error
@@ -57,6 +57,14 @@ type RequestForwarder interface {
 	// a genuine anonymous read rather than inferring it from a (public-write) write.
 	// Caller is responsible for closing the response body.
 	DoAnonymousFullObjectRequest(ctx context.Context, bucket, key string) (*http.Response, error)
+
+	// DoObjectDeleteRequest executes a synthetic DELETE for one object, signed with
+	// the given credentials. Used by tiered mode's cross-tier cleanup when a small
+	// (local) write replaces an object whose prior version lives upstream. A
+	// non-empty etag is sent as If-Match so the delete only removes the displaced
+	// version — never a newer object a concurrent write put in its place.
+	// Caller is responsible for closing the response body.
+	DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error)
 
 	// DoConditionalGetRequest executes a conditional GET for cache revalidation.
 	// Sends If-None-Match and/or If-Modified-Since headers.
@@ -112,7 +120,7 @@ func mapAuthError(err error) *AuthError {
 	var code AuthErrorCode
 
 	// Check for specific auth errors
-	if errors.Is(err, auth.ErrSignatureMismatch) {
+	if errors.Is(err, auth.ErrSignatureMismatch) || errors.Is(err, auth.ErrChunkSignatureMismatch) {
 		reason = "signature_mismatch"
 		code = ErrCodeSignatureMismatch
 	} else if errors.Is(err, auth.ErrUnknownAccessKey) {
@@ -122,7 +130,8 @@ func mapAuthError(err error) *AuthError {
 		reason = "expired_request"
 		code = ErrCodeExpiredRequest
 	} else if errors.Is(err, auth.ErrMissingAuth) || errors.Is(err, auth.ErrInvalidAuthFormat) ||
-		errors.Is(err, auth.ErrUnsupportedAuthScheme) || errors.Is(err, auth.ErrMissingContentHash) {
+		errors.Is(err, auth.ErrUnsupportedAuthScheme) || errors.Is(err, auth.ErrMissingContentHash) ||
+		errors.Is(err, auth.ErrInvalidExpires) {
 		reason = "malformed_auth"
 		code = ErrCodeMalformedAuth
 	} else {
@@ -163,7 +172,7 @@ type ResponseInterceptor func(resp *http.Response, originalReq *http.Request)
 type baseForwarder struct {
 	signer              *auth.RequestSigner // Both modes need this for DoFullObjectRequest
 	httpClient          *http.Client
-	responseInterceptor ResponseInterceptor // Optional: called before headers are sent to client
+	responseInterceptor ResponseInterceptor // Optional: called before response headers are written.
 }
 
 // newBaseForwarder creates the shared base with HTTP client and signer.
@@ -187,18 +196,28 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 }
 
 // executeAndStream executes the request and streams the response to the client.
-// originalReq is the original client request, passed to the response interceptor
-// for parsing auth info. It can be nil if no interceptor is set.
+// It returns a body-copy error even though the upstream status has already been
+// committed; the HTTP handler must abort that incomplete response. originalReq is
+// the original client request, passed to the response interceptor for parsing auth
+// info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) error {
-	_, _, err := b.executeAndStreamReturningMeta(w, fwdReq, inContentLength, originalReq)
+	_, _, err := b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, false)
 	return err
 }
 
 // executeAndStreamReturningMeta is executeAndStream that also returns the upstream
 // status code and a clone of the upstream response headers. Used by the write-through
 // tee path, which needs the response ETag to build cache metadata for the just-written
-// object without a read-back GET. On a transport error it returns (0, nil, err).
+// object without a read-back GET. On a transport error it returns (0, nil, err); a
+// body-copy error returns the received status and headers with the error.
 func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (int, http.Header, error) {
+	return b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, true)
+}
+
+// executeAndStreamWithMeta streams an upstream response and optionally retains an
+// owned copy of its headers for a caller that needs metadata after streaming. It
+// returns any body-copy error even though the upstream status is already committed.
+func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, captureMeta bool) (int, http.Header, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
@@ -217,9 +236,12 @@ func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwd
 		b.responseInterceptor(resp, originalReq)
 	}
 
-	// Clone response headers before streaming so callers can read the upstream ETag
-	// after the body is consumed.
-	respHeaders := resp.Header.Clone()
+	var respHeaders http.Header
+	if captureMeta {
+		// The write-through tee reads the ETag after the body is consumed, so it
+		// needs independent header ownership.
+		respHeaders = resp.Header.Clone()
+	}
 
 	// Stream response back to client
 	copyHeaders(w.Header(), resp.Header)
@@ -231,10 +253,11 @@ func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwd
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
-	return resp.StatusCode, respHeaders, nil
+	return resp.StatusCode, respHeaders, copyErr
 }
 
-// executeAndCapture executes the request, streams to client, and captures the response.
+// executeAndCapture executes the request, writes its response to w, and captures it.
+// w may defer committing the response until the caller has processed the capture.
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*ResponseCapture, error) {
@@ -251,7 +274,7 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	}
 	defer resp.Body.Close()
 
-	// Run response interceptor before sending headers to client
+	// Run response interceptor before writing response headers.
 	if b.responseInterceptor != nil {
 		b.responseInterceptor(resp, originalReq)
 	}
@@ -266,7 +289,7 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	// Capture body while streaming to client
+	// Capture body while writing it to the response writer.
 	var readErr error
 	capture.Body, readErr = io.ReadAll(io.TeeReader(resp.Body, w))
 	if readErr != nil {
@@ -276,8 +299,11 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 		capture.Complete = true
 	}
 
-	// Track bytes out from response body
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+	// Track bytes out from response body. A deferred writer counts the bytes
+	// accepted by the client when it later commits the captured response.
+	if _, deferred := w.(responseByteAccountingDeferred); !deferred {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+	}
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
 	return capture, nil
@@ -317,10 +343,9 @@ func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int
 // (from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) are valid Tigris credentials
 // that can sign requests directly.
 func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
-	path := "/" + bucket + "/" + key
-
-	// Create request without Range header - just a simple GET for the full object
-	fwdReq, err := b.signer.SignRequest(ctx, "GET", path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
+	// SignObjectRequest takes the key literally: a key containing '?' must not
+	// be split into path + query (it would fetch a truncated sibling key).
+	fwdReq, err := b.signer.SignObjectRequest(ctx, "GET", bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +389,38 @@ func (b *baseForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket
 	return resp, nil
 }
 
+// DoObjectDeleteRequest executes a synthetic DELETE for one object. Standard
+// SigV4 signing, like every TAG-initiated request. A non-empty etag becomes an
+// If-Match precondition: a 412 means the object was already replaced and must
+// be left alone. Tigris enforces If-Match on DELETE (conditional deletes are
+// ordered against the object's current version); because other backends may
+// silently ignore it, tiered mode issues this delete on Tigris only (the
+// cleanup is disabled elsewhere — see deleteUpstreamObjectAsync).
+func (b *baseForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
+	var extraHeaders http.Header
+	if etag != "" {
+		extraHeaders = http.Header{}
+		extraHeaders.Set("If-Match", etag)
+	}
+	// SignObjectRequest takes the key literally: splitting a '?'-bearing key
+	// into path + query would aim this DESTRUCTIVE request at a truncated
+	// sibling key.
+	fwdReq, err := b.signer.SignObjectRequest(ctx, http.MethodDelete, bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(http.MethodDelete, time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cross-tier delete failed")
+		return nil, err
+	}
+
+	return resp, nil
+}
+
 // DoConditionalGetRequest executes a conditional GET request to upstream.
 // Used for cache revalidation: sends If-None-Match and/or If-Modified-Since headers
 // to check if a cached object is still fresh.
@@ -386,8 +443,6 @@ func (b *baseForwarder) DoConditionalHeadRequest(ctx context.Context, bucket, ke
 // Sends If-None-Match and/or If-Modified-Since headers for cache revalidation.
 // Uses standard SigV4 signing because these are synthetic requests initiated by TAG.
 func (b *baseForwarder) doConditionalRequest(ctx context.Context, method, bucket, key, accessKey, secretKey, etag string, lastModified int64, rangeHeader string) (*http.Response, error) {
-	path := "/" + bucket + "/" + key
-
 	extraHeaders := http.Header{}
 	if etag != "" {
 		extraHeaders.Set("If-None-Match", etag)
@@ -400,7 +455,8 @@ func (b *baseForwarder) doConditionalRequest(ctx context.Context, method, bucket
 		extraHeaders.Set("Range", rangeHeader)
 	}
 
-	fwdReq, err := b.signer.SignRequest(ctx, method, path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	// SignObjectRequest takes the key literally — see DoObjectDeleteRequest.
+	fwdReq, err := b.signer.SignObjectRequest(ctx, method, bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -453,13 +509,35 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 	}
 }
 
-// prepareForwardedRequest sets Content-Length on the forwarded request and strips
-// AWS chunked-encoding headers when the request body was decoded from chunked format.
+// headersForForwardedSigning returns the client headers as they will be sent
+// upstream. When the body was decoded from aws-chunked framing, the framing
+// headers go: X-Amz-Decoded-Content-Length (the signer signs every x-amz-*
+// header, and a signed header that is absent on arrival is a
+// SignatureDoesNotMatch at Tigris, so it must be removed BEFORE signing, not
+// after) and the aws-chunked Content-Encoding token (the forwarded body is the
+// decoded object). The client's header map is never mutated.
+func headersForForwardedSigning(headers http.Header, chunked bool) http.Header {
+	if !chunked {
+		return headers
+	}
+	forwarded := headers.Clone()
+	forwarded.Del("X-Amz-Decoded-Content-Length")
+	if ce := forwarded.Get("Content-Encoding"); ce != "" {
+		if stripped := stripAWSChunkedToken(ce); stripped == "" {
+			forwarded.Del("Content-Encoding")
+		} else {
+			forwarded.Set("Content-Encoding", stripped)
+		}
+	}
+	return forwarded
+}
+
+// prepareForwardedRequest sets Content-Length on the forwarded request. The
+// chunked-encoding headers were already left out of the signed header set by
+// headersForForwardedSigning.
 func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked bool) {
 	if chunked {
 		fwdReq.ContentLength = contentLength
-		fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
-		stripAWSChunkedEncoding(fwdReq)
 		// When decoded content length is 0, set Body to http.NoBody so Go's
 		// HTTP transport sends "Content-Length: 0" instead of using
 		// "Transfer-Encoding: chunked" (which happens when ContentLength == 0
@@ -469,29 +547,6 @@ func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked 
 		}
 	} else if contentLength > 0 {
 		fwdReq.ContentLength = contentLength
-	}
-}
-
-// stripAWSChunkedEncoding removes "aws-chunked" from the Content-Encoding header.
-// AWS S3 allows combined values like "aws-chunked,gzip". After decoding the chunked
-// layer, we strip only the aws-chunked token and preserve any remaining encodings.
-func stripAWSChunkedEncoding(req *http.Request) {
-	ce := req.Header.Get("Content-Encoding")
-	if ce == "" {
-		return
-	}
-
-	var remaining []string
-	for _, part := range strings.Split(ce, ",") {
-		if strings.TrimSpace(part) != "aws-chunked" {
-			remaining = append(remaining, strings.TrimSpace(part))
-		}
-	}
-
-	if len(remaining) == 0 {
-		req.Header.Del("Content-Encoding")
-	} else {
-		req.Header.Set("Content-Encoding", strings.Join(remaining, ","))
 	}
 }
 
@@ -532,6 +587,13 @@ func logUpstreamResponse(fwdReq *http.Request, originalReq *http.Request, status
 		Msg("Upstream response")
 }
 
+// responseByteAccountingDeferred marks a writer that buffers a captured response
+// instead of sending it to the client as the upstream body is read. The writer
+// accounts for outbound bytes when it commits the response.
+type responseByteAccountingDeferred interface {
+	deferResponseByteAccounting()
+}
+
 // ResponseCapture holds captured response data.
 type ResponseCapture struct {
 	StatusCode int
@@ -549,11 +611,12 @@ func (r *ResponseCapture) ContentLength() int64 {
 // For x-amz-meta-* headers, the key is lowercased to match S3 convention,
 // since Go's http.Header canonicalizes keys (e.g., x-amz-meta-foo → X-Amz-Meta-Foo).
 func copyHeaders(dst, src http.Header) {
+	const metadataPrefix = "x-amz-meta-"
+
 	for k, v := range src {
-		lower := strings.ToLower(k)
-		if strings.HasPrefix(lower, "x-amz-meta-") {
+		if len(k) >= len(metadataPrefix) && strings.EqualFold(k[:len(metadataPrefix)], metadataPrefix) {
 			// Use lowercase for metadata headers per S3 convention
-			dst[lower] = v
+			dst[strings.ToLower(k)] = v
 		} else {
 			dst[k] = v
 		}

@@ -17,6 +17,11 @@ import (
 // DeleteObjects (Multi-Object Delete) Support
 // ============================================================================
 
+// bulkDeleteFenceTimeout bounds the post-success cache fence a cache-enabled
+// bulk delete waits on before committing its staged upstream response, so a
+// stalled cache peer delays the client's 2xx by at most this long.
+const bulkDeleteFenceTimeout = 10 * time.Second
+
 // deleteObjectsRequest represents the S3 DeleteObjects request body.
 type deleteObjectsRequest struct {
 	XMLName xml.Name            `xml:"Delete"`
@@ -76,6 +81,65 @@ func isS3ErrorBody(body []byte) bool {
 	}
 }
 
+// deleteObjectsResponseStager retains only response headers and status. ForwardWithCapture
+// owns the response body in ResponseCapture; acknowledging but discarding its writes here
+// prevents a cache-enabled bulk-delete response from reaching the client before the
+// post-success invalidations complete, without retaining a second body copy.
+type deleteObjectsResponseStager struct {
+	header     http.Header
+	statusCode int
+}
+
+func newDeleteObjectsResponseStager() *deleteObjectsResponseStager {
+	return &deleteObjectsResponseStager{header: make(http.Header)}
+}
+
+func (w *deleteObjectsResponseStager) Header() http.Header {
+	return w.header
+}
+
+func (w *deleteObjectsResponseStager) deferResponseByteAccounting() {}
+
+func (w *deleteObjectsResponseStager) WriteHeader(statusCode int) {
+	if w.statusCode == 0 {
+		w.statusCode = statusCode
+	}
+}
+
+func (w *deleteObjectsResponseStager) Write(body []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	return len(body), nil
+}
+
+func (w *deleteObjectsResponseStager) commit(dst http.ResponseWriter, capture *ResponseCapture) {
+	headers := w.header
+	statusCode := w.statusCode
+	var body []byte
+	if capture != nil {
+		if len(headers) == 0 {
+			headers = capture.Headers
+		}
+		if statusCode == 0 {
+			statusCode = capture.StatusCode
+		}
+		body = capture.Body
+	}
+
+	copyHeaders(dst.Header(), headers)
+	if statusCode != 0 {
+		dst.WriteHeader(statusCode)
+	}
+	if len(body) > 0 {
+		n, err := dst.Write(body)
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to write captured bulk-delete response body")
+		}
+	}
+}
+
 // HandleDeleteObjects handles POST /{bucket}?delete for bulk object deletion.
 // Invalidates cache for requested objects BEFORE forwarding to ensure consistency.
 func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) error {
@@ -96,12 +160,38 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// requestedCounts tracks how many entries each key was requested under (the same
 	// key may appear multiple times with different version IDs).
 	var requestedCounts map[string]int
+	// Tiered: pre-forward tokens per key, so the post-success converge is
+	// ordered — see convergeTieredDelete.
+	type tieredPrior struct {
+		version uint64
+		known   bool
+	}
+	var tieredPriors map[string]tieredPrior
+	if s.config.IsTiered() {
+		tieredPriors = make(map[string]tieredPrior)
+	}
 	if s.cache.IsEnabled() {
 		var deleteReq deleteObjectsRequest
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
 			for _, obj := range deleteReq.Objects {
-				s.invalidateObject(context.Background(), bucket, obj.Key)
+				// Proxy modes only — see preForwardInvalidate; in tiered
+				// mode a listed key may be a local-tier only-copy that a
+				// rejected bulk delete must leave intact (the per-key
+				// post-success converge below carries tiered).
+				s.preForwardInvalidate(context.Background(), bucket, obj.Key)
+				if tieredPriors != nil {
+					if _, seen := tieredPriors[obj.Key]; !seen {
+						// Claim before capturing the token, held for the whole
+						// bulk delete: cancels and excludes re-tiers so a heal
+						// cannot resurrect a deleted key past the ordered
+						// converge (see HandleDeleteObject).
+						s.claimRetierWrite(bucket, obj.Key)
+						defer s.releaseRetierWrite(bucket, obj.Key)
+						_, v, known := s.captureMarkerPrior(context.Background(), bucket, obj.Key)
+						tieredPriors[obj.Key] = tieredPrior{version: v, known: known}
+					}
+				}
 				requestedCounts[obj.Key]++
 				log.Debug().
 					Str("bucket", bucket).
@@ -111,14 +201,24 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		}
 	}
 
+	// For parsed requests with cache keys to fence, stage response headers and
+	// status while ForwardWithCapture retains the body for result classification.
+	// Cache-disabled, malformed, and empty requests keep the direct streaming path.
+	forwardWriter := w
+	var responseStager *deleteObjectsResponseStager
+	if s.cache.IsEnabled() && len(requestedCounts) > 0 {
+		responseStager = newDeleteObjectsResponseStager()
+		forwardWriter = responseStager
+	}
+
 	// Forward request to upstream, capturing the response so we can tell which
 	// per-object deletes actually succeeded — S3 returns 200 OK with per-key
 	// <Error> elements for partial failures.
-	capture, err := s.forwarder.ForwardWithCapture(r.Context(), w, r)
+	capture, err := s.forwarder.ForwardWithCapture(r.Context(), forwardWriter, r)
 
 	// Re-invalidate AFTER upstream confirms the deletes, for the same
 	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
-	// bulk delete may have re-cached a not-yet-deleted object; this second tombstone
+	// bulk delete may have re-cached a not-yet-deleted object; this second fence bump
 	// blocks that stale repopulation. A key is re-invalidated when at least one of
 	// its requested entries was deleted — i.e. more entries were requested for the
 	// key than upstream reported as errored. Counting by key (never matching version
@@ -127,14 +227,48 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// A key whose entries ALL errored keeps its refill (it's still upstream).
 	// Routed through invalidateObject so a failed re-invalidation is recorded/logged.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
+		// Upstream has committed the deletes, so a client disconnect must not
+		// abandon the fence (WithoutCancel); the timeout keeps a stalled cache
+		// peer from holding the staged response indefinitely. On expiry the
+		// remaining per-key attempts fail fast, the captured 2xx is still
+		// committed below, and the stale metadata ages out via TTL.
+		fenceCtx, cancelFence := context.WithTimeout(context.WithoutCancel(r.Context()), bulkDeleteFenceTimeout)
+		fencedKeys, skippedKeys := 0, 0
 		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
 		for key, reqN := range requestedCounts {
 			// On a parse failure, over-invalidate every requested key (safe).
 			if parsed && reqN <= erroredCounts[key] {
 				continue // every requested entry for this key errored — object still present
 			}
-			s.invalidateObject(context.Background(), bucket, key)
+			// Once the shared deadline has passed, stop starting per-key fences in
+			// either mode: the tiered helper runs under its own per-key timeout, so
+			// without this check a large tiered batch could hold the 2xx for N times
+			// that timeout. Skipped keys age out via TTL and are counted below.
+			if fenceCtx.Err() != nil {
+				skippedKeys++
+				continue
+			}
+			fencedKeys++
+			if tieredPriors != nil {
+				p := tieredPriors[key]
+				s.convergeTieredDelete(bucket, key, p.version, p.known)
+				continue
+			}
+			s.convergeInvalidation(fenceCtx, bucket, key)
 		}
+		if fenceCtx.Err() != nil {
+			log.Warn().
+				Str("bucket", bucket).
+				Int("keys", fencedKeys).
+				Int("skipped_keys", skippedKeys).
+				Dur("timeout", bulkDeleteFenceTimeout).
+				Msg("Bulk-delete cache fence did not converge within the timeout; responding with the upstream result, stale metadata may serve until TTL")
+		}
+		cancelFence()
+	}
+
+	if responseStager != nil {
+		responseStager.commit(w, capture)
 	}
 
 	// Record metrics
@@ -142,7 +276,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("DeleteObjects", status, time.Since(start).Seconds())
+	metrics.RecordRequest("DeleteObjects", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	return err
 }
