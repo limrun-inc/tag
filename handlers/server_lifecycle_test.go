@@ -53,8 +53,8 @@ func TestServerStartStopLifecycle(t *testing.T) {
 					t.Errorf("server handler /health = (%d, %q), want (200, \"OK\") from the configured router", rec.Code, rec.Body.String())
 				}
 			}
-			if initial.ReadTimeout != 5*time.Minute || initial.WriteTimeout != 5*time.Minute || initial.IdleTimeout != 120*time.Second {
-				t.Errorf("server timeouts = (%s, %s, %s), want (5m, 5m, 2m)", initial.ReadTimeout, initial.WriteTimeout, initial.IdleTimeout)
+			if initial.ReadTimeout != 0 || initial.WriteTimeout != 0 || initial.ReadHeaderTimeout != 30*time.Second || initial.IdleTimeout != 120*time.Second {
+				t.Errorf("server timeouts = (%s, %s, %s), want (0, 0, 2m), with a 30s header timeout", initial.ReadTimeout, initial.WriteTimeout, initial.IdleTimeout)
 			}
 		}
 

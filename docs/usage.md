@@ -281,4 +281,15 @@ config = Config(s3={'addressing_style': 'path'})
 s3 = boto3.client('s3', endpoint_url='http://localhost:8080', config=config)
 ```
 
-TAG does not support virtual-hosted style requests (e.g., `bucket.localhost:8080`).
+General bucket operations require path-style addressing. Transparent mode also
+accepts presigned object requests using `<bucket>.t3.tigrisfiles.io` and
+`<bucket>.s3.<domain>`. Preserve the URL's original Host when routing these
+requests through TAG. TAG uses that hostname for TLS SNI and certificate
+verification, while connecting only to the configured upstream endpoint.
+
+TAG limits request headers to 30 seconds and waits up to 60 seconds for upstream
+response headers. It imposes no total HTTP body-transfer deadline. Cache reads
+streaming to clients time out after five minutes without successful writes;
+inline cache population times out after 60 seconds without body-read progress.
+Buffered cache reads and background fetches retain their bounded deadlines.
+Client request cancellation and service shutdown still cancel active work.

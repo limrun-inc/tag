@@ -65,11 +65,10 @@ func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled boo
 	// Initialize before Start can run in another goroutine so Stop always sees
 	// this same server, even when shutdown wins the race to start serving.
 	s.httpServer = &http.Server{
-		Addr:         s.bindAddr,
-		Handler:      s.foregroundHandlerMiddleware(s.router),
-		ReadTimeout:  5 * time.Minute,
-		WriteTimeout: 5 * time.Minute,
-		IdleTimeout:  120 * time.Second,
+		Addr:              s.bindAddr,
+		Handler:           s.foregroundHandlerMiddleware(s.router),
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 		BaseContext: func(net.Listener) context.Context {
 			return requestCtx
 		},
@@ -510,6 +509,9 @@ func handleError(w http.ResponseWriter, r *http.Request, err error) {
 
 // getBucketName extracts the bucket name from request path variables.
 func getBucketName(r *http.Request) string {
+	if bucket, ok := proxy.PresignedVirtualHostBucket(r); ok {
+		return bucket
+	}
 	vars := mux.Vars(r)
 	return vars["bucket"]
 }
@@ -653,6 +655,11 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 
 // handleBucket handles basic bucket operations.
 func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request) {
+	// A single-segment virtual-host key otherwise matches the bucket route.
+	if _, ok := proxy.PresignedVirtualHostBucket(r); ok && strings.TrimPrefix(r.URL.Path, "/") != "" {
+		s.handleObject(w, r)
+		return
+	}
 	if !validateBucketName(w, r) {
 		return
 	}

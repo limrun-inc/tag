@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -909,12 +910,16 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 
+	if bypassPresignedCache(r) {
+		return s.forwardWithoutCache(ctx, w, r, "HeadObject", start)
+	}
+
 	// A representation selector (?versionId, ?partNumber, response-* header
 	// overrides) is not answered by the cached current-object metadata; forward
 	// upstream as-is, exactly like the GET path.
 	if hasRepresentationSelectors(r) {
 		log.Debug().Str("bucket", bucket).Str("key", key).Strs("selectors", representationSelectorNames(r)).Msg("HEAD representation selector, forwarding upstream")
-		return s.forwardRepresentationSelector(ctx, w, r, "HeadObject", start)
+		return s.forwardWithoutCache(ctx, w, r, "HeadObject", start)
 	}
 
 	// Try to serve from cached metadata (no body needed)
@@ -1428,6 +1433,9 @@ func completionRequestForLocalValidation(r *http.Request) (*http.Request, bool) 
 
 // ParseBucketKey extracts bucket and key from request path.
 func ParseBucketKey(r *http.Request) (bucket, key string) {
+	if bucket, ok := PresignedVirtualHostBucket(r); ok {
+		return bucket, strings.TrimPrefix(r.URL.Path, "/")
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	parts := strings.SplitN(path, "/", 2)
 	if len(parts) >= 1 {
@@ -1437,6 +1445,33 @@ func ParseBucketKey(r *http.Request) (bucket, key string) {
 		key = parts[1]
 	}
 	return
+}
+
+// PresignedVirtualHostBucket recognizes the bucket hosts used by Tigris download URLs.
+// The handlers apply the same bucket-name validation as for path-style requests.
+func PresignedVirtualHostBucket(r *http.Request) (string, bool) {
+	if !auth.IsPresignedRequest(r) {
+		return "", false
+	}
+	host := strings.ToLower(r.Host)
+	if hostname, _, err := net.SplitHostPort(host); err == nil {
+		host = hostname
+	}
+	const suffix = ".t3.tigrisfiles.io"
+	if strings.HasSuffix(host, suffix) {
+		bucket := strings.TrimSuffix(host, suffix)
+		return bucket, bucket != ""
+	}
+	if i := strings.Index(host, ".s3."); i > 0 {
+		return host[:i], true
+	}
+	return "", false
+}
+
+// Presigned app downloads explicitly request origin validation. Keep the original
+// signed request intact and let Tigris answer, even when a cached object exists.
+func bypassPresignedCache(r *http.Request) bool {
+	return auth.IsPresignedRequest(r) && r.Header.Get("Cache-Control") != ""
 }
 
 // hasNoAuthCredentials returns true if the request carries no SigV4 credentials

@@ -144,6 +144,11 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
 	}
 
+	// URL.Host controls TLS SNI, certificate verification and connection pooling.
+	// NewForwarder pins the TCP connection to the configured upstream endpoint.
+	if _, ok := PresignedVirtualHostBucket(r); ok {
+		baseURL.Host = r.Host
+	}
 	baseURL.Path = reqPath
 	baseURL.RawPath = rawPath
 	baseURL.RawQuery = r.URL.RawQuery

@@ -35,19 +35,15 @@ const maxRangeBlockFanout = 32
 // while the original request context can still perform its upstream fallback.
 const certifiedRangeReadTimeout = 5 * time.Second
 
-// getBlockRangeStream is the one cache-read seam for block payload slices. Each read
-// carries its own deadline so a stalled peer surfaces as a transient read error —
-// errBlockStreamDegraded on a committed stream, an untouched response pre-commit —
-// rather than holding the request open. A read into a staging buffer is bounded by
-// the size-scaled cacheReadTimeoutForSize; a read whose sink is the client
-// (toClient) is paced by that client, so it gets the flat cacheStreamReadTimeout
-// that only restates the server's WriteTimeout.
+// getBlockRangeStream bounds buffered reads by size and client-paced reads by idle time.
+// A stalled peer remains a transient error, so it cannot evict a healthy entry.
 func (s *Service) getBlockRangeStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, idx, localStart, localEnd int64, w io.Writer, toClient bool) error {
-	timeout := cacheReadTimeoutForSize(localEnd - localStart + 1)
 	if toClient {
-		timeout = cacheStreamReadTimeout
+		return readCacheStream(ctx, w, func(readCtx context.Context, dest io.Writer) error {
+			return s.cache.GetBlockRangeStream(readCtx, bucket, key, meta.ETag, meta.BlockSize, idx, localStart, localEnd, dest)
+		})
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, cacheReadTimeoutForSize(localEnd-localStart+1))
 	defer cancel()
 	return s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, localStart, localEnd, w)
 }
