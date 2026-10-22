@@ -41,16 +41,79 @@ func (f *transparentForwarder) initInterceptor() {
 }
 
 // interceptResponse is called by base forwarder methods after receiving the
-// upstream response but before headers are sent to the client. It extracts
-// signing keys from successful responses and revokes authZ on 403s.
+// upstream response but before headers are sent to the client. It learns
+// signing keys, grants authorization only for successful object reads, and
+// revokes authZ on 403s.
 func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) {
 	f.learnSigningKeys(resp, originalReq)
+	f.grantReadAuthorization(resp, originalReq)
 	f.handleAuthzRevocation(resp, originalReq)
 }
 
+// isReadAuthorizationQuery accepts only selectors and authentication metadata
+// known not to select a different S3 operation. The basic object route also
+// receives unrecognized GET/HEAD subresources, so an unknown or malformed
+// query cannot prove that the origin authorized GetObject or HeadObject.
+func isReadAuthorizationQuery(rawQuery string) bool {
+	if rawQuery == "" {
+		return true
+	}
+
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false
+	}
+
+	for key := range query {
+		if isReadRepresentationSelector(key) {
+			continue
+		}
+		switch key {
+		case "X-Amz-Checksum-Mode", "x-amz-expected-bucket-owner", "x-amz-request-payer":
+			continue
+		}
+
+		allowedAuthOrSDKParam := false
+		for _, param := range originlessIgnoredParams {
+			if key == param {
+				allowedAuthOrSDKParam = true
+				break
+			}
+		}
+		if !allowedAuthOrSDKParam {
+			return false
+		}
+	}
+	return true
+}
+
+// shallowHeaderCopy gives the forwarded request its own header map while
+// reusing the immutable value slices owned by the client request. Header.Set
+// and Header.Del replace or remove entries, so the values for headers changed
+// by this forwarder do not alias the inbound map. The unchanged slices are
+// read-only for the lifetime of the outbound request, as required by the
+// net/http RoundTripper contract.
+func shallowHeaderCopy(header http.Header) http.Header {
+	if header == nil {
+		return make(http.Header)
+	}
+
+	copied := make(http.Header, len(header)+4)
+	for key, values := range header {
+		if values != nil {
+			// Keep the data borrowed but prevent an append on the forwarded
+			// entry from reusing the inbound slice's spare capacity.
+			values = values[:len(values):len(values)]
+		}
+		copied[key] = values
+	}
+	return copied
+}
+
 // buildTransparentRequest creates a forwarded request for transparent proxy mode.
-// Copies ALL headers from the original request (including Authorization, X-Amz-Date, etc.)
-// and adds the 4 proxy headers. The body is streamed as-is without decoding.
+// Copies the header map while borrowing unchanged header-value slices. The body
+// is streamed as-is without decoding. Headers changed for the upstream request
+// remain private to the forwarded request.
 //
 // For AWS chunked transfer encoding (streaming SigV4), ensures the required
 // Content-Encoding: aws-chunked header is present per the S3 spec. Some clients
@@ -90,9 +153,10 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Clone ALL headers from the original request (preserving Authorization, X-Amz-Date, etc.)
-	// Clone avoids mutating the original request headers when adding proxy headers below.
-	fwdReq.Header = r.Header.Clone()
+	// Keep the map itself private so proxy credentials and any synthesized
+	// headers are never visible through the inbound request. Unchanged value
+	// slices are borrowed and must not be mutated by the transport.
+	fwdReq.Header = shallowHeaderCopy(r.Header)
 
 	// Ensure X-Amz-Date is present for Tigris's proxy validation path.
 	// Some SDK versions (botocore 1.42+) sign with "date" in SignedHeaders
@@ -175,6 +239,21 @@ func (f *transparentForwarder) ValidateAndGetCredentials(r *http.Request) (AuthR
 	// which always uses TAG's own credentials via SigV4 signing.
 	// DoRequestWithCreds in transparent mode ignores these (uses client's auth).
 	return result, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
+}
+
+// chunkVerifier implements chunkVerifierProvider for the tiered local-tier PUT,
+// which the engine decodes itself. Without local auth there is no signing
+// material (and validateLocally reports every request validated), so the
+// body decodes unverified exactly as before.
+func (f *transparentForwarder) chunkVerifier(r *http.Request) (*auth.ChunkVerifier, error) {
+	if f.validator == nil {
+		return nil, nil
+	}
+	vr, err := f.validator.Validate(r)
+	if err != nil {
+		return nil, mapAuthError(err)
+	}
+	return vr.ChunkVerifier(), nil
 }
 
 // validateLocally performs local SigV4 validation of the client's request.
@@ -261,6 +340,7 @@ func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.R
 
 // learnSigningKeys extracts and caches derived signing keys from the Tigris response.
 // The signing keys header is always stripped before the response reaches the client.
+// Learning identity keys does not grant authorization to read cached objects.
 func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Request) {
 	// Always strip the internal header, even when local auth is disabled.
 	headerVal := resp.Header.Get(signingKeysHeader)
@@ -304,7 +384,6 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	}
 
 	bucket, _ := ParseBucketKey(r)
-	f.authzCache.Grant(authInfo.AccessKey, bucket)
 
 	if newKeys > 0 {
 		log.Debug().
@@ -316,6 +395,29 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 
 	metrics.ProxySigningKeysReceived.Inc()
 	metrics.DerivedKeyStoreSize.Set(float64(f.derivedKeyStore.Count()))
+	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+}
+
+// grantReadAuthorization records bucket authorization only after an upstream
+// success from a client GetObject or HeadObject. The method, object path, and
+// query classifier reject other operations that can reach the basic object route.
+func (f *transparentForwarder) grantReadAuthorization(resp *http.Response, r *http.Request) {
+	if f.validator == nil || f.keyUnwrapper == nil || f.authzCache == nil ||
+		resp.StatusCode < 200 || resp.StatusCode >= 300 || r == nil ||
+		(r.Method != http.MethodGet && r.Method != http.MethodHead) || !isReadAuthorizationQuery(r.URL.RawQuery) {
+		return
+	}
+
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		return
+	}
+	bucket, key := ParseBucketKey(r)
+	if bucket == "" || key == "" {
+		return
+	}
+
+	f.authzCache.Grant(authInfo.AccessKey, bucket)
 	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
 }
 

@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/tigrisdata/tag/cache"
 )
 
 // teeMockForwarder is a mockForwarder that also implements bodyTeeingForwarder, so
@@ -21,8 +23,8 @@ import (
 type teeMockForwarder struct {
 	*mockForwarder
 	teeFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error)
-	// headHook, if set, runs when the tee issues its authoritative HEAD — used to simulate a
-	// competing write landing during the HEAD window.
+	// headHook, if set, runs when the tee issues its authoritative HEAD — used to gate that
+	// work or simulate a competing write during the HEAD window.
 	headHook func()
 }
 
@@ -60,6 +62,94 @@ func headResp(etag, contentType string, contentLength int64) *http.Response {
 	h.Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	h.Set("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT")
 	return &http.Response{StatusCode: http.StatusOK, Header: h, Body: http.NoBody, ContentLength: contentLength}
+}
+
+// A response delivery error after the upstream PUT's 2xx still converges the cache, and the
+// tee reservation remains owned until its asynchronous cache write finishes and releases it.
+func TestHandlePutObject_WriteThroughTee_ResponseCopyErrorInvalidatesAndReleasesReservation(t *testing.T) {
+	copyErr := errors.New("response body delivery failed")
+	body := "tee-body-after-successful-upstream-put"
+	headStarted := make(chan struct{}, 1)
+	releaseHead := make(chan struct{})
+	headReleased := false
+	defer func() {
+		if !headReleased {
+			close(releaseHead)
+		}
+	}()
+
+	var c *cache.Cache
+	forwarder := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp: headResp(`"tee-etag"`, "text/plain", int64(len(body))),
+		},
+		teeFunc: func(_ context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error) {
+			if _, err := io.Copy(tee, r.Body); err != nil {
+				return 0, nil, "", "", err
+			}
+			bucket, key := ParseBucketKey(r)
+			stale := &cache.CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"stale"`, ContentLength: 5, StatusCode: http.StatusOK}
+			if err := c.PutWithMeta(context.Background(), bucket, key, stale, []byte("stale"), 60); err != nil {
+				return 0, nil, "", "", err
+			}
+			headers := http.Header{}
+			headers.Set("ETag", `"tee-etag"`)
+			w.Header().Set("ETag", `"tee-etag"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "response prefix")
+			return http.StatusOK, headers, "access", "secret", copyErr
+		},
+		headHook: func() {
+			headStarted <- struct{}{}
+			<-releaseHead
+		},
+	}
+	service, c := newTestService(forwarder, true)
+	service.config.Cache.WarmOnWrite = true
+	service.config.Cache.SizeThreshold = 1 << 20
+	service.config.Cache.BlockSize = 1 << 20
+	service.cacheSemaphore = make(chan struct{}, 1)
+
+	request := authedPut(wowBucket, wowKey, body)
+	writer := httptest.NewRecorder()
+	if err := service.HandlePutObject(writer, request); !errors.Is(err, copyErr) {
+		t.Fatalf("HandlePutObject error = %v, want %v", err, copyErr)
+	}
+	if writer.Code != http.StatusOK {
+		t.Fatalf("upstream status = %d, want %d", writer.Code, http.StatusOK)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Fatal("the 2xx PUT's post-forward invalidation did not remove the racing refill")
+	}
+	select {
+	case <-headStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("write-through worker did not reach its gated HEAD")
+	}
+	select {
+	case service.cacheSemaphore <- struct{}{}:
+		<-service.cacheSemaphore
+		t.Fatal("tee reservation was released before its asynchronous owner finished using the body")
+	default:
+	}
+
+	slotAcquired := make(chan struct{})
+	go func() {
+		service.cacheSemaphore <- struct{}{}
+		close(slotAcquired)
+	}()
+	close(releaseHead)
+	headReleased = true
+	select {
+	case <-slotAcquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tee reservation was not released after the write-through owner completed")
+	}
+	<-service.cacheSemaphore
+	if !service.acquireCacheSlot(context.Background(), int64(len(body)), priorityReadMiss) {
+		t.Fatal("tee completion did not release both the count slot and byte reservation")
+	}
+	service.releaseCacheSlot(int64(len(body)))
 }
 
 // A single authenticated PutObject within the size threshold is cached by teeing the body,
@@ -234,7 +324,7 @@ func TestHandlePutObject_WriteThroughTee_HeadFailureFallsBackToWarm(t *testing.T
 // the tee must NOT fall back to a read-back warm — a warm would only re-download the full
 // body to reject it again, defeating the bandwidth win.
 func TestHandlePutObject_WriteThroughTee_NotCacheableSkipsWarm(t *testing.T) {
-	var puts, warmGets atomic.Int32
+	var puts, warmGets, heads atomic.Int32
 	body := "no-store-body"
 
 	head := headResp(`"tee-etag"`, "text/plain", int64(len(body)))
@@ -245,7 +335,8 @@ func TestHandlePutObject_WriteThroughTee_NotCacheableSkipsWarm(t *testing.T) {
 			conditionalResp:  head,
 			doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"), // must NOT fire
 		},
-		teeFunc: teeUpstream(&puts, `"tee-etag"`),
+		teeFunc:  teeUpstream(&puts, `"tee-etag"`),
+		headHook: func() { heads.Add(1) },
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
@@ -264,6 +355,140 @@ func TestHandlePutObject_WriteThroughTee_NotCacheableSkipsWarm(t *testing.T) {
 	}
 	if got := puts.Load(); got != 1 {
 		t.Errorf("tee upstream PUTs = %d, want 1", got)
+	}
+	if got := heads.Load(); got != 1 {
+		t.Errorf("metadata HEADs = %d, want 1 (no policy was available on the PUT)", got)
+	}
+}
+
+// A Cache-Control policy supplied with the PUT is already enough to reject shared caching.
+// The request must take the plain-forward path before tee admission: no metadata HEAD, tee
+// buffer, cache entry, or read-back warm is needed for no-store/private.
+func TestHandlePutObject_WriteThroughTee_RequestCacheControlPlainForwards(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		cacheControls []string
+	}{
+		{name: "no-store", cacheControls: []string{"No-Store"}},
+		{name: "private", cacheControls: []string{"max-age=60, PRIVATE"}},
+		{name: "private-with-field-list", cacheControls: []string{`private="Set-Cookie"`}},
+		{name: "repeated-no-store", cacheControls: []string{"max-age=60", "no-store"}},
+		{name: "repeated-private", cacheControls: []string{"max-age=60", "private"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var teedPuts, directPuts, warmGets, heads atomic.Int32
+			var forwardedBody bytes.Buffer
+			body := "request-cache-control-body"
+
+			mock := &teeMockForwarder{
+				mockForwarder: &mockForwarder{
+					// A cacheable response makes an accidental HEAD observable as both a
+					// second request and a wrongly published entry.
+					conditionalResp:  headResp(`"tee-etag"`, "text/plain", int64(len(body))),
+					doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"),
+					forwardFunc: func(_ context.Context, w http.ResponseWriter, r *http.Request) error {
+						if _, err := io.Copy(&forwardedBody, r.Body); err != nil {
+							return err
+						}
+						directPuts.Add(1)
+						w.WriteHeader(http.StatusOK)
+						return nil
+					},
+				},
+				teeFunc:  teeUpstream(&teedPuts, `"tee-etag"`),
+				headHook: func() { heads.Add(1) },
+			}
+			svc, c := newTestService(mock, true)
+			svc.config.Cache.WarmOnWrite = true
+			svc.config.Cache.SizeThreshold = 1 << 20
+			svc.config.Cache.BlockSize = 1 << 20
+			svc.cacheSemaphore = make(chan struct{}, 1)
+
+			r := authedPut(wowBucket, wowKey, body)
+			for _, cacheControl := range tc.cacheControls {
+				r.Header.Add("Cache-Control", cacheControl)
+			}
+			w := httptest.NewRecorder()
+			if err := svc.HandlePutObject(w, r); err != nil {
+				t.Fatalf("HandlePutObject: %v", err)
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("client status = %d, want 200", w.Code)
+			}
+			if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+				t.Error("request-declared non-cacheable object was cached")
+			}
+			if got := teedPuts.Load(); got != 0 {
+				t.Errorf("tee upstream PUTs = %d, want 0", got)
+			}
+			if got := directPuts.Load(); got != 1 {
+				t.Errorf("plain-forward upstream PUTs = %d, want 1", got)
+			}
+			if got := forwardedBody.String(); got != body {
+				t.Errorf("plain-forward body = %q, want %q", got, body)
+			}
+			if got := heads.Load(); got != 0 {
+				t.Errorf("metadata HEADs = %d, want 0", got)
+			}
+			if got := warmGets.Load(); got != 0 {
+				t.Errorf("read-back warm GETs = %d, want 0", got)
+			}
+			if !svc.acquireCacheSlot(context.Background(), int64(len(body)), priorityReadMiss) {
+				t.Fatal("request policy path held a cache slot")
+			}
+			svc.releaseCacheSlot(int64(len(body)))
+		})
+	}
+}
+
+// Only exact no-store/private directives reject shared storage. no-cache and extension
+// directives whose names or values merely contain those strings retain the normal tee path
+// and its authoritative metadata HEAD.
+func TestHandlePutObject_WriteThroughTee_RequestCacheControlExtensionsUseHead(t *testing.T) {
+	var teedPuts, directPuts, warmGets, heads atomic.Int32
+	body := "request-no-cache-body"
+
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp:  headResp(`"tee-etag"`, "text/plain", int64(len(body))),
+			doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"),
+			forwardFunc: func(_ context.Context, w http.ResponseWriter, r *http.Request) error {
+				if _, err := io.Copy(io.Discard, r.Body); err != nil {
+					return err
+				}
+				directPuts.Add(1)
+				w.WriteHeader(http.StatusOK)
+				return nil
+			},
+		},
+		teeFunc:  teeUpstream(&teedPuts, `"tee-etag"`),
+		headHook: func() { heads.Add(1) },
+	}
+	svc, c := newTestService(mock, true)
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
+
+	r := authedPut(wowBucket, wowKey, body)
+	r.Header.Set("Cache-Control", `no-cache, no-storex, privatex, foo="private, no-store"`)
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, r); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("cacheable request-policy PUT was not cached through the tee")
+	}
+	if got := teedPuts.Load(); got != 1 {
+		t.Errorf("tee upstream PUTs = %d, want 1", got)
+	}
+	if got := directPuts.Load(); got != 0 {
+		t.Errorf("plain-forward upstream PUTs = %d, want 0", got)
+	}
+	if got := heads.Load(); got != 1 {
+		t.Errorf("metadata HEADs = %d, want 1", got)
+	}
+	if got := warmGets.Load(); got != 0 {
+		t.Errorf("read-back warm GETs = %d, want 0", got)
 	}
 }
 
