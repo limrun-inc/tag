@@ -65,13 +65,14 @@ func TestTransparentVirtualHostTLSUsesConfiguredOrigin(t *testing.T) {
 	}
 	roots := x509.NewCertPool()
 	roots.AddCert(cert)
-	type observed struct{ host, sni, remote, path, query, forwarded string }
+	type observed struct{ host, sni, remote, path, query, forwarded, protocol string }
 	requests := make(chan observed, 8)
 	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- observed{r.Host, r.TLS.ServerName, r.RemoteAddr, r.URL.EscapedPath(), r.URL.RawQuery, r.Header.Get("X-Tigris-Forwarded-Host")}
+		requests <- observed{r.Host, r.TLS.ServerName, r.RemoteAddr, r.URL.EscapedPath(), r.URL.RawQuery, r.Header.Get("X-Tigris-Forwarded-Host"), r.Proto}
 		io.WriteString(w, "complete object")
 	}))
 	origin.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+	origin.EnableHTTP2 = true
 	origin.StartTLS()
 	defer origin.Close()
 	f := NewForwarder(nil, origin.URL, "auto", 10, auth.NewProxySigner("test", "secret"), nil).(*transparentForwarder)
@@ -88,7 +89,7 @@ func TestTransparentVirtualHostTLSUsesConfiguredOrigin(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := <-requests
-		if got.host != host || got.sni != host || got.forwarded != host || got.path != path || got.query != query || w.Body.String() != "complete object" {
+		if got.host != host || got.sni != host || got.forwarded != host || got.path != path || got.query != query || got.protocol != "HTTP/2.0" || w.Body.String() != "complete object" {
 			t.Fatalf("request changed: %+v, body=%q", got, w.Body.String())
 		}
 		if i == 1 && got.remote != previous.remote {

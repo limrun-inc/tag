@@ -164,3 +164,87 @@ func TestPresignedVirtualHostCachesUnderBucketAndFullKey(t *testing.T) {
 		t.Fatalf("warm request: cache=%s body=%q upstream_calls=%d", warm.Header().Get(XCacheHeader), warm.Body.String(), calls.Load())
 	}
 }
+
+func TestSignedBuildCacheRevalidationAndVerification(t *testing.T) {
+	for _, tc := range []struct {
+		method string
+		status int
+	}{{"GET", 304}, {"HEAD", 200}, {"HEAD", 404}} {
+		t.Run(fmt.Sprintf("%s_origin_%d", tc.method, tc.status), func(t *testing.T) {
+			var calls atomic.Int32
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.URL.Path != "/limrun-build-cache/org/archive.tar" {
+					t.Errorf("wrong origin path: %s", r.URL.Path)
+				}
+				if tc.method == "HEAD" && r.Header.Get("If-None-Match") != "" {
+					t.Error("verification HEAD unexpectedly used cached ETag")
+				}
+				if tc.status == 200 {
+					w.Header().Set("X-Amz-Meta-Sha256", "new-digest")
+					w.Header().Set("Content-Length", "19")
+				}
+				w.WriteHeader(tc.status)
+			}))
+			defer origin.Close()
+			r, _ := http.NewRequest(tc.method, "https://t3.storage.dev/limrun-build-cache/org/archive.tar", nil)
+			r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+			if err := v4.NewSigner().SignHTTP(t.Context(), aws.Credentials{AccessKeyID: compatAccess, SecretAccessKey: compatSecret}, r, "UNSIGNED-PAYLOAD", "s3", compatRegion, time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			r.Header.Set("Cache-Control", "no-cache")
+			if tc.method == "HEAD" {
+				r.Header.Set("Cache-Control", "no-store")
+			}
+			f := compatLearnedForwarder(t, origin.URL, r, "limrun-build-cache")
+			svc, c := newTestService(f, true)
+			defer svc.Stop()
+			body := []byte("old archive")
+			meta := &cache.CachedObjectMeta{Bucket: "limrun-build-cache", Key: "org/archive.tar", ETag: `"old-etag"`, ContentLength: int64(len(body)), StatusCode: 200, UserMetadata: map[string]string{"x-amz-meta-sha256": "old-digest"}}
+			if err := c.PutWithMeta(t.Context(), meta.Bucket, meta.Key, meta, body, 0); err != nil {
+				t.Fatal(err)
+			}
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				if r.Method == "HEAD" {
+					err = svc.HandleHeadObject(w, r)
+				} else {
+					err = svc.HandleGetObject(w, r)
+				}
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadGateway)
+				}
+			}))
+			defer gateway.Close()
+			gatewayURL, _ := r.URL.Parse(gateway.URL)
+			r.URL.Scheme, r.URL.Host = gatewayURL.Scheme, gatewayURL.Host
+			response, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			gotBody, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("expected one origin request; got %d", calls.Load())
+			}
+			if tc.method == "HEAD" {
+				if response.StatusCode != tc.status {
+					t.Fatalf("verification HEAD did not preserve origin response: status=%d", response.StatusCode)
+				}
+				if tc.status == 200 && response.Header.Get("X-Amz-Meta-Sha256") != "new-digest" {
+					t.Fatal("verification HEAD returned cached metadata")
+				}
+				return
+			}
+			if tc.status == 304 {
+				if response.StatusCode != 200 || string(gotBody) != string(body) || response.Header.Get("X-Amz-Meta-Sha256") != "old-digest" {
+					t.Fatalf("successful revalidation lost body or metadata: status=%d", response.StatusCode)
+				}
+
+			}
+		})
+	}
+}
