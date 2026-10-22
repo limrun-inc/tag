@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/tigrisdata/ocache/coordinator"
 	"github.com/tigrisdata/ocache/embedded"
 	ocachestorage "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/tag/auth"
@@ -23,6 +24,8 @@ import (
 	"github.com/tigrisdata/tag/handlers"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // Build-time variables set via ldflags.
@@ -235,14 +238,15 @@ func main() {
 			Msg("Initializing embedded cache")
 
 		embeddedCfg := &embedded.Config{
-			DiskPath:      cfg.Cache.DiskPath,
-			TTL:           cfg.Cache.TTL,
-			MaxDiskUsage:  cfg.Cache.MaxDiskUsageBytes,
-			NodeID:        cfg.Cache.NodeID,
-			ClusterAddr:   cfg.Cache.ClusterAddr,
-			GRPCAddr:      cfg.Cache.GRPCAddr,
-			AdvertiseAddr: cfg.Cache.AdvertiseAddr,
-			SeedNodes:     cfg.Cache.SeedNodes,
+			DiskPath:          cfg.Cache.DiskPath,
+			TTL:               cfg.Cache.TTL,
+			MaxDiskUsage:      cfg.Cache.MaxDiskUsageBytes,
+			NodeID:            cfg.Cache.NodeID,
+			ClusterAddr:       cfg.Cache.ClusterAddr,
+			GRPCAddr:          cfg.Cache.GRPCAddr,
+			AdvertiseAddr:     cfg.Cache.AdvertiseAddr,
+			SeedNodes:         cfg.Cache.SeedNodes,
+			GRPCServerOptions: []grpc.ServerOption{grpc.KeepaliveEnforcementPolicy(cacheGRPCKeepalivePolicy())},
 		}
 
 		// Advanced storage tuning. Defaults are applied by config.applyDefaults;
@@ -263,7 +267,7 @@ func main() {
 				log.Fatal().Msg("Cache gRPC auth requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (set TAG_CACHE_GRPC_AUTH=false to disable)")
 			}
 			grpcToken := auth.DeriveGRPCAuthToken(accessKey, secretKey)
-			embeddedCfg.GRPCServerOptions = auth.GRPCServerOptions(grpcToken)
+			embeddedCfg.GRPCServerOptions = append(embeddedCfg.GRPCServerOptions, auth.GRPCServerOptions(grpcToken)...)
 			embeddedCfg.GRPCDialOptions = auth.GRPCDialOptions(grpcToken)
 			log.Info().Msg("Cache gRPC auth enabled")
 		}
@@ -405,4 +409,12 @@ func main() {
 	service.Stop()
 
 	log.Info().Msg("TAG shutdown complete")
+}
+
+// OCache peers ping every KeepaliveTime, including between active streams.
+func cacheGRPCKeepalivePolicy() keepalive.EnforcementPolicy {
+	return keepalive.EnforcementPolicy{
+		MinTime:             coordinator.DefaultRouterConfig().KeepaliveTime,
+		PermitWithoutStream: true,
+	}
 }

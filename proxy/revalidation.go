@@ -500,13 +500,11 @@ func (s *Service) serveFromCache(
 	// the response writer; a short one only once the stream ends cleanly. In
 	// both cases the last promised byte, held back by lengthBoundedWriter, is
 	// never released, so the client cannot mistake the body for complete.
-	// The client paces this read (the response writer is its sink), so a size-scaled
-	// bound would punish slow clients; the flat cap matches the server's WriteTimeout.
-	ctx, cancel := context.WithTimeout(ctx, cacheStreamReadTimeout)
-	defer cancel()
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bw := &lengthBoundedWriter{w: cw, bucket: bucket, key: key, meta: meta}
-	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bw)
+	bodyErr := readCacheStream(ctx, bw, func(readCtx context.Context, dest io.Writer) error {
+		return s.cache.GetBodyStream(readCtx, bucket, key, meta.BodyDiscriminator(), dest)
+	})
 	if bodyErr == nil {
 		// The stream ended cleanly: only now is the delivered count meaningful.
 		// A failed stream is already incomplete and may be transient, so it is
@@ -767,13 +765,9 @@ func hasRepresentationSelectors(r *http.Request) bool {
 	return false
 }
 
-// forwardRepresentationSelector is the GET/HEAD path for a request with
-// representation selectors: a plain upstream forward with no cache read, no
-// broadcast coalescing (the broadcast key is bucket/key only, so a
-// ?versionId=old fetch must not be shared with a current-object fetch), and
-// no populate of any kind. X-Cache reports BYPASS, like Cache-Control:
-// no-store.
-func (s *Service) forwardRepresentationSelector(ctx context.Context, w http.ResponseWriter, r *http.Request, operation string, start time.Time) error {
+// forwardWithoutCache preserves the original request without cache reads,
+// broadcast coalescing or population. Each caller receives its own origin response.
+func (s *Service) forwardWithoutCache(ctx context.Context, w http.ResponseWriter, r *http.Request, operation string, start time.Time) error {
 	writeCacheStatus(w, s.cacheMissStatus(true))
 	err := s.forwarder.Forward(ctx, w, r)
 	metrics.RecordRequestResult(operation, metrics.SourceUpstream, err, time.Since(start).Seconds())

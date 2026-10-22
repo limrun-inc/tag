@@ -70,17 +70,13 @@ const (
 	// generous lower bound on peer-to-pod gRPC throughput.
 	minCacheReadThroughput = 1024 * 1024 // 1 MiB/s
 
-	// maxCacheReadTimeout caps the read deadline at the server's WriteTimeout
-	// (handlers/server.go): a read that outlives the response cannot help it.
+	// maxCacheReadTimeout caps reads into buffers, which clients do not pace.
 	maxCacheReadTimeout = 5 * time.Minute
 )
 
-// cacheStreamReadTimeout bounds a cache read whose destination is the client: the
-// response writer is the read's sink, so the client paces the read and a
-// size-scaled bound would cut off a slow-but-progressing client earlier than
-// the server itself does. The flat cap only restates the bound the server's
-// WriteTimeout already enforces, so it can never truncate a response that would
-// otherwise have completed. It is a variable so tests can inject a short deadline.
+// cacheStreamReadTimeout bounds idle time while a cache read streams to the client.
+// Successful writes reset it, so a progressing transfer has no total time limit.
+// Tests inject a shorter interval.
 var cacheStreamReadTimeout = maxCacheReadTimeout
 
 // cacheReadTimeoutForSize bounds one cache read of n bytes INTO A BUFFER (or a
@@ -88,7 +84,7 @@ var cacheStreamReadTimeout = maxCacheReadTimeout
 // cacheReadTimeout plus one second per minCacheReadThroughput, capped at
 // maxCacheReadTimeout. n <= 0 (a presence probe) gets the floor. Without it a
 // stalled peer read holds the request until the client disconnects or the
-// server's WriteTimeout fires. The deadline never extends the caller's own: a
+// read deadline expires. The deadline never extends the caller's own: a
 // shorter parent deadline still wins. Reads that stream straight to the client
 // use cacheStreamReadTimeout instead.
 //
@@ -285,15 +281,17 @@ func (s *Service) setupCacheListener(
 			return
 		}
 
-		// Use a detached context for cache writes to avoid cancellation when HTTP request completes.
-		// Scale timeout by content length so large objects have enough time to write.
-		cacheCtx, cacheCancel := context.WithTimeout(s.workers.ctx, cacheWriteTimeoutForSize(meta.ContentLength))
+		// A client paces the broadcast, so only an idle transfer should expire.
+		// Service shutdown still cancels the detached populate through workers.ctx.
+		cacheCtx, progress := newProgressContext(s.workers.ctx, cacheWriteTimeout)
+		cacheCancel := progress.close
 		defer cacheCancel()
 
 		ttl := int(s.config.Cache.TTL.Seconds())
 
 		// Wrap pipeReader with signaling reader to know when cache reader is ready
 		sigReader := newSignalingReader(pipeReader)
+		cacheReader := &progressReader{r: sigReader, p: progress}
 
 		// Intermediate buffer absorbs chunks while cache writer initializes.
 		// Sized as 1/4 of the broadcaster's channel buffer to balance memory savings
@@ -332,9 +330,9 @@ func (s *Service) setupCacheListener(
 			// last-write-winning stale bytes over it.
 			if s.isBlockEligibleSize(meta.ContentLength) {
 				meta.BlockSize = s.config.Cache.BlockSize
-				_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, expected)
+				_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, cacheReader, ttl, expected)
 			} else {
-				_, cacheErr = s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, sigReader, ttl, expected)
+				_, cacheErr = s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, cacheReader, ttl, expected)
 			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
@@ -355,7 +353,7 @@ func (s *Service) setupCacheListener(
 			case <-sigReader.Ready():
 				// Reader is ready, safe to write
 			case <-cacheCtx.Done():
-				writeErr := cacheCtx.Err()
+				writeErr := context.Cause(cacheCtx)
 				// Drain queue before reporting relay completion so the populate
 				// owner does not release its reservation while buffers remain held.
 				for chunk := range chunkQueue {
@@ -405,7 +403,7 @@ func (s *Service) setupCacheListener(
 					// Ownership transferred - don't Release()
 				case <-cacheCtx.Done():
 					broadcast.PutChunkBuf(chunk.Data) // Return unused buffer
-					relayErr = cacheCtx.Err()
+					relayErr = context.Cause(cacheCtx)
 					earlyExit = true
 					break chunkLoop
 				}

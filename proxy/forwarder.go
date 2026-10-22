@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -185,12 +187,14 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 		signer: auth.NewRequestSigner(tigrisEndpoint, region),
 		httpClient: &http.Client{
 			Transport: &http.Transport{
-				MaxIdleConns:        maxIdleConnsPerHost,
-				MaxIdleConnsPerHost: maxIdleConnsPerHost,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  true, // Proxy must never auto-decompress upstream responses
+				DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 60 * time.Second,
+				MaxIdleConns:          maxIdleConnsPerHost,
+				MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+				IdleConnTimeout:       90 * time.Second,
+				DisableCompression:    true, // Proxy must never auto-decompress upstream responses
 			},
-			Timeout: 5 * time.Minute,
 		},
 	}
 }
@@ -487,6 +491,24 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 	base := newBaseForwarder(tigrisEndpoint, region, maxIdleConnsPerHost)
 
 	if proxySigner != nil {
+		// Virtual-host requests need their signed hostname for TLS and HTTP.
+		// Keep TCP destinations fixed to the configured origin, including redirects.
+		upstream, parseErr := url.Parse(tigrisEndpoint)
+		transport := base.httpClient.Transport.(*http.Transport)
+		dial := transport.DialContext
+		transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			port := upstream.Port()
+			if port == "" {
+				port = "443"
+				if upstream.Scheme == "http" {
+					port = "80"
+				}
+			}
+			return dial(ctx, network, net.JoinHostPort(upstream.Hostname(), port))
+		}
 		f := &transparentForwarder{
 			baseForwarder:    base,
 			proxySigner:      proxySigner,

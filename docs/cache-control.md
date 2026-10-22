@@ -32,6 +32,12 @@ curl -H "Cache-Control: no-cache" -H "Range: bytes=0-99" \
 
 If the revalidation request to upstream fails, TAG serves the stale cached copy as a fallback.
 
+Presigned GET and HEAD requests are an exception: any nonempty `Cache-Control`
+header bypasses the cache. TAG forwards the original signed request, returns the
+origin's status and body, and does not populate or replace an entry. This keeps
+presigned `no-cache` app downloads subject to origin authorization and prevents a
+stale cached app from hiding an origin error.
+
 ## Bypass Cache
 
 Send `Cache-Control: no-store` to skip the cache entirely. TAG forwards the request directly to upstream and does not cache the response.

@@ -26,7 +26,7 @@ func TestCacheReadTimeoutForSize(t *testing.T) {
 		{name: "negative returns floor", n: -1, want: cacheReadTimeout},
 		{name: "sub-MiB adds nothing", n: 1024*1024 - 1, want: cacheReadTimeout},
 		{name: "16 MiB block adds 16s", n: 16 << 20, want: cacheReadTimeout + 16*time.Second},
-		{name: "1 GiB caps at the server WriteTimeout", n: 1 << 30, want: maxCacheReadTimeout},
+		{name: "1 GiB caps buffered reads", n: 1 << 30, want: maxCacheReadTimeout},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -89,7 +89,10 @@ func (s *stalledRead) block(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.calls == 0 {
-		s.hadDeadline, s.remaining, s.err = ok, deadline.Sub(now), ctx.Err()
+		s.hadDeadline, s.remaining, s.err = ok, deadline.Sub(now), context.Cause(ctx)
+		if !ok {
+			s.remaining = time.Since(now)
+		}
 	}
 	s.calls++
 	return ctx.Err()
@@ -102,8 +105,8 @@ func (s *stalledRead) assertBoundedBy(t *testing.T, injected time.Duration) {
 	if s.calls == 0 {
 		t.Fatal("cache read was never attempted")
 	}
-	if !s.hadDeadline || s.remaining > injected {
-		t.Fatalf("cache read deadline = (set=%t, remaining=%v), want <= injected %v", s.hadDeadline, s.remaining, injected)
+	if (s.hadDeadline && s.remaining > injected) || (!s.hadDeadline && (s.remaining < injected || s.remaining > injected*10)) {
+		t.Fatalf("cache read deadline = (set=%t, remaining=%v), want close to injected %v", s.hadDeadline, s.remaining, injected)
 	}
 	if !errors.Is(s.err, context.DeadlineExceeded) {
 		t.Fatalf("cache read ctx error = %v, want context.DeadlineExceeded", s.err)
@@ -217,8 +220,8 @@ func TestHandleGetObject_StalledBlockProbeFallsThroughWithoutInvalidating(t *tes
 	}
 }
 
-// A slow-but-progressing client on a large streamed body is paced by the flat
-// stream bound (the server's WriteTimeout), never by the size-scaled deadline: with
+// A slow client on a large streamed body is bounded by idle time,
+// never by the size-scaled deadline: with
 // the size-scaled value injected far below the client's stall, the whole body still
 // arrives and the cache read is never canceled.
 func TestServeFromCache_SlowClientIsNotCutOffBySizeScaledDeadline(t *testing.T) {
@@ -292,7 +295,7 @@ func TestServeFromCache_SlowClientIsNotCutOffBySizeScaledDeadline(t *testing.T) 
 	if streamErr != nil {
 		t.Fatalf("cache stream was canceled: %v", streamErr)
 	}
-	if remaining <= sized {
-		t.Fatalf("streamed read deadline remaining = %v, want the flat stream bound (> injected %v)", remaining, sized)
+	if remaining != 0 && remaining <= sized {
+		t.Fatalf("streamed read deadline remaining = %v, want no total deadline (or a parent deadline > %v)", remaining, sized)
 	}
 }

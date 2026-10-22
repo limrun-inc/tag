@@ -130,6 +130,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
+	if bypassPresignedCache(r) {
+		return s.forwardWithoutCache(ctx, w, r, "GetObject", start)
+	}
+
 	// A representation selector (?versionId, ?partNumber, response-* header
 	// overrides) asks for something the cache does not hold: the cache has only
 	// the current object under its own headers. Forward upstream as-is — no
@@ -137,7 +141,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// carry these, and #266 made URL-only presigned GETs locally validated).
 	if hasRepresentationSelectors(r) {
 		log.Debug().Str("bucket", bucket).Str("key", key).Strs("selectors", representationSelectorNames(r)).Msg("Representation selector, forwarding upstream")
-		return s.forwardRepresentationSelector(ctx, w, r, "GetObject", start)
+		return s.forwardWithoutCache(ctx, w, r, "GetObject", start)
 	}
 
 	// 2. Check cache (fast path) - now also works for range requests!
@@ -776,11 +780,9 @@ func (s *Service) serveRangeFromCache(
 		rangeEnd:      rng.end,
 		rangeTotal:    meta.ContentLength,
 	}
-	// The client paces this read (the response writer is its sink), so a size-scaled
-	// bound would punish slow clients; the flat cap matches the server's WriteTimeout.
-	readCtx, cancel := context.WithTimeout(ctx, cacheStreamReadTimeout)
-	defer cancel()
-	streamErr := s.cache.GetRangeStream(readCtx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, cw)
+	streamErr := readCacheStream(ctx, cw, func(readCtx context.Context, dest io.Writer) error {
+		return s.cache.GetRangeStream(readCtx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, dest)
+	})
 
 	if streamErr != nil {
 		if !cw.committed {
