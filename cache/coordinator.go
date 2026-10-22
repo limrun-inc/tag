@@ -236,11 +236,9 @@ const (
 	tombstoneMarginSeconds   = 300
 )
 
-// TombstoneTTLSeconds returns how long an invalidation tombstone must live for
-// a given cache size threshold: it must outlive any populate that could race
-// it (the upstream fetch plus the streaming write of the largest cacheable
-// object), modeled additively — write + fetch + margin — so the margin stays
-// constant at every threshold.
+// TombstoneTTLSeconds preserves the retention used by older nodes in a mixed ring.
+// A legacy populate may stream longer, but loses publication permission before
+// its decision-time token can outlive a racing invalidation marker.
 func TombstoneTTLSeconds(sizeThreshold int64) int64 {
 	write := int64(tombstoneMinWriteSeconds)
 	if sizeThreshold > 0 {
@@ -253,7 +251,7 @@ func TombstoneTTLSeconds(sizeThreshold int64) int64 {
 
 type legacyCoordinator struct {
 	client       cacheclient.CacheClient
-	tombstoneTTL int64 // seconds; must outlive the longest racing cache-populate
+	tombstoneTTL int64 // seconds; bounds the lifetime of publication tokens
 }
 
 // getMetaWithVersion reads via the plain API and hands out the wall-clock
@@ -290,6 +288,20 @@ func (c *legacyCoordinator) putMeta(ctx context.Context, bucket, key, metaKey st
 		return false, nil
 	}
 	if expected != VersionAny {
+		// A missing marker cannot distinguish an unchanged object from an
+		// invalidation whose marker expired during a slow body transfer.
+		// Reserve the existing margin for the commit, including peer delays.
+		deadline := time.Unix(0, int64(expected)).Add(time.Duration(c.tombstoneTTL-tombstoneMarginSeconds) * time.Second)
+		if !time.Now().Before(deadline) {
+			metrics.RecordCacheOperation("meta_put", "precondition_lost")
+			log.Debug().Str("bucket", bucket).Str("key", key).
+				Msg("Skipping meta write - publication token expired")
+			return false, nil
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+
 		// Tombstone gate right before the visibility-granting meta write: an
 		// invalidation at or after the caller's decision-time stamp blocks the
 		// commit, so a populate cannot resurrect deleted metadata. If the marker

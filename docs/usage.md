@@ -293,3 +293,6 @@ streaming to clients time out after five minutes without successful writes;
 inline cache population times out after 60 seconds without body-read progress.
 Buffered cache reads and background fetches retain their bounded deadlines.
 Client request cancellation and service shutdown still cancel active work.
+With legacy coordination, a cache populate that outlives its invalidation-marker
+window cannot publish metadata. Its client download continues; this prevents an
+expired deletion marker from allowing old content back into the cache.
