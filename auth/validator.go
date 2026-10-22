@@ -53,12 +53,45 @@ func NewRequestValidator(keyProvider KeyProvider) *RequestValidator {
 	}
 }
 
+// ValidatedRequest is the outcome of a successful signature validation: the
+// access key, plus the signing material the request signature was computed
+// with. That material is retained so the chunk chain of a
+// STREAMING-AWS4-HMAC-SHA256-PAYLOAD body can be verified against the same
+// key, signing time and credential scope, seeded with the request signature.
+type ValidatedRequest struct {
+	AccessKey string
+
+	signingKey  []byte
+	signingTime string // X-Amz-Date form, as it appears in the string to sign
+	scope       string
+	signature   string
+}
+
+// ChunkVerifier returns a verifier for the request's signed chunk chain.
+func (vr *ValidatedRequest) ChunkVerifier() *ChunkVerifier {
+	return &ChunkVerifier{
+		signingKey: vr.signingKey,
+		prefix:     streamingAlgorithm + "\n" + vr.signingTime + "\n" + vr.scope + "\n",
+		previous:   vr.signature,
+	}
+}
+
 // ValidateRequest validates the AWS SigV4 signature of an incoming request.
 // Header-authenticated requests and non-GET requests require X-Amz-Content-Sha256.
 // Presigned GETs use UNSIGNED-PAYLOAD and may omit the header.
 // The header lets uploads be validated without buffering the request body.
 // Returns the access key if validation succeeds, or an error if it fails.
 func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
+	vr, err := v.Validate(r)
+	if err != nil {
+		return "", err
+	}
+	return vr.AccessKey, nil
+}
+
+// Validate is ValidateRequest returning the full validation outcome, for
+// callers that must go on to verify a signed streaming body.
+func (v *RequestValidator) Validate(r *http.Request) (*ValidatedRequest, error) {
 	bodyHash := r.Header.Get("X-Amz-Content-Sha256")
 
 	// Classify the authentication form before enforcing the hash requirement:
@@ -66,12 +99,12 @@ func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
 	authInfo, err := ParseAuthInfo(r)
 	if err != nil {
 		if bodyHash == "" {
-			return "", ErrMissingContentHash
+			return nil, ErrMissingContentHash
 		}
-		return "", fmt.Errorf("failed to parse auth: %w", err)
+		return nil, fmt.Errorf("failed to parse auth: %w", err)
 	}
 	if bodyHash == "" && (!authInfo.IsPresigned || r.Method != http.MethodGet) {
-		return "", ErrMissingContentHash
+		return nil, ErrMissingContentHash
 	}
 
 	// Get the date string for signing key lookup
@@ -87,7 +120,7 @@ func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
 	if shortDate == "" {
 		t, err := ParseHTTPDate(dateStr)
 		if err != nil {
-			return "", ErrInvalidDate
+			return nil, ErrInvalidDate
 		}
 		shortDate = t.UTC().Format(shortTimeFormat)
 	}
@@ -95,37 +128,50 @@ func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
 	// Look up signing key
 	signingKey, err := v.keyProvider.GetSigningKey(authInfo.AccessKey, shortDate, authInfo.Region)
 	if err != nil {
-		return "", fmt.Errorf("failed to get signing key: %w", err)
+		return nil, fmt.Errorf("failed to get signing key: %w", err)
 	}
 
 	// Validate based on auth type
+	var signingTime time.Time
 	if authInfo.IsPresigned {
-		return authInfo.AccessKey, v.validatePresigned(r, authInfo, signingKey)
+		signingTime, err = v.validatePresigned(r, authInfo, signingKey)
+	} else {
+		signingTime, err = v.validateSigned(r, authInfo, signingKey, bodyHash)
 	}
-	return authInfo.AccessKey, v.validateSigned(r, authInfo, signingKey, bodyHash)
+	if err != nil {
+		return nil, err
+	}
+	return &ValidatedRequest{
+		AccessKey:   authInfo.AccessKey,
+		signingKey:  signingKey,
+		signingTime: signingTime.Format(TimeFormat),
+		scope:       credentialScope(signingTime, authInfo.Region),
+		signature:   authInfo.Signature,
+	}, nil
 }
 
-// validateSigned validates a header-based signed request using a pre-computed body hash.
-func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, signingKey []byte, bodyHash string) error {
+// validateSigned validates a header-based signed request using a pre-computed
+// body hash and returns the signing time the signature was verified under.
+func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, signingKey []byte, bodyHash string) (time.Time, error) {
 	// Get the date from the request
 	dateStr := r.Header.Get("X-Amz-Date")
 	if dateStr == "" {
 		dateStr = r.Header.Get("Date")
 	}
 	if dateStr == "" {
-		return ErrInvalidDate
+		return time.Time{}, ErrInvalidDate
 	}
 
 	// Parse and validate the date
 	requestTime, err := ParseHTTPDate(dateStr)
 	if err != nil {
-		return ErrInvalidDate
+		return time.Time{}, ErrInvalidDate
 	}
 
 	// Check request age
 	age := time.Since(requestTime)
 	if age > maxRequestAge || age < -maxRequestAge {
-		return ErrExpiredRequest
+		return time.Time{}, ErrExpiredRequest
 	}
 
 	// Compute expected signature
@@ -133,49 +179,50 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 
 	// Compare signatures (constant time)
 	if !hmac.Equal([]byte(authInfo.Signature), []byte(expectedSig)) {
-		return ErrSignatureMismatch
+		return time.Time{}, ErrSignatureMismatch
 	}
 
-	return nil
+	return requestTime, nil
 }
 
-// validatePresigned validates a presigned URL request.
+// validatePresigned validates a presigned URL request and returns the signing
+// time the signature was verified under.
 //
 // Beyond the signature, a presigned URL must satisfy the AWS rules for its
 // lifetime: X-Amz-Expires is mandatory, appears exactly once, is an integer in
 // [1, maxPresignedExpires], the URL is rejected once that many seconds have
 // passed since X-Amz-Date, and X-Amz-Date may not sit more than maxRequestAge
 // in the future (the same clock-skew tolerance header-signed requests get).
-func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo, signingKey []byte) error {
+func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo, signingKey []byte) (time.Time, error) {
 	query := r.URL.Query()
 
 	// Get expiration time
 	dateStr := query.Get("X-Amz-Date")
 	if dateStr == "" {
-		return ErrInvalidDate
+		return time.Time{}, ErrInvalidDate
 	}
 
 	requestTime, err := time.Parse(TimeFormat, dateStr)
 	if err != nil {
-		return ErrInvalidDate
+		return time.Time{}, ErrInvalidDate
 	}
 
 	// Check expires. The range check runs before the Duration conversion so
 	// the multiplication below can never overflow.
 	expiresValues := query["X-Amz-Expires"]
 	if len(expiresValues) != 1 {
-		return ErrInvalidExpires
+		return time.Time{}, ErrInvalidExpires
 	}
 	expires, err := strconv.ParseInt(expiresValues[0], 10, 64)
 	if err != nil || expires < 1 || expires > maxPresignedExpires {
-		return ErrInvalidExpires
+		return time.Time{}, ErrInvalidExpires
 	}
 	age := time.Since(requestTime)
 	if age < -maxRequestAge {
-		return ErrExpiredRequest
+		return time.Time{}, ErrExpiredRequest
 	}
 	if age > time.Duration(expires)*time.Second {
-		return ErrExpiredRequest
+		return time.Time{}, ErrExpiredRequest
 	}
 
 	// For presigned URLs, body hash is typically UNSIGNED-PAYLOAD
@@ -186,18 +233,19 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 
 	// Compare signatures (constant time)
 	if !hmac.Equal([]byte(authInfo.Signature), []byte(expectedSig)) {
-		return ErrSignatureMismatch
+		return time.Time{}, ErrSignatureMismatch
 	}
 
-	return nil
+	return requestTime, nil
+}
+
+// credentialScope builds the SigV4 credential scope for a signing time and region.
+func credentialScope(signingTime time.Time, region string) string {
+	return fmt.Sprintf("%s/%s/%s/%s", signingTime.Format(shortTimeFormat), region, service, terminationString)
 }
 
 // computeSignature computes the expected signature for a signed request.
 func (v *RequestValidator) computeSignature(r *http.Request, authInfo *AuthInfo, signingKey []byte, bodyHash string, signingTime time.Time) string {
-	// Build credential scope
-	dateStr := signingTime.Format(shortTimeFormat)
-	credentialScope := fmt.Sprintf("%s/%s/%s/%s", dateStr, authInfo.Region, service, terminationString)
-
 	// Build canonical request
 	canonicalRequest := v.buildCanonicalRequest(r, authInfo.SignedHeaders, bodyHash)
 
@@ -205,7 +253,7 @@ func (v *RequestValidator) computeSignature(r *http.Request, authInfo *AuthInfo,
 	stringToSign := strings.Join([]string{
 		algorithm,
 		signingTime.Format(TimeFormat),
-		credentialScope,
+		credentialScope(signingTime, authInfo.Region),
 		hashSHA256([]byte(canonicalRequest)),
 	}, "\n")
 
@@ -215,10 +263,6 @@ func (v *RequestValidator) computeSignature(r *http.Request, authInfo *AuthInfo,
 
 // computePresignedSignature computes the expected signature for a presigned URL.
 func (v *RequestValidator) computePresignedSignature(r *http.Request, authInfo *AuthInfo, signingKey []byte, bodyHash string, signingTime time.Time) string {
-	// Build credential scope
-	dateStr := signingTime.Format(shortTimeFormat)
-	credentialScope := fmt.Sprintf("%s/%s/%s/%s", dateStr, authInfo.Region, service, terminationString)
-
 	// For presigned URLs, we need to exclude the signature from the query string
 	// when computing the canonical request
 	canonicalRequest := v.buildCanonicalRequestPresigned(r, authInfo.SignedHeaders, bodyHash)
@@ -227,7 +271,7 @@ func (v *RequestValidator) computePresignedSignature(r *http.Request, authInfo *
 	stringToSign := strings.Join([]string{
 		algorithm,
 		signingTime.Format(TimeFormat),
-		credentialScope,
+		credentialScope(signingTime, authInfo.Region),
 		hashSHA256([]byte(canonicalRequest)),
 	}, "\n")
 
