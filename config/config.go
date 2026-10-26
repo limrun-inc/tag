@@ -68,8 +68,8 @@ const (
 	// DefaultBroadcastChunkSize is the default chunk size for streaming (64KB).
 	DefaultBroadcastChunkSize = 64 * 1024
 
-	// DefaultBroadcastChannelBuffer is the default buffer size per listener (1024 chunks = ~64MB).
-	DefaultBroadcastChannelBuffer = 1024
+	// DefaultBroadcastChannelBuffer absorbs temporary consumer slowdowns with up to 256 MiB of chunk buffers per listener.
+	DefaultBroadcastChannelBuffer = 4096
 
 	// DefaultMaxIdleConnsPerHost is the default HTTP connection pool size per upstream host.
 	// Higher values improve throughput for cache miss scenarios with high concurrency.
@@ -432,7 +432,7 @@ func (c *CacheConfig) SetGRPCAuth(enabled bool) {
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
 type BroadcastConfig struct {
 	ChunkSize     int `yaml:"chunk_size"`     // Size of chunks for streaming (default: 64KB)
-	ChannelBuffer int `yaml:"channel_buffer"` // Buffer size per listener in chunks (default: 1024, ~64MB at 64KB chunks)
+	ChannelBuffer int `yaml:"channel_buffer"` // Buffer size per listener in chunks (default: 4096, 256 MiB at 64 KiB chunks)
 }
 
 // LogConfig holds logging configuration.

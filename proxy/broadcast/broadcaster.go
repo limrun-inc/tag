@@ -49,12 +49,9 @@ func PutChunkBuf(b []byte) {
 const (
 	// DefaultChunkSize is the default size of chunks for streaming (64 KB).
 	DefaultChunkSize = 64 * 1024
-	// DefaultChannelBuffer is the default number of chunks to buffer per listener.
-	// With 64KB chunks, this is ~64MB buffer per listener, providing sufficient
-	// tolerance for temporary slowdowns before disconnecting slow consumers.
-	// Increased from 64 to 1024 to handle large objects (64MB+) where cache writes
-	// are slower than origin streaming.
-	DefaultChannelBuffer = 1024
+	// DefaultChannelBuffer absorbs temporary consumer slowdowns before disconnecting a listener.
+	// Each listener can retain up to 256 MiB of pooled 64 KiB chunk buffers.
+	DefaultChannelBuffer = 4096
 )
 
 // ErrSlowConsumer indicates a listener was disconnected for being too slow.
