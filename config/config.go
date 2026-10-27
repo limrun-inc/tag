@@ -107,6 +107,11 @@ const (
 	// byte budget, not the count, is what actually bounds this memory.
 	DefaultCacheMaxPopulateMemoryBytes = 2 << 30
 
+	// DefaultCachePopulateShedDiskRatio is the default for PopulateShedDiskRatio:
+	// populates are shed once tracked disk usage reaches 105% of
+	// MaxDiskUsageBytes, i.e. only when eviction has clearly fallen behind.
+	DefaultCachePopulateShedDiskRatio = 1.05
+
 	// DefaultWarmOnWriteReservedFraction is the default cap on the fraction of the
 	// cache-populate memory budget reserved for warm-on-write populates (when
 	// warm_on_write is enabled). The reservation is demand-driven and elastic:
@@ -117,8 +122,21 @@ const (
 	DefaultWarmOnWriteReservedFraction = 0.5
 )
 
+// Operating modes. Mode selects how TAG relates to its upstream:
+// transparent forwards client signatures as-is with proxy headers (default),
+// signing validates client signatures and re-signs for upstream, and tiered
+// serves small objects entirely from the local cache — metadata is
+// authoritative, misses are answered locally — while large objects pass
+// through to upstream.
+const (
+	ModeTransparent = "transparent"
+	ModeSigning     = "signing"
+	ModeTiered      = "tiered"
+)
+
 // Config holds all configuration for TAG.
 type Config struct {
+	Mode        string            `yaml:"mode"` // transparent (default) | signing | tiered
 	Server      ServerConfig      `yaml:"server"`
 	Upstream    UpstreamConfig    `yaml:"upstream"`
 	Credentials CredentialsConfig `yaml:"credentials"`
@@ -145,6 +163,47 @@ type ServerConfig struct {
 // TLS is enabled when both TLSCertFile and TLSKeyFile are set.
 func (s *ServerConfig) TLSEnabled() bool {
 	return s.TLSCertFile != "" && s.TLSKeyFile != ""
+}
+
+// ResolvedMode returns the operating mode, folding in the deprecated
+// upstream.transparent_proxy flag when mode is unset.
+func (c *Config) ResolvedMode() string {
+	if c.Mode != "" {
+		return c.Mode
+	}
+	if !c.Upstream.IsTransparentProxy() {
+		return ModeSigning
+	}
+	return ModeTransparent
+}
+
+// IsTiered returns whether TAG runs in tiered store mode.
+func (c *Config) IsTiered() bool { return c.ResolvedMode() == ModeTiered }
+
+// ForwardsTransparently reports whether upstream requests are forwarded the
+// transparent way — client signature preserved, X-Tigris-Proxy-* identity
+// headers added, credentials learned from Tigris — as opposed to the signing
+// way (TAG validates against its credential store and re-signs). Transparent
+// mode always does; signing mode never does; TIERED derives it from the
+// endpoint: the proxy-header path is meaningful only to Tigris, so a tiered
+// deployment fronting a Tigris endpoint forwards transparently and one
+// fronting any other S3-compatible endpoint forwards by signing. Tiering is a
+// caching topology, not a forwarding flavor — this is the one place the two
+// are joined, so every transparent-vs-signing fork must key on it rather than
+// on the mode name.
+func (c *Config) ForwardsTransparently() bool {
+	switch c.ResolvedMode() {
+	case ModeTransparent:
+		return true
+	case ModeTiered:
+		// Strict Tigris-domain check, NOT the transparent allowlist: the
+		// transparent flavor re-enables the cross-tier cleanup DELETE, whose
+		// safety needs a backend verified to enforce If-Match. A localhost
+		// stand-in (a local MinIO) earns no such trust and forwards by signing.
+		return IsTigrisEndpoint(c.Upstream.Endpoint)
+	default:
+		return false
+	}
 }
 
 // UpstreamConfig holds Tigris endpoint configuration.
@@ -199,19 +258,67 @@ type CacheConfig struct {
 	// "lru" (default) or "fifo" (oldest-written first). Only takes effect when
 	// MaxDiskUsageBytes > 0 — with no disk cap nothing is evicted regardless.
 	EvictionPolicy string `yaml:"eviction_policy"`
+	// ParquetOptimization enables format-aware prefetching for objects whose key
+	// ends in ".parquet". A parquet reader always reads the file footer before any
+	// data, and the footer is at the end of the object, so a read that touches the
+	// object's tail is a reliable signal that the whole metadata region is about to
+	// be read. When the metadata spans more than the (partial) tail block, TAG
+	// fetches the remaining metadata blocks in the background instead of letting the
+	// reader discover them as misses. Measured on a production analytics workload, footers
+	// run ~1.25% of object size, so a 300 MB object carries ~3.5 MB of metadata --
+	// several blocks at a 1 MiB block_size. Off by default: it reads 8 bytes of
+	// object content to size the footer, which is format-specific behavior an
+	// operator should opt into.
+	ParquetOptimization bool `yaml:"parquet_optimization"`
+
+	// MetaOnWrite caches an object's METADATA when TAG proxies its write, without
+	// caching the body. TAG otherwise invalidates on write and caches nothing, so
+	// the first read of a freshly written object pays an upstream round trip just to
+	// establish metadata before block mode can engage. Multipart uploads are the gap
+	// this closes: write-through already caches meta+body for a teed PutObject, but
+	// TAG never sees a multipart body and so caches nothing at all. Prototype.
+	MetaOnWrite bool `yaml:"meta_on_write"`
+
+	// CompactionBytesPerSecond bounds the shared source-read budget for ocache's
+	// background file compaction and segment recompaction (bytes/second). It
+	// protects serving reads on throughput-capped volumes: unthrottled
+	// compaction bursts saturate the disk and stall foreground GETs. 0 or unset
+	// leaves compaction unthrottled (ocache's library default); set it to a
+	// small fraction of the volume's throughput cap (e.g. 16-32 MiB/s on a
+	// 240 MB/s volume).
+	CompactionBytesPerSecond int64 `yaml:"compaction_bytes_per_second"`
 	// MaxConcurrentWrites bounds concurrent cache-populate operations (upstream
 	// fetch + streaming write). When saturated, the object is still served from
 	// upstream but not cached, so the memory/I/O-heavy write path can't grow
 	// unbounded. 0 or unset uses DefaultCacheMaxConcurrentWrites; a negative
 	// value disables the limit.
 	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
+	// PopulateShedDiskRatio sheds cache populates while tracked disk usage is at
+	// or above this fraction of MaxDiskUsageBytes: tiered local-tier PUTs go
+	// upstream instead, re-tiers and proxy-mode populates are skipped, and the
+	// object is still served. Protects the node from ingesting faster than it
+	// can evict (writes that are evicted before they are ever read). Only takes
+	// effect when MaxDiskUsageBytes > 0. 0 or unset uses
+	// DefaultCachePopulateShedDiskRatio; a negative value disables shedding.
+	PopulateShedDiskRatio float64 `yaml:"populate_shed_disk_ratio"`
+	// PopulateShedReject answers a shed tiered local-tier PUT with 503 SlowDown
+	// instead of placing it upstream with a marker. Use it where the upstream
+	// tier is slow to read back (a cold object store behind TAG): an
+	// upstream-tier small object then costs more to serve than a miss. The
+	// owner-side refusal already answers SlowDown; this makes the local
+	// pre-check do the same. Conditional writes are unaffected (never shed).
+	PopulateShedReject bool `yaml:"populate_shed_reject"`
 	// MaxPopulateMemoryBytes bounds the aggregate memory buffered by ALL cache buffering —
 	// cache-populate and block-serve staging together — as one honest total: buffering never
-	// exceeds this value. Each populate reserves its object size, capped at the per-populate
-	// buffer ceiling (~(channel_buffer + max(channel_buffer/4, 64)) × chunk_size); when it can't
-	// fit, the object is served from upstream uncached. Small objects reserve little (high
-	// concurrency) while a burst of large objects is throttled — this is what actually bounds
-	// populate memory, since a byte-unaware count can pin many GB under large-object fan-out.
+	// exceeds this value. Foreground coalesced populates reserve their object size, capped at
+	// the broadcast listener plus relay-queue ceiling (~(channel_buffer + max(channel_buffer/4,
+	// 64)) × chunk_size). Direct background full-object populates reserve the clustered
+	// cache client's retained 1 MiB sender buffer and destination gRPC first-chunk buffer,
+	// the embedded storage writer's retained 1 MiB first-read buffer and 1 MiB file-copy
+	// buffer, plus one configured block scratch buffer when block mode can select it.
+	// When a populate cannot fit,
+	// the object is served from upstream uncached. This is what actually
+	// bounds populate memory, since a byte-unaware count can pin many GB under large-object fan-out.
 	// Applied independently of MaxConcurrentWrites (both limits apply). 0 or unset uses
 	// DefaultCacheMaxPopulateMemoryBytes; a negative value disables the budget (count-only).
 	//
@@ -228,6 +335,19 @@ type CacheConfig struct {
 	// best-effort background GET (deduplicated and shed under the populate budget).
 	// It costs one extra upstream GET per write, so it defaults to false.
 	WarmOnWrite bool `yaml:"warm_on_write"`
+	// LegacyCoordination selects the cache's meta-key ordering mechanism
+	// (cache/coordinator.go). true (the DEFAULT when unset) runs the legacy
+	// timestamp-tombstone mechanism, byte-faithful to v1.20 — rolling upgrades
+	// from any earlier release are homogeneous under it. false runs the CAS
+	// coordinator (ocache fences + versions, no tombstones); set it only when
+	// EVERY node in the cluster runs a CAS-capable release, and flip via a
+	// brisk rolling restart (nodes in different modes order writes with
+	// different mechanisms during that window). Standalone nodes may flip
+	// immediately after upgrading. Tiered mode requires CAS and selects it
+	// automatically when this is unset; an explicit true there is rejected
+	// at startup (see validateMode).
+	LegacyCoordination *bool `yaml:"legacy_coordination"`
+
 	// BlockCachingEnabled turns on block-aligned caching for large objects (RFC 0001):
 	// objects at or above BlockSize are cached at BlockSize granularity on read, so a range
 	// read (e.g. a Parquet footer) populates and serves only the blocks it touches instead of
@@ -260,6 +380,21 @@ func (c *CacheConfig) IsEnabled() bool {
 		return true // Default to enabled
 	}
 	return *c.Enabled
+}
+
+// IsLegacyCoordination returns whether the legacy tombstone coordinator is
+// selected (default: true when nil — the safe choice for mixed-version
+// clusters; see the field comment).
+func (c *CacheConfig) IsLegacyCoordination() bool {
+	if c.LegacyCoordination == nil {
+		return true
+	}
+	return *c.LegacyCoordination
+}
+
+// SetLegacyCoordination sets the LegacyCoordination field to the given value.
+func (c *CacheConfig) SetLegacyCoordination(enabled bool) {
+	c.LegacyCoordination = &enabled
 }
 
 // IsBlockCachingEnabled returns whether block-aligned caching is enabled (default: true when nil).
@@ -344,6 +479,16 @@ func NewDefault() *Config {
 	return cfg
 }
 
+// Validate runs the full configuration validation and applies mode-derived
+// defaults (tiered mode selects CAS coordination and disables block caching).
+// Load and NewDefault call it automatically; call it again after mutating a
+// Config programmatically — in particular after setting Mode — or the
+// mode-derived defaults silently do not apply and forbidden combinations
+// (tiered + legacy coordination, tiered + block caching) go undetected.
+func (c *Config) Validate() error {
+	return validate(c)
+}
+
 // applyDefaults sets default values for unset configuration fields.
 func applyDefaults(cfg *Config) {
 	// Server defaults
@@ -410,6 +555,11 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Cache.MaxPopulateMemoryBytes == 0 {
 		cfg.Cache.MaxPopulateMemoryBytes = DefaultCacheMaxPopulateMemoryBytes
+	}
+	// 0 means default; NaN or ±Inf (accepted by YAML and ParseFloat) would make
+	// the over-budget comparison silently false, so they take the default too.
+	if r := cfg.Cache.PopulateShedDiskRatio; r == 0 || math.IsNaN(r) || math.IsInf(r, 0) {
+		cfg.Cache.PopulateShedDiskRatio = DefaultCachePopulateShedDiskRatio
 	}
 	if cfg.Cache.WarmOnWriteReservedFraction == 0 {
 		cfg.Cache.WarmOnWriteReservedFraction = DefaultWarmOnWriteReservedFraction
@@ -530,6 +680,15 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.MaxDiskUsageBytes = size
 			}
 		}
+		// 0 keeps the default (like the neighbouring limits); negative disables.
+		if shed := os.Getenv("TAG_CACHE_POPULATE_SHED_DISK_RATIO"); shed != "" {
+			if ratio, err := strconv.ParseFloat(shed, 64); err == nil && ratio != 0 && !math.IsNaN(ratio) && !math.IsInf(ratio, 0) {
+				cfg.Cache.PopulateShedDiskRatio = ratio
+			}
+		}
+		if reject, ok := envBool("TAG_CACHE_POPULATE_SHED_REJECT"); ok {
+			cfg.Cache.PopulateShedReject = reject
+		}
 		if nodeID := os.Getenv("TAG_CACHE_NODE_ID"); nodeID != "" {
 			cfg.Cache.NodeID = nodeID
 		}
@@ -566,6 +725,21 @@ func applyEnvOverrides(cfg *Config) {
 		if workers, ok := envInt("TAG_CACHE_RECOVERY_WORKERS"); ok && workers > 0 {
 			cfg.Cache.RecoveryWorkers = workers
 		}
+		// Enable parquet-aware footer prefetching from environment.
+		if val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_CACHE_PARQUET_OPTIMIZATION"))); val != "" {
+			cfg.Cache.ParquetOptimization = val == "true" || val == "1"
+		}
+		// Enable metadata caching on write from environment.
+		if val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_CACHE_META_ON_WRITE"))); val != "" {
+			cfg.Cache.MetaOnWrite = val == "true" || val == "1"
+		}
+		// Override the compaction source-read budget from environment
+		// (bytes/second). An explicit 0 disables the throttle even when YAML
+		// enabled it (ocache 0-disables convention); a negative value is
+		// ignored so it cannot wipe a valid YAML setting.
+		if bps, ok := envInt64("TAG_CACHE_COMPACTION_BPS"); ok && bps >= 0 {
+			cfg.Cache.CompactionBytesPerSecond = bps
+		}
 		// Override eviction policy from environment ("lru" or "fifo").
 		// Ignore a blank/whitespace-only value so it can't wipe a valid YAML or
 		// default setting; an unrecognized non-empty value is caught by validate().
@@ -573,7 +747,8 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Cache.EvictionPolicy = val
 		}
 		// Override concurrent cache-write limit from environment
-		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_WRITES"); ok && n > 0 {
+		// n != 0 for the same 0-default / negative-disables contract as above.
+		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_WRITES"); ok && n != 0 {
 			cfg.Cache.MaxConcurrentWrites = n
 		}
 		// Override cache-populate memory budget from environment (negative disables)
@@ -588,9 +763,19 @@ func applyEnvOverrides(cfg *Config) {
 		if b, ok := envBool("TAG_CACHE_BLOCK_CACHING_ENABLED"); ok {
 			cfg.Cache.SetBlockCachingEnabled(b)
 		}
+		// Override cache coordination mode from environment. Fail-safe: only
+		// an explicit "false"/"0" selects the CAS coordinator; anything else
+		// (typos included) keeps the legacy default.
+		if val := os.Getenv("TAG_CACHE_LEGACY_COORDINATION"); val != "" {
+			cfg.Cache.SetLegacyCoordination(!(val == "false" || val == "0"))
+		}
 		// Override the block granularity from environment (0/unset keeps the default).
 		if n, ok := envInt64("TAG_CACHE_BLOCK_SIZE"); ok && n > 0 {
 			cfg.Cache.BlockSize = n
+		}
+		// Override the max cacheable object size from environment (0/unset keeps the default).
+		if n, ok := envInt64("TAG_CACHE_SIZE_THRESHOLD"); ok && n > 0 {
+			cfg.Cache.SizeThreshold = n
 		}
 		// Override the warm-on-write populate reservation fraction from environment.
 		// f != 0 mirrors the sibling budget overrides: an env "0" means "use the
@@ -631,8 +816,10 @@ func applyEnvOverrides(cfg *Config) {
 	}
 
 	// Override the ingress in-flight request limit from environment
+	// n != 0, not n > 0: the documented contract is 0/unset = default and
+	// NEGATIVE = disabled, matching the yaml field and the populate-memory override.
 	if val := os.Getenv("TAG_MAX_INFLIGHT_REQUESTS"); val != "" {
-		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+		if n, err := strconv.Atoi(val); err == nil && n != 0 {
 			cfg.Server.MaxInflightRequests = n
 		}
 	}
@@ -650,7 +837,12 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Server.TLSKeyFile = keyFile
 	}
 
-	// Override transparent proxy from environment (enabled by default)
+	// Override operating mode from environment
+	if val := os.Getenv("TAG_MODE"); val != "" {
+		cfg.Mode = val
+	}
+
+	// Override transparent proxy from environment (deprecated: use TAG_MODE)
 	if val := os.Getenv("TAG_TRANSPARENT_PROXY"); val != "" {
 		enabled := val == "true" || val == "1"
 		cfg.Upstream.SetTransparentProxy(enabled)
@@ -666,7 +858,13 @@ func applyEnvOverrides(cfg *Config) {
 
 // validate checks that the final configuration is valid.
 func validate(cfg *Config) error {
-	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.Upstream.IsTransparentProxy()); err != nil {
+	if err := validateMode(cfg); err != nil {
+		return err
+	}
+	// Only TRANSPARENT mode is pinned to Tigris (its proxy headers are
+	// Tigris-specific). Tiered is allowed on any S3-compatible endpoint — it
+	// derives its forwarding flavor from the endpoint (ForwardsTransparently).
+	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.ResolvedMode() == ModeTransparent); err != nil {
 		return err
 	}
 	if err := validateTLS(&cfg.Server); err != nil {
@@ -674,6 +872,50 @@ func validate(cfg *Config) error {
 	}
 	if err := validateEvictionPolicy(cfg.Cache.EvictionPolicy); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateMode checks the operating mode and its interaction with the
+// deprecated transparent_proxy flag and with block caching. Tiered mode is
+// whole-object only (block caching would let individual blocks of a cached
+// object expire, which breaks authoritative local misses), so an explicit
+// block_caching_enabled=true is rejected and the block-caching default flips
+// to off.
+func validateMode(cfg *Config) error {
+	switch cfg.Mode {
+	case "", ModeTransparent, ModeSigning, ModeTiered:
+	default:
+		return fmt.Errorf("invalid mode %q: must be %q, %q, or %q", cfg.Mode, ModeTransparent, ModeSigning, ModeTiered)
+	}
+	if cfg.Mode != "" && cfg.Upstream.TransparentProxy != nil {
+		tp := *cfg.Upstream.TransparentProxy
+		if cfg.Mode == ModeTiered || (cfg.Mode == ModeTransparent) != tp {
+			return fmt.Errorf("mode %q conflicts with deprecated transparent_proxy=%v: remove transparent_proxy", cfg.Mode, tp)
+		}
+	}
+	if cfg.IsTiered() {
+		if cfg.Cache.BlockCachingEnabled != nil && *cfg.Cache.BlockCachingEnabled {
+			return fmt.Errorf("tiered mode requires whole-object caching: remove cache.block_caching_enabled")
+		}
+		cfg.Cache.SetBlockCachingEnabled(false)
+		if !cfg.Cache.IsEnabled() {
+			return fmt.Errorf("tiered mode requires the cache to be enabled")
+		}
+		// Tiered mode REQUIRES CAS-strength meta coordination: the cache is
+		// authoritative and the local tier holds the only copy, so an ordering
+		// race that would be transient staleness in proxy mode (legacy
+		// coordination's accepted write-vs-write window) is permanent data
+		// loss here — a re-tier or populate could overwrite an acknowledged
+		// write. Every node running tiered is CAS-capable by construction (the
+		// mode ships with the coordinator), so the legacy default's
+		// mixed-cluster rationale does not apply: unset selects CAS
+		// automatically, and an explicit legacy_coordination=true is a
+		// contradiction rejected like the other tiered conflicts above.
+		if cfg.Cache.LegacyCoordination != nil && *cfg.Cache.LegacyCoordination {
+			return fmt.Errorf("tiered mode requires CAS meta coordination: remove cache.legacy_coordination")
+		}
+		cfg.Cache.SetLegacyCoordination(false)
 	}
 	return nil
 }
@@ -705,21 +947,37 @@ func validateTLS(server *ServerConfig) error {
 	return nil
 }
 
-// IsTigrisEndpoint reports whether the endpoint host is localhost or a Tigris
-// domain (*.tigris.dev, *.storage.dev). Transparent proxy mode requires a Tigris
-// endpoint; signing mode works with any S3-compatible endpoint. Returns false if
-// the endpoint cannot be parsed.
+// IsTigrisEndpoint reports whether the endpoint host is a Tigris domain
+// (*.tigris.dev, *.storage.dev) — the backends whose behavior TAG has
+// verified: X-Tigris-Proxy-* headers understood, keys learnable, If-Match on
+// DELETE enforced. It selects tiered mode's forwarding flavor and therefore
+// whether the cross-tier cleanup may run, so it is deliberately STRICT:
+// localhost is not Tigris (a local MinIO is not), see IsTransparentEndpoint
+// for the transparent-mode allowlist. Hostnames are case-insensitive
+// (RFC 4343). Returns false if the endpoint cannot be parsed.
 func IsTigrisEndpoint(endpoint string) bool {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return false
 	}
+	host := strings.ToLower(u.Hostname()) // strips port if present
+	return strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev")
+}
 
-	host := u.Hostname() // strips port if present
-	if host == "localhost" {
+// IsTransparentEndpoint reports whether transparent proxy mode may target the
+// endpoint: a Tigris domain, or localhost for local testing against a Tigris
+// stand-in. This is an ALLOWLIST for the transparent-mode validator only — it
+// carries no trust claim about the backend, which is why tiered mode's flavor
+// selection uses IsTigrisEndpoint instead.
+func IsTransparentEndpoint(endpoint string) bool {
+	if IsTigrisEndpoint(endpoint) {
 		return true
 	}
-	return strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev")
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	return strings.ToLower(u.Hostname()) == "localhost"
 }
 
 // validateUpstreamEndpoint ensures the upstream endpoint is a well-formed
@@ -739,7 +997,7 @@ func validateUpstreamEndpoint(endpoint string, transparent bool) error {
 	if u.Hostname() == "" {
 		return fmt.Errorf("upstream endpoint %q must include a host", endpoint)
 	}
-	if transparent && !IsTigrisEndpoint(endpoint) {
+	if transparent && !IsTransparentEndpoint(endpoint) {
 		return fmt.Errorf("upstream endpoint %q is not allowed in transparent proxy mode: host must be localhost, *.tigris.dev, or *.storage.dev (use signing mode for other S3-compatible services)", endpoint)
 	}
 	return nil

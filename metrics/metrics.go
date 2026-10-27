@@ -10,23 +10,31 @@ import (
 )
 
 var (
-	// RequestsTotal counts total requests by operation and status.
+	// RequestsTotal counts total requests by operation and status; mode is
+	// the process's operating mode (one constant value per instance — it
+	// exists so fleet-wide queries can split traffic by mode) and source is
+	// where the RESPONSE was produced: "local" when TAG answered from its own
+	// store or knowledge (cache hits, revalidated-304 serves, authoritative
+	// misses, auth errors), "upstream" when the response was proxied.
 	RequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_requests_total",
 			Help: "Total number of requests processed",
 		},
-		[]string{"operation", "status"},
+		[]string{"operation", "status", "mode", "source"},
 	)
 
 	// RequestDuration tracks request latency by operation.
 	RequestDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "tag_request_duration_seconds",
-			Help:    "Request duration in seconds",
-			Buckets: prometheus.DefBuckets,
+			Name: "tag_request_duration_seconds",
+			Help: "Request duration in seconds",
+			// DefBuckets plus extra resolution in the 1-10s tail (1.5, 2, 3, 4, 7.5):
+			// the default 1 -> 2.5 -> 5 -> 10 jumps are too coarse to localize p99 during
+			// tail investigations — quantiles interpolate across whole seconds.
+			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10},
 		},
-		[]string{"operation"},
+		[]string{"operation", "mode", "source"},
 	)
 
 	// CacheHits counts cache hits.
@@ -71,6 +79,34 @@ var (
 			Help: "Total number of upstream errors",
 		},
 		[]string{"method"},
+	)
+
+	// TieredCleanup counts tiered mode's cross-tier cleanup deletes by outcome:
+	// deleted, already_gone (404), replaced (412 — a newer version took the key),
+	// rejected (any other upstream refusal), error (request failed), and
+	// no_etag (marker had no ETag to bind the delete to, cleanup skipped).
+	// Failures are Debug-logged per the repo's log policy, so this counter is
+	// the rollout-visibility signal for orphaned upstream copies.
+	TieredCleanup = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_tiered_cleanup_total",
+			Help: "Tiered-mode cross-tier cleanup deletes by outcome",
+		},
+		[]string{"outcome"},
+	)
+
+	// TieredRetier counts tiered mode's re-tier-on-read attempts by outcome:
+	// retiered (moved into the local tier), shed (populate budget refused the
+	// buffer), changed (the object was replaced, deleted, or no longer the
+	// marker by commit time — its newer state wins), canceled (a concurrent
+	// write claimed the key — coordination, not failure), error (fetch or
+	// store failed). Per-key dedup and claim-refused skips are not counted.
+	TieredRetier = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_tiered_retier_total",
+			Help: "Tiered-mode re-tier-on-read attempts by outcome",
+		},
+		[]string{"outcome"},
 	)
 
 	// AuthFailures counts authentication/signature validation failures.
@@ -127,7 +163,19 @@ var (
 	CachePopulateSkipped = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_cache_populate_skipped_total",
-			Help: "Total cache populates skipped due to the concurrent-cache-write limit, by source",
+			Help: "Total cache populates skipped because a populate limiter refused (write-count limit, memory budget, or disk-budget shed; see tag_cache_populate_disk_shed_total), by source",
+		},
+		[]string{"source"},
+	)
+
+	// CachePopulateDiskShed counts populates shed because tracked disk usage
+	// reached cache.populate_shed_disk_ratio of the disk cap: the store cannot
+	// evict as fast as it is being filled, so new bodies are served without
+	// being cached (tiered PUTs go upstream) until eviction catches up.
+	CachePopulateDiskShed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_cache_populate_disk_shed_total",
+			Help: "Total cache populates shed because disk usage is over the shed ratio, by source",
 		},
 		[]string{"source"},
 	)
@@ -264,6 +312,74 @@ var (
 		},
 	)
 
+	// CacheBlockPopulateFailed counts blocks that were fetched and validated but whose
+	// cache write failed (either the unary byte-write fast path or the streaming fallback).
+	// A flood-safe, alertable signal for populate-write failures; the per-block error is
+	// logged only at Debug to avoid log flooding under a sustained cache-backend outage.
+	CacheBlockPopulateFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_populate_failed_total",
+			Help: "Number of validated object blocks whose cache write failed (block-aligned caching)",
+		},
+	)
+
+	// CacheBlockPrefetchWindows counts multi-block serves by the prefetch window they were
+	// granted from the shared staging budget: "full" (requested window granted), "shrunk"
+	// (a smaller window than requested), or "sequential" (budget declined every window size —
+	// the serve degraded to the unbuffered sequential path). A rising shrunk/sequential share
+	// under load means the staging budget (half of max_populate_memory_bytes) is saturating
+	// and tail latency is being served by the slow path.
+	CacheBlockPrefetchWindows = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_prefetch_windows_total",
+			Help: "Multi-block serves by granted prefetch window outcome: full, shrunk, or sequential (block-aligned caching)",
+		},
+		[]string{"outcome"},
+	)
+
+	// CacheBlockPrefetched counts blocks fetched speculatively rather than to satisfy
+	// a request in flight, by trigger. It is a VOLUME signal — how much speculative
+	// work a trigger is doing — not a precision signal.
+	//
+	// There is deliberately no matching "used" counter. Attributing each later serve
+	// back to a prefetch required a per-block lookup on the serve path, which runs
+	// hundreds of times per full-object serve and thousands of times per second, to
+	// re-derive a ratio that is ~98% by construction: a reader that has read a parquet
+	// trailer cannot do anything except read the metadata region next. Whether the
+	// prefetch pays off is better read from tag_cache_block_hits_total /
+	// tag_cache_block_misses_total, which measures the outcome rather than a proxy for
+	// it and costs nothing extra.
+	CacheBlockPrefetched = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_prefetched_total",
+			Help: "Blocks fetched speculatively, by trigger",
+		},
+		[]string{"trigger"},
+	)
+
+	// CacheParquetFooterPrefetchShed counts eligible read-triggered footer scans
+	// refused because the per-Service admission limit is full. It counts declined
+	// trigger attempts, not distinct object versions.
+	CacheParquetFooterPrefetchShed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_parquet_footer_prefetch_shed_total",
+			Help: "Eligible read-triggered Parquet footer prefetch attempts declined because the service-wide scan limit was full",
+		},
+	)
+
+	// CacheParquetFooterBytes records valid trailer sizes seen by admitted read
+	// scans and write warms. Read triggers shed before trailer inspection are not
+	// observed, so load shedding can make the sample incomplete. Metadata that fits
+	// inside the object's tail block is already cached by the read that triggered
+	// this measurement, so only the tail of this distribution matters.
+	CacheParquetFooterBytes = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "tag_cache_parquet_footer_bytes",
+			Help:    "Size of the parquet metadata region, in bytes",
+			Buckets: prometheus.ExponentialBuckets(64*1024, 2, 10),
+		},
+	)
+
 	// CacheBlockHits counts covering blocks already present in cache when serving a request
 	// from block mode; CacheBlockMisses counts covering blocks that had to be fetched.
 	CacheBlockHits = promauto.NewCounter(
@@ -365,9 +481,37 @@ var (
 )
 
 // RecordRequest records a request with its duration and status.
-func RecordRequest(operation, status string, durationSeconds float64) {
-	RequestsTotal.WithLabelValues(operation, status).Inc()
-	RequestDuration.WithLabelValues(operation).Observe(durationSeconds)
+// Source label values for RecordRequest: where the response was produced.
+const (
+	SourceLocal    = "local"    // answered from TAG's own store or knowledge
+	SourceUpstream = "upstream" // proxied from upstream
+)
+
+// processMode is the operating mode stamped on every request metric. One
+// value per process, set once at startup (SetMode) before the server serves —
+// not synchronized, so it must not change while requests flow.
+var processMode = "unknown"
+
+// SetMode records the process's operating mode (transparent/signing/tiered)
+// for the request metrics' mode label. Call once at startup.
+func SetMode(mode string) {
+	if mode != "" {
+		processMode = mode
+	}
+}
+
+func RecordRequest(operation, status, source string, durationSeconds float64) {
+	RequestsTotal.WithLabelValues(operation, status, processMode, source).Inc()
+	RequestDuration.WithLabelValues(operation, processMode, source).Observe(durationSeconds)
+}
+
+// RecordRequestResult records a request with a status derived from its result.
+func RecordRequestResult(operation, source string, err error, durationSeconds float64) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordRequest(operation, status, source, durationSeconds)
 }
 
 // RecordCacheHit records a cache hit.
@@ -457,6 +601,11 @@ func RecordCachePopulateSkipped(source string) {
 	CachePopulateSkipped.WithLabelValues(source).Inc()
 }
 
+// RecordCachePopulateDiskShed records a populate shed by the disk-usage guard.
+func RecordCachePopulateDiskShed(source string) {
+	CachePopulateDiskShed.WithLabelValues(source).Inc()
+}
+
 // RecordCacheServeLocality records a cache body read as served locally or
 // pulled from a peer over gRPC.
 func RecordCacheServeLocality(locality string) {
@@ -509,4 +658,35 @@ func SampleCacheSize(ctx context.Context, interval time.Duration, size func() in
 			CacheSizeBytes.Set(float64(size()))
 		}
 	}
+}
+
+// RecordTieredCleanup classifies a cross-tier cleanup delete's outcome from
+// its transport error or HTTP status and records it — classification lives
+// here, not at call sites. 404 means the displaced copy was already gone; 412
+// means the If-Match lost because a newer version took the key (left alone);
+// both are completed outcomes, not failures.
+func RecordTieredCleanup(status int, err error) {
+	outcome := "deleted"
+	switch {
+	case err != nil:
+		outcome = "error"
+	case status == 404:
+		outcome = "already_gone"
+	case status == 412:
+		outcome = "replaced"
+	case status >= 300:
+		outcome = "rejected"
+	}
+	TieredCleanup.WithLabelValues(outcome).Inc()
+}
+
+// RecordTieredCleanupSkipped records a cleanup that was never attempted
+// (e.g. no displaced ETag to bind the delete to).
+func RecordTieredCleanupSkipped(reason string) {
+	TieredCleanup.WithLabelValues(reason).Inc()
+}
+
+// RecordTieredRetier records a re-tier-on-read attempt's outcome.
+func RecordTieredRetier(outcome string) {
+	TieredRetier.WithLabelValues(outcome).Inc()
 }

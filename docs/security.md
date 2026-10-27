@@ -105,6 +105,8 @@ Client                     TAG                          Tigris
 
 **RequestValidator** performs cryptographic SigV4 validation using stored signing keys. Uses constant-time comparison (HMAC-Equal) to prevent timing attacks. Enforces a 15-minute clock skew tolerance.
 
+A valid SigV4 presigned GET can omit `X-Amz-Content-Sha256`; its signature uses `UNSIGNED-PAYLOAD`. Header-authenticated requests and other methods still require the header. A presigned URL must carry exactly one integer `X-Amz-Expires` in `[1, 604800]` (seven days, as on AWS); it is rejected once that many seconds have passed since `X-Amz-Date`, or if `X-Amz-Date` is more than 15 minutes in the future. Cache serving still requires a learned signing key and an authorization grant for the requested bucket.
+
 ## Access Control Flow
 
 ```text
@@ -131,13 +133,13 @@ Request arrives at TAG
 
 ## Authorization Lifecycle
 
-Authorization decisions are cached per `(accessKey, bucket)` pair:
+Authorization decisions are cached per `(accessKey, bucket)` pair. TAG may learn signing keys from any successful response with the internal header. Those keys prove identity, not read permission. TAG grants bucket authorization only after a successful upstream `GetObject` or `HeadObject` response. Successful writes and other passthrough operations do not grant cached-read access.
 
-| Event                                | Action                                    |
-| ------------------------------------ | ----------------------------------------- |
-| Tigris returns 2xx with signing keys | `AuthzCache.Grant(accessKey, bucket)`     |
-| Tigris returns 403                   | `AuthzCache.Revoke(accessKey, bucket)`    |
-| TTL expires (10 min default)         | Entry removed, next request re-authorizes |
+| Event                                              | Action                                    |
+| -------------------------------------------------- | ----------------------------------------- |
+| Upstream 2xx to client `GetObject` or `HeadObject` | `AuthzCache.Grant(accessKey, bucket)`     |
+| Tigris returns 403                                 | `AuthzCache.Revoke(accessKey, bucket)`    |
+| TTL expires (10 min default)                       | Entry removed, next request re-authorizes |
 
 Authorization is strictly per-bucket. A client may have access to some buckets but not others, and TAG enforces this at the cache level.
 
@@ -184,6 +186,8 @@ TAG validates the upstream endpoint at startup. In **every mode**, the endpoint 
 | `*.storage.dev` | `https://t3.storage.dev`         | Tigris storage domains    |
 
 Any other host causes a fatal startup error in transparent mode.
+
+**Tiered mode** does not apply the allowlist. It derives its forwarding flavor from the endpoint: a Tigris domain (`*.tigris.dev`, `*.storage.dev`) forwards transparently; any other host — `localhost` included, since it makes no claim about the backend behind it — forwards by signing, with the same SSRF considerations as signing mode below. See [Tiered store mode](tiered-mode.md#authentication).
 
 **Signing mode** (`transparent_proxy: false`) does not apply the Tigris allowlist — it re-signs with standard SigV4 and can front any S3-compatible service. The upstream is a single, operator-configured value; TAG forwards only to that endpoint and never lets clients choose the upstream, so this is not an open proxy. The SSRF surface is limited to operator misconfiguration of `upstream.endpoint`, so treat that value as trusted configuration and set it explicitly. TAG logs a warning at startup when signing mode targets a non-Tigris host; third-party backends are community-supported.
 
