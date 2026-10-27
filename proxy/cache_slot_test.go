@@ -256,9 +256,13 @@ func TestPerPopulateBufferBytes(t *testing.T) {
 		return c
 	}
 
-	// Defaults: (1024 + 256) * 64KB.
-	if got, want := perPopulateBufferBytes(mk(64*1024, 1024)), int64(1024+256)*64*1024; got != want {
+	// The default listener and relay together reserve 320 MiB per large foreground fill.
+	if got, want := perPopulateBufferBytes(config.NewDefault()), int64(320<<20); got != want {
 		t.Errorf("perPopulateBufferBytes(default) = %d, want %d", got, want)
+	}
+	// Explicit smaller queues retain their original reservation.
+	if got, want := perPopulateBufferBytes(mk(64*1024, 1024)), int64(80<<20); got != want {
+		t.Errorf("perPopulateBufferBytes(channelBuf=1024) = %d, want %d", got, want)
 	}
 	// Small channel_buffer: queue is floored at 64, not channelBuf/4=4.
 	if got, want := perPopulateBufferBytes(mk(64*1024, 16)), int64(16+64)*64*1024; got != want {
@@ -270,7 +274,7 @@ func TestPerPopulateBufferBytes(t *testing.T) {
 		t.Errorf("perPopulateBufferBytes(chunk=16KB) = %d, want %d (pool floor, not 16KB)", got, want)
 	}
 	// Zero broadcast values fall back to defaults.
-	if got, want := perPopulateBufferBytes(mk(0, 0)), int64(1024+256)*64*1024; got != want {
+	if got, want := perPopulateBufferBytes(mk(0, 0)), int64(320<<20); got != want {
 		t.Errorf("perPopulateBufferBytes(zero) = %d, want %d (defaults)", got, want)
 	}
 }
