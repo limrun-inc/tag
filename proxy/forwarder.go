@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/metrics"
+	"github.com/tigrisdata/tag/proxy/origin"
 )
 
 // AuthResult represents the outcome of authentication validation.
@@ -172,6 +173,8 @@ type ResponseInterceptor func(resp *http.Response, originalReq *http.Request)
 // baseForwarder contains shared HTTP execution logic used by both
 // signingForwarder and transparentForwarder.
 type baseForwarder struct {
+	originReader        *origin.Reader
+	hedgeClient         *http.Client
 	signer              *auth.RequestSigner // Both modes need this for DoFullObjectRequest
 	httpClient          *http.Client
 	responseInterceptor ResponseInterceptor // Optional: called before response headers are written.
@@ -205,8 +208,8 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 // committed; the HTTP handler must abort that incomplete response. originalReq is
 // the original client request, passed to the response interceptor for parsing auth
 // info. It can be nil if no interceptor is set.
-func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) error {
-	_, _, err := b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, false)
+func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, fetch origin.Fetch) error {
+	_, _, err := b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, false, fetch)
 	return err
 }
 
@@ -215,20 +218,20 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 // tee path, which needs the response ETag to build cache metadata for the just-written
 // object without a read-back GET. On a transport error it returns (0, nil, err); a
 // body-copy error returns the received status and headers with the error.
-func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (int, http.Header, error) {
-	return b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, true)
+func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, fetch origin.Fetch) (int, http.Header, error) {
+	return b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, true, fetch)
 }
 
 // executeAndStreamWithMeta streams an upstream response and optionally retains an
 // owned copy of its headers for a caller that needs metadata after streaming. It
 // returns any body-copy error even though the upstream status is already committed.
-func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, captureMeta bool) (int, http.Header, error) {
+func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, captureMeta bool, fetch origin.Fetch) (int, http.Header, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
 
 	upstreamStart := time.Now()
-	resp, err := b.httpClient.Do(fwdReq)
+	resp, err := b.doOriginRequest(fwdReq, fetch)
 	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
@@ -265,13 +268,13 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 // w may defer committing the response until the caller has processed the capture.
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
-func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*ResponseCapture, error) {
+func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, fetch origin.Fetch) (*ResponseCapture, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
 
 	upstreamStart := time.Now()
-	resp, err := b.httpClient.Do(fwdReq)
+	resp, err := b.doOriginRequest(fwdReq, fetch)
 	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
@@ -318,13 +321,13 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 // Caller is responsible for closing the response body.
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
-func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*http.Response, error) {
+func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int64, originalReq *http.Request, fetch origin.Fetch) (*http.Response, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
 
 	upstreamStart := time.Now()
-	resp, err := b.httpClient.Do(fwdReq)
+	resp, err := b.doOriginRequest(fwdReq, fetch)
 	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
@@ -356,7 +359,7 @@ func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, ac
 	}
 
 	upstreamStart := time.Now()
-	resp, err := b.httpClient.Do(fwdReq)
+	resp, err := b.doOriginRequest(fwdReq, b.rangeFetch(fwdReq, accessKey, secretKey))
 	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background fetch failed")
@@ -467,7 +470,7 @@ func (b *baseForwarder) doConditionalRequest(ctx context.Context, method, bucket
 	}
 
 	upstreamStart := time.Now()
-	resp, err := b.httpClient.Do(fwdReq)
+	resp, err := b.doOriginRequest(fwdReq, b.rangeFetch(fwdReq, accessKey, secretKey))
 	metrics.RecordUpstreamRequest(method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msgf("Conditional %s failed", method)

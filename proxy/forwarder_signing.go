@@ -122,7 +122,7 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 	if err != nil {
 		return err
 	}
-	return forwardError(f.executeAndStream(w, fwdReq, contentLength, nil))
+	return forwardError(f.executeAndStream(w, fwdReq, contentLength, nil, f.rangeFetch(fwdReq, vr.AccessKey, secretKey)))
 }
 
 // ForwardTeeingBody forwards a single PutObject while teeing the decoded request body
@@ -155,7 +155,7 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 	}
 
 	// Return the validated credentials so the caller can HEAD/warm without re-validating.
-	status, headers, err := f.executeAndStreamReturningMeta(w, fwdReq, contentLength, nil)
+	status, headers, err := f.executeAndStreamReturningMeta(w, fwdReq, contentLength, nil, nil)
 	return status, headers, vr.AccessKey, secretKey, forwardError(err)
 }
 
@@ -175,7 +175,7 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	if err != nil {
 		return nil, err
 	}
-	capture, err := f.executeAndCapture(w, fwdReq, contentLength, nil)
+	capture, err := f.executeAndCapture(w, fwdReq, contentLength, nil, f.rangeFetch(fwdReq, vr.AccessKey, secretKey))
 	return capture, forwardError(err)
 }
 
@@ -212,7 +212,7 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 	if err != nil {
 		return nil, err
 	}
-	resp, err := f.executeRequest(fwdReq, contentLength, nil)
+	resp, err := f.executeRequest(fwdReq, contentLength, nil, f.rangeFetch(fwdReq, accessKey, secretKey))
 	return resp, forwardError(err)
 
 }

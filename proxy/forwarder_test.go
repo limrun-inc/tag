@@ -52,7 +52,7 @@ func TestExecuteAndStreamReturningMetaReturnsBodyReadError(t *testing.T) {
 	}
 	writer := httptest.NewRecorder()
 
-	status, gotHeaders, err := forwarder.executeAndStreamReturningMeta(writer, request, 0, nil)
+	status, gotHeaders, err := forwarder.executeAndStreamReturningMeta(writer, request, 0, nil, nil)
 	if !errors.Is(err, readErr) {
 		t.Fatalf("executeAndStreamReturningMeta error = %v, want %v", err, readErr)
 	}
@@ -89,7 +89,7 @@ func TestExecuteAndStreamReturningMetaOwnsHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, headers, err := forwarder.executeAndStreamReturningMeta(writer, request, 0, nil)
+	status, headers, err := forwarder.executeAndStreamReturningMeta(writer, request, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("executeAndStreamReturningMeta: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestDeleteObjectsResponseStagerCountsClientAcceptedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create upstream request: %v", err)
 	}
-	capture, err := forwarder.executeAndCapture(stager, request, 0, nil)
+	capture, err := forwarder.executeAndCapture(stager, request, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("executeAndCapture: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestDeleteObjectsResponseStagerCountsClientAcceptedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create full-write upstream request: %v", err)
 	}
-	fullCapture, err := forwarder.executeAndCapture(fullStager, fullRequest, 0, nil)
+	fullCapture, err := forwarder.executeAndCapture(fullStager, fullRequest, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("executeAndCapture for full write: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestDeleteObjectsResponseStagerCountsClientAcceptedBytes(t *testing.T) {
 		t.Fatalf("create regular-write request: %v", err)
 	}
 	regularWriter := httptest.NewRecorder()
-	regularCapture, err := forwarder.executeAndCapture(regularWriter, regularRequest, 0, nil)
+	regularCapture, err := forwarder.executeAndCapture(regularWriter, regularRequest, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("executeAndCapture for regular writer: %v", err)
 	}
