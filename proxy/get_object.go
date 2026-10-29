@@ -423,6 +423,10 @@ func (s *Service) streamFromUpstream(
 		return err
 	}
 	defer resp.Body.Close()
+	streamCtx := ctx
+	if timed, ok := resp.Body.(interface{ Context() context.Context }); ok {
+		streamCtx = timed.Context()
+	}
 
 	// Determine if we should cache this response. The whole-vs-block decision is made downstream
 	// in the shared cache writer (setupCacheListener) by size: a block-eligible object (>=
@@ -479,6 +483,15 @@ func (s *Service) streamFromUpstream(
 	}()
 
 	for {
+		if s.config.Upstream.ParallelDownloads {
+			waited, err := broadcaster.WaitForClientCapacity(streamCtx)
+			if waited > 0 {
+				metrics.OriginRangeOutputWait.Add(waited.Seconds())
+			}
+			if err != nil {
+				return err
+			}
+		}
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			if ownedInput && broadcaster.BroadcastOwned(buf[:n]) {
@@ -587,6 +600,7 @@ func (s *Service) writeChunksToResponse(
 	}()
 
 	for chunk := range listener.Chunks() {
+		listener.Consumed()
 		if chunk.Err != nil {
 			if chunk.Err == broadcast.ErrSlowConsumer {
 				metrics.RecordBroadcastSlowConsumer()
