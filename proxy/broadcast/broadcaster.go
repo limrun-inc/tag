@@ -51,8 +51,8 @@ const (
 	// DefaultChunkSize is the default size of chunks for streaming (64 KB).
 	DefaultChunkSize = 64 * 1024
 	// DefaultChannelBuffer absorbs temporary consumer slowdowns before disconnecting a listener.
-	// Each listener can retain up to 256 MiB of pooled 64 KiB chunk buffers.
-	DefaultChannelBuffer = 4096
+	// Each listener can retain up to 64 MiB of pooled 64 KiB chunk buffers.
+	DefaultChannelBuffer = 1024
 )
 
 // ErrSlowConsumer indicates a listener was disconnected for being too slow.
