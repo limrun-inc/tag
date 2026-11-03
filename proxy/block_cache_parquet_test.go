@@ -1,0 +1,711 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	cacheclient "github.com/tigrisdata/ocache/client"
+	"github.com/tigrisdata/tag/cache"
+	"github.com/tigrisdata/tag/config"
+)
+
+// parquetTailBlock builds an object tail that a parquet reader would recognise:
+// footerLen bytes of metadata, then the 4-byte length, then the magic.
+func parquetTailBlock(t *testing.T, blockSize, footerLen int64) (content []byte, contentLength int64) {
+	t.Helper()
+	// One full block of padding before the metadata region keeps the trailer
+	// inside the tail block while forcing the metadata to start earlier.
+	contentLength = blockSize + footerLen + parquetTrailerSize
+	content = make([]byte, contentLength)
+	binary.LittleEndian.PutUint32(content[contentLength-parquetTrailerSize:], uint32(footerLen))
+	copy(content[contentLength-4:], parquetMagic)
+	return content, contentLength
+}
+
+func TestIsParquetKey(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		want bool
+	}{
+		{"metrics/date=2026-08-19/hour=01/minute=40/ingestor.data.01M0.parquet", true},
+		{"UPPER.PARQUET", true},
+		{"manifest.json", false},
+		{"parquet", false},
+		{"a.parquet.tmp", false},
+	} {
+		if got := isParquetKey(tc.key); got != tc.want {
+			t.Errorf("isParquetKey(%q) = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
+// The trigger must fire only for a completed read that reached the object's
+// trailer, and only when the optimization is enabled. Everything else is a
+// read that tells us nothing about a reader opening the file.
+func TestMaybePrefetchParquetFooter_TriggerConditions(t *testing.T) {
+	const blockSize = 1024
+	meta := &cache.CachedObjectMeta{
+		ETag:          `"v1"`,
+		BlockSize:     blockSize,
+		ContentLength: 4096,
+	}
+	tail := meta.ContentLength - 1
+	trailer := meta.ContentLength - parquetTrailerSize
+
+	for _, tc := range []struct {
+		name        string
+		enabled     bool
+		key         string
+		start, end  int64
+		wantTrigger bool
+	}{
+		{"tail read on parquet fires", true, "a.parquet", trailer, tail, true},
+		{"whole object read fires", true, "a.parquet", 0, tail, true},
+		{"disabled does not fire", false, "a.parquet", trailer, tail, false},
+		{"non-parquet key does not fire", true, "a.json", trailer, tail, false},
+		{"read short of the trailer does not fire", true, "a.parquet", 0, trailer - 1, false},
+		{"read stopping before the last byte does not fire", true, "a.parquet", trailer, tail - 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.NewDefault()
+			cfg.Cache.ParquetOptimization = tc.enabled
+			s := &Service{config: cfg}
+
+			// With no cache wired, a fired trigger panics in the goroutine it
+			// starts, so assert on the decision itself rather than the effect.
+			got := s.parquetFooterPrefetchWanted(tc.key, meta, tc.start, tc.end)
+			if got != tc.wantTrigger {
+				t.Errorf("trigger = %v, want %v", got, tc.wantTrigger)
+			}
+		})
+	}
+}
+
+// The declared metadata length is read from the object's own trailer. A value
+// that is not a parquet trailer, or that cannot describe this object, must be
+// rejected rather than turned into a prefetch range.
+func TestReadParquetFooterLength(t *testing.T) {
+	const blockSize = 1024
+
+	t.Run("reads the declared length", func(t *testing.T) {
+		content, contentLength := parquetTailBlock(t, blockSize, 300)
+		s := newParquetTestService(t, content, blockSize)
+		meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
+
+		got, ok, complete := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta)
+		if !ok || !complete || got != 300 {
+			t.Fatalf("footer length = %d (ok=%v, complete=%v), want 300", got, ok, complete)
+		}
+	})
+
+	t.Run("rejects a missing magic", func(t *testing.T) {
+		content, contentLength := parquetTailBlock(t, blockSize, 300)
+		copy(content[contentLength-4:], "XXXX")
+		s := newParquetTestService(t, content, blockSize)
+		meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
+
+		if _, ok, complete := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta); ok || !complete {
+			t.Fatalf("missing-magic result = (ok=%v, complete=%v), want stable negative", ok, complete)
+		}
+	})
+
+	t.Run("rejects a length larger than the object", func(t *testing.T) {
+		content, contentLength := parquetTailBlock(t, blockSize, 300)
+		binary.LittleEndian.PutUint32(content[contentLength-parquetTrailerSize:], uint32(contentLength))
+		s := newParquetTestService(t, content, blockSize)
+		meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
+
+		if _, ok, complete := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta); ok || !complete {
+			t.Fatalf("oversize-footer result = (ok=%v, complete=%v), want stable negative", ok, complete)
+		}
+	})
+}
+
+// parquetFooterForwarder serves ranged reads out of a full object body and
+// records what was asked for, which is what the prefetch is judged on.
+type parquetFooterForwarder struct {
+	mockForwarder
+	body []byte
+	etag string
+
+	mu     sync.Mutex
+	ranges []string
+	served chan struct{}
+}
+
+func (f *parquetFooterForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
+	var start, end int64
+	if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+		return nil, fmt.Errorf("unparsable range %q: %w", rangeHeader, err)
+	}
+	f.mu.Lock()
+	f.ranges = append(f.ranges, rangeHeader)
+	f.mu.Unlock()
+	if f.served != nil {
+		f.served <- struct{}{}
+	}
+
+	header := make(http.Header)
+	header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(f.body)))
+	header.Set("ETag", f.etag)
+	chunk := f.body[start : end+1]
+	return &http.Response{
+		StatusCode:    http.StatusPartialContent,
+		ContentLength: int64(len(chunk)),
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(chunk)),
+	}, nil
+}
+
+func (f *parquetFooterForwarder) requestedRanges() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.ranges)
+}
+
+// The whole point of the optimization: metadata that spans more blocks than the
+// tail must pull exactly the blocks it spans — no more, and not the tail block
+// the triggering read already cached.
+func TestPrefetchParquetFooterBlocks_FetchesTheSpannedBlocks(t *testing.T) {
+	const (
+		blockSize = 1024
+		blocks    = 6
+		bucket    = "bucket"
+		key       = "a.parquet"
+		etag      = `"v1"`
+	)
+	contentLength := int64(blockSize * blocks)
+	// Place the metadata start inside block 3, so blocks 3 and 4 must be
+	// prefetched and block 5 (the tail) must not.
+	metaStart := int64(3500)
+	footerLen := contentLength - parquetTrailerSize - metaStart
+
+	body := make([]byte, contentLength)
+	for i := range body {
+		body[i] = byte(i)
+	}
+	binary.LittleEndian.PutUint32(body[contentLength-parquetTrailerSize:], uint32(footerLen))
+	copy(body[contentLength-4:], parquetMagic)
+
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	fwd := &parquetFooterForwarder{body: body, etag: etag}
+	s := NewService(fwd, store, cfg)
+
+	meta := &cache.CachedObjectMeta{ETag: etag, BlockSize: blockSize, ContentLength: contentLength}
+	// Seed only the tail block, as the triggering read would have.
+	tail := int64(blocks - 1)
+	if err := store.PutBlock(context.Background(), bucket, key, etag, blockSize, tail, body[tail*blockSize:], 3600); err != nil {
+		t.Fatalf("seeding tail block: %v", err)
+	}
+
+	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta, nil)
+
+	// Fetched concurrently, so compare as a set: ordering is not part of the contract.
+	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("upstream ranges = %v, want %v", got, want)
+	}
+	for _, idx := range []int64{3, 4} {
+		if !store.BlockExists(context.Background(), bucket, key, etag, blockSize, idx) {
+			t.Errorf("block %d was not cached by the prefetch", idx)
+		}
+	}
+	_ = s
+}
+
+// Metadata that fits inside the tail block is already cached by the read that
+// triggered the prefetch, so speculating further would be pure waste.
+func TestPrefetchParquetFooterBlocks_NoFetchWhenFooterFitsTailBlock(t *testing.T) {
+	const blockSize = 1024
+	content, contentLength := parquetTailBlock(t, blockSize, 300)
+	s := newParquetTestService(t, content, blockSize)
+	fwd := &parquetFooterForwarder{body: content, etag: `"v1"`}
+	s.forwarder = fwd
+
+	meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
+	s.prefetchParquetFooterBlocks("b", "a.parquet", "access", "secret", meta, nil)
+
+	if got := fwd.requestedRanges(); len(got) != 0 {
+		t.Fatalf("prefetched %v for metadata that fits the tail block", got)
+	}
+}
+
+// A hot object is tail-read repeatedly. Each such read must not start its own
+// prefetch goroutine while one is already running for that object version.
+func TestMaybePrefetchParquetFooter_CoalescesConcurrentTriggers(t *testing.T) {
+	const blockSize = 1024
+	content, contentLength := parquetTailBlock(t, blockSize, 300)
+	s := newParquetTestService(t, content, blockSize)
+	meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
+
+	// Stand in for a prefetch already running for this object version.
+	dedupKey := "pq:b/a.parquet/" + meta.ETag
+	s.activeBackgroundFetches.Store(dedupKey, struct{}{})
+
+	s.maybePrefetchParquetFooter("b", "a.parquet", "access", "secret", meta, contentLength-parquetTrailerSize, contentLength-1, nil)
+
+	// A coalesced trigger must leave the in-flight marker for its owner to clear.
+	if _, ok := s.activeBackgroundFetches.Load(dedupKey); !ok {
+		t.Fatal("coalesced trigger deleted the in-flight marker owned by another prefetch")
+	}
+}
+
+// Regression test for the wiring, not the mechanism. A parquet reader's trailer
+// probe is a few bytes, so it is served by the assembled-range path and never
+// reaches streamBlockRange. Triggering the prefetch only from the streaming path
+// meant the signal that matters most never fired in production shapes.
+func TestServeRangeFromBlockCache_TrailerProbeTriggersFooterPrefetch(t *testing.T) {
+	const (
+		blockSize = 1024
+		blocks    = 6
+		bucket    = "bucket"
+		key       = "a.parquet"
+		etag      = `"v1"`
+	)
+	contentLength := int64(blockSize * blocks)
+	metaStart := int64(3500) // inside block 3, so blocks 3 and 4 must be prefetched
+	footerLen := contentLength - parquetTrailerSize - metaStart
+
+	body := make([]byte, contentLength)
+	binary.LittleEndian.PutUint32(body[contentLength-parquetTrailerSize:], uint32(footerLen))
+	copy(body[contentLength-4:], parquetMagic)
+
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	served := make(chan struct{}, blocks)
+	fwd := &parquetFooterForwarder{body: body, etag: etag, served: served}
+	s := NewService(fwd, store, cfg)
+
+	meta := &cache.CachedObjectMeta{ETag: etag, BlockSize: blockSize, ContentLength: contentLength}
+	tail := int64(blocks - 1)
+	if err := store.PutBlock(context.Background(), bucket, key, etag, blockSize, tail, body[tail*blockSize:], 3600); err != nil {
+		t.Fatalf("seeding tail block: %v", err)
+	}
+
+	// The read a parquet reader actually issues first: the 8-byte trailer.
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", contentLength-parquetTrailerSize, contentLength-1)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+	req.Header.Set("Range", rangeHeader)
+
+	ok, err := s.serveRangeFromBlockCache(context.Background(), rec, req, bucket, key, "access", "secret", meta, rangeHeader, time.Now())
+	if err != nil || !ok {
+		t.Fatalf("serveRangeFromBlockCache(trailer) = (%v, %v), want (true, nil)", ok, err)
+	}
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec.Code)
+	}
+
+	// The prefetch is detached; wait for the two blocks it must fetch.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-served:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("trailer probe did not trigger the footer prefetch (ranges so far: %v)", fwd.requestedRanges())
+		}
+	}
+
+	// Concurrent fetches, so compare as a set.
+	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("prefetched ranges = %v, want %v", got, want)
+	}
+}
+
+// Regression test for the cold-open race. The assembled serve path returns a
+// freshly fetched tail block from an in-memory lease while its cache write is
+// still detached, so the trailer is NOT yet readable from cache when the
+// prefetch fires. Reading it back from cache would skip the prefetch on a
+// reader's first open, which is precisely what this feature targets -- and it
+// would also bias tag_cache_parquet_footer_bytes toward warm re-opens only.
+func TestPrefetchParquetFooterBlocks_UsesServedTrailerWhenTailNotYetCached(t *testing.T) {
+	const (
+		blockSize = 1024
+		blocks    = 6
+		bucket    = "bucket"
+		key       = "a.parquet"
+		etag      = `"v1"`
+	)
+	contentLength := int64(blockSize * blocks)
+	metaStart := int64(3500)
+	footerLen := contentLength - parquetTrailerSize - metaStart
+
+	body := make([]byte, contentLength)
+	binary.LittleEndian.PutUint32(body[contentLength-parquetTrailerSize:], uint32(footerLen))
+	copy(body[contentLength-4:], parquetMagic)
+
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	fwd := &parquetFooterForwarder{body: body, etag: etag}
+	s := NewService(fwd, store, cfg)
+
+	meta := &cache.CachedObjectMeta{ETag: etag, BlockSize: blockSize, ContentLength: contentLength}
+
+	// Deliberately seed NOTHING: this is the cold open, with the tail block's
+	// cache write still in flight.
+	trailer := body[contentLength-parquetTrailerSize:]
+	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta, trailer)
+
+	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("prefetched ranges = %v, want %v (served trailer was ignored)", got, want)
+	}
+}
+
+// Without the served bytes and without a cached tail, there is nothing to read
+// the length from, so the prefetch must skip rather than guess.
+func TestPrefetchParquetFooterBlocks_SkipsWhenTrailerUnavailable(t *testing.T) {
+	const blockSize = 1024
+	content, contentLength := parquetTailBlock(t, blockSize, 300)
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	fwd := &parquetFooterForwarder{body: content, etag: `"v1"`}
+	s := NewService(fwd, store, cfg)
+
+	meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
+	if completed := s.prefetchParquetFooterBlocks("b", "a.parquet", "access", "secret", meta, nil); completed {
+		t.Fatal("unreadable trailer was treated as a completed stable negative")
+	}
+
+	if got := fwd.requestedRanges(); len(got) != 0 {
+		t.Fatalf("prefetched %v with no readable trailer", got)
+	}
+}
+
+// newParquetTestService wires a Service whose cache serves the given object
+// content at block granularity, which is all the footer reader needs.
+func newParquetTestService(t *testing.T, content []byte, blockSize int64) *Service {
+	t.Helper()
+	cfg := config.NewDefault()
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	s := NewService(nil, c, cfg)
+	s.config.Cache.ParquetOptimization = true
+
+	contentLength := int64(len(content))
+	blocks := (contentLength + blockSize - 1) / blockSize
+	for i := int64(0); i < blocks; i++ {
+		start := i * blockSize
+		end := min(start+blockSize, contentLength)
+		if err := c.PutBlock(context.Background(), "b", "a.parquet", `"v1"`, blockSize, i, content[start:end], 3600); err != nil {
+			t.Fatalf("seeding block %d: %v", i, err)
+		}
+	}
+	return s
+}
+
+// The block set must cover the whole metadata region through the tail, and stay
+// bounded when a declared footer length is pathological.
+func TestParquetFooterBlocks(t *testing.T) {
+	const blockSize = 1024
+	t.Run("spans metadata through the tail", func(t *testing.T) {
+		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 6 * blockSize}
+		// metadata starts at 6144-8-2644 = 3492, inside block 3; tail is block 5.
+		got := parquetFooterBlocks(meta, 2644, false)
+		if !slices.Equal(got, []int64{3, 4, 5}) {
+			t.Fatalf("blocks = %v, want [3 4 5]", got)
+		}
+	})
+
+	t.Run("footer inside the tail block is just that block", func(t *testing.T) {
+		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 6 * blockSize}
+		if got := parquetFooterBlocks(meta, 100, false); !slices.Equal(got, []int64{5}) {
+			t.Fatalf("blocks = %v, want [5]", got)
+		}
+	})
+
+	t.Run("stays bounded for a pathological footer", func(t *testing.T) {
+		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 5000 * blockSize}
+		got := parquetFooterBlocks(meta, 4000*blockSize, false)
+		if len(got) != maxParquetFooterPrefetchBlocks {
+			t.Fatalf("blocks = %d, want the %d cap", len(got), maxParquetFooterPrefetchBlocks)
+		}
+		if got[len(got)-1] != 4999 {
+			t.Fatalf("last block = %d, want the tail block 4999", got[len(got)-1])
+		}
+	})
+}
+
+// suffixRangeForwarder answers a bytes=-8 suffix range the way S3 does: 206 with
+// Content-Range reporting the total size, which is what lets the warm path run for
+// an object TAG has never seen.
+type suffixRangeForwarder struct {
+	mockForwarder
+	body   []byte
+	etag   string
+	status int
+
+	mu     sync.Mutex
+	ranges []string
+}
+
+func (f *suffixRangeForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
+	f.mu.Lock()
+	f.ranges = append(f.ranges, rangeHeader)
+	f.mu.Unlock()
+
+	total := int64(len(f.body))
+	var n int64 = parquetTrailerSize
+	if _, err := fmt.Sscanf(rangeHeader, "bytes=-%d", &n); err != nil {
+		return nil, fmt.Errorf("unexpected range %q", rangeHeader)
+	}
+	chunk := f.body[total-n:]
+	header := make(http.Header)
+	header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", total-n, total-1, total))
+	if f.etag != "" {
+		header.Set("ETag", f.etag)
+	}
+	status := f.status
+	if status == 0 {
+		status = http.StatusPartialContent
+	}
+	return &http.Response{
+		StatusCode:    status,
+		ContentLength: int64(len(chunk)),
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(chunk)),
+	}, nil
+}
+
+func newWarmTestService(t *testing.T, body []byte, etag string, status int) (*Service, *suffixRangeForwarder) {
+	t.Helper()
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 1024
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	fwd := &suffixRangeForwarder{body: body, etag: etag, status: status}
+	return NewService(fwd, store, cfg), fwd
+}
+
+func warmTestObject(footerLen int64) []byte {
+	const blockSize, blocks = 1024, 6
+	body := make([]byte, blockSize*blocks)
+	binary.LittleEndian.PutUint32(body[len(body)-parquetTrailerSize:], uint32(footerLen))
+	copy(body[len(body)-4:], parquetMagic)
+	return body
+}
+
+// The whole point: an object TAG has never seen resolves its size, ETag and footer
+// length from ONE suffix-range read -- no HEAD, no manifest, no cached metadata.
+func TestReadParquetTrailerFromUpstream(t *testing.T) {
+	t.Run("resolves size, etag and footer length", func(t *testing.T) {
+		body := warmTestObject(2644)
+		s, fwd := newWarmTestService(t, body, `"v1"`, 0)
+
+		meta, footerLen, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk")
+		if !ok {
+			t.Fatal("trailer read failed")
+		}
+		if meta.ContentLength != int64(len(body)) || meta.ETag != `"v1"` || footerLen != 2644 {
+			t.Fatalf("meta = %+v footerLen=%d, want len=%d etag=\"v1\" footer=2644", meta, footerLen, len(body))
+		}
+		if got := fwd.ranges; !slices.Equal(got, []string{"bytes=-8"}) {
+			t.Fatalf("upstream ranges = %v, want one suffix range", got)
+		}
+	})
+
+	t.Run("rejects a 200 rather than draining a whole object", func(t *testing.T) {
+		s, _ := newWarmTestService(t, warmTestObject(2644), `"v1"`, http.StatusOK)
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("accepted a 200 - the range was ignored and the body is the whole object")
+		}
+	})
+
+	t.Run("rejects a missing ETag", func(t *testing.T) {
+		s, _ := newWarmTestService(t, warmTestObject(2644), "", 0)
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("accepted an object with no ETag - nothing could be keyed")
+		}
+	})
+
+	// The warm meta is the visibility gate for the entry, so it must be a complete
+	// object meta -- not just the three fields the block maths needs. A zero
+	// StatusCode reaches WriteHeader on a later HEAD hit and panics net/http.
+	t.Run("builds a complete object meta", func(t *testing.T) {
+		body := warmTestObject(2644)
+		s, _ := newWarmTestService(t, body, `"v1"`, 0)
+
+		meta, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk")
+		if !ok {
+			t.Fatal("trailer read failed")
+		}
+		if meta.StatusCode < 100 || meta.StatusCode > 999 {
+			t.Fatalf("StatusCode = %d, which panics net/http at WriteHeader", meta.StatusCode)
+		}
+		if meta.Bucket != "b" || meta.Key != "a.parquet" {
+			t.Fatalf("meta identity = %q/%q, want b/a.parquet", meta.Bucket, meta.Key)
+		}
+	})
+
+	t.Run("rejects an interval that is not the object tail", func(t *testing.T) {
+		s, _ := newWarmTestService(t, warmTestObject(2644), `"v1"`, 0)
+		s.forwarder = &wrongIntervalForwarder{body: warmTestObject(2644), etag: `"v1"`}
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("accepted bytes from an interval other than the object's last 8")
+		}
+	})
+
+	// Every other populate path refuses these; this one must too.
+	t.Run("rejects an object the client marked uncacheable", func(t *testing.T) {
+		s, _ := newWarmTestService(t, warmTestObject(2644), `"v1"`, 0)
+		s.forwarder = &noStoreForwarder{body: warmTestObject(2644), etag: `"v1"`}
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("warmed an object marked Cache-Control: no-store")
+		}
+	})
+
+	t.Run("rejects a non-parquet trailer", func(t *testing.T) {
+		body := warmTestObject(2644)
+		copy(body[len(body)-4:], "XXXX")
+		s, _ := newWarmTestService(t, body, `"v1"`, 0)
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("accepted a key that merely ends in .parquet")
+		}
+	})
+}
+
+// The trigger must stay off unless the optimization is on and the key is parquet,
+// and must not fire twice for a retried write.
+func TestWarmParquetFooterOnWrite_Gating(t *testing.T) {
+	body := warmTestObject(2644)
+
+	t.Run("disabled does nothing", func(t *testing.T) {
+		s, fwd := newWarmTestService(t, body, `"v1"`, 0)
+		s.config.Cache.ParquetOptimization = false
+		s.warmParquetFooterOnWrite(httptest.NewRequest(http.MethodPut, "/b/a.parquet", nil), "b", "a.parquet")
+		if len(fwd.ranges) != 0 {
+			t.Fatalf("warmed %v with the optimization off", fwd.ranges)
+		}
+	})
+
+	t.Run("non-parquet key does nothing", func(t *testing.T) {
+		s, fwd := newWarmTestService(t, body, `"v1"`, 0)
+		s.warmParquetFooterOnWrite(httptest.NewRequest(http.MethodPut, "/b/a.json", nil), "b", "a.json")
+		if len(fwd.ranges) != 0 {
+			t.Fatalf("warmed %v for a non-parquet key", fwd.ranges)
+		}
+	})
+
+	t.Run("a retried write coalesces", func(t *testing.T) {
+		s, fwd := newWarmTestService(t, body, `"v1"`, 0)
+		s.activeBackgroundFetches.Store("pqw:b/a.parquet", struct{}{})
+		s.warmParquetFooterOnWrite(httptest.NewRequest(http.MethodPut, "/b/a.parquet", nil), "b", "a.parquet")
+		if len(fwd.ranges) != 0 {
+			t.Fatalf("warmed %v while another warm was in flight", fwd.ranges)
+		}
+		if _, ok := s.activeBackgroundFetches.Load("pqw:b/a.parquet"); !ok {
+			t.Fatal("coalesced trigger cleared the marker owned by the in-flight warm")
+		}
+	})
+}
+
+// wrongIntervalForwarder answers the suffix range with trailer-shaped bytes taken
+// from the WRONG interval, and reports that interval honestly in Content-Range.
+// Block indices are derived from these bounds, so they must be checked.
+type wrongIntervalForwarder struct {
+	mockForwarder
+	body []byte
+	etag string
+}
+
+func (f *wrongIntervalForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, _ string) (*http.Response, error) {
+	total := int64(len(f.body))
+	header := make(http.Header)
+	// Valid trailer bytes, but from the middle of the object rather than its tail.
+	header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", parquetTrailerSize-1, total))
+	header.Set("ETag", f.etag)
+	return &http.Response{
+		StatusCode:    http.StatusPartialContent,
+		ContentLength: parquetTrailerSize,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(f.body[total-parquetTrailerSize:])),
+	}, nil
+}
+
+// noStoreForwarder answers the suffix range for an object the client marked
+// uncacheable, which every populate path is required to refuse.
+type noStoreForwarder struct {
+	mockForwarder
+	body []byte
+	etag string
+}
+
+func (f *noStoreForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, _ string) (*http.Response, error) {
+	total := int64(len(f.body))
+	header := make(http.Header)
+	header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", total-parquetTrailerSize, total-1, total))
+	header.Set("ETag", f.etag)
+	header.Set("Cache-Control", "no-store")
+	return &http.Response{
+		StatusCode:    http.StatusPartialContent,
+		ContentLength: parquetTrailerSize,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(f.body[total-parquetTrailerSize:])),
+	}, nil
+}
+
+// The cap must bound the blocks a caller actually fetches. Applying it to a span
+// that still contains the tail, then dropping the tail, silently gives the read
+// trigger one block less than the write trigger from the same configured limit.
+func TestParquetFooterBlocks_CapAppliesAfterTailIsDropped(t *testing.T) {
+	const blockSize = 1024
+	meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 5000 * blockSize}
+	huge := int64(4000 * blockSize)
+
+	write := parquetFooterBlocks(meta, huge, false)
+	read := parquetFooterBlocks(meta, huge, true)
+
+	if len(write) != maxParquetFooterPrefetchBlocks {
+		t.Fatalf("write trigger got %d blocks, want the %d cap", len(write), maxParquetFooterPrefetchBlocks)
+	}
+	if len(read) != maxParquetFooterPrefetchBlocks {
+		t.Fatalf("read trigger got %d blocks, want the %d cap — the tail was dropped after capping", len(read), maxParquetFooterPrefetchBlocks)
+	}
+	if read[len(read)-1] != write[len(write)-1]-1 {
+		t.Fatalf("read range should end one block before the tail: read ends %d, write ends %d", read[len(read)-1], write[len(write)-1])
+	}
+}
+
+// A block-aligned object has a FULL tail block, not a zero-length remainder, so its
+// metadata has to exceed a whole block before anything needs prefetching.
+func TestParquetFooterBlocks_BlockAlignedObjectHasFullTail(t *testing.T) {
+	const blockSize = 1024
+	meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 4 * blockSize}
+
+	// Footer smaller than a full block fits the tail; nothing to fetch beyond it.
+	if got := parquetFooterBlocks(meta, blockSize-parquetTrailerSize-1, true); len(got) != 0 {
+		t.Fatalf("aligned object with a sub-block footer wanted %v, want nothing", got)
+	}
+	// Footer larger than the tail block does spill into the previous one.
+	if got := parquetFooterBlocks(meta, blockSize+10, true); len(got) == 0 {
+		t.Fatal("aligned object with a footer larger than one block should need a prefetch")
+	}
+}

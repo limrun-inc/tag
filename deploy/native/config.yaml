@@ -4,6 +4,13 @@
 # Override any setting via environment variables (see docs/configuration.md).
 # Environment variables take precedence over this file.
 
+# Operating mode: transparent (default), signing, or tiered.
+# See docs/configuration.md and docs/tiered-mode.md.
+# Left unset so the deprecated TAG_TRANSPARENT_PROXY / upstream.transparent_proxy
+# still select the mode; setting both inconsistently is a startup-fatal error.
+# Default: "transparent"
+# mode: transparent
+
 # Server configuration
 server:
   # HTTP port for the S3 API
@@ -46,6 +53,17 @@ cache:
   # Max disk usage in bytes (0 = unlimited)
   # Default: 0
   max_disk_usage_bytes: 0
+
+  # Stop writing new cache bodies while tracked usage is at or above this
+  # fraction of max_disk_usage_bytes (eviction behind ingest). Objects are still
+  # served. Only applies with a disk cap; 0 keeps the default, negative disables.
+  # Default: 1.05
+  populate_shed_disk_ratio: 1.05
+
+  # Tiered mode: refuse a shed small PUT with 503 SlowDown instead of placing
+  # it upstream with a marker (use where the upstream tier is slow to read back).
+  # Default: false
+  populate_shed_reject: false
 
   # Unique node identifier for cluster mode
   # Required for multi-node deployments

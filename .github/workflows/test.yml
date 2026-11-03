@@ -16,13 +16,14 @@ on:
       - "LICENSE"
       - ".gitignore"
   workflow_call:
+  workflow_dispatch:
 
 env:
-  GO_VERSION: "1.24.2"
+  GO_VERSION: "1.27.2"
 
 jobs:
   test:
-    runs-on: namespace-profile-ubuntu-2404
+    runs-on: ${{ github.repository == 'limrun-inc/tag' && 'ubuntu-latest' || 'namespace-profile-ubuntu-2404' }}
     permissions:
       actions: write
       contents: read
@@ -31,6 +32,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Fork artifacts identify the PR's source commit, not GitHub's temporary merge.
+          ref: ${{ github.repository == 'limrun-inc/tag' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -40,6 +44,13 @@ jobs:
 
       - name: Download dependencies
         run: go mod download
+
+      - name: Use reachable apt mirror
+        # The runner image points apt at azure.archive.ubuntu.com, which is a
+        # single point of failure (and unreliable outside Azure). Repoint to
+        # the main Ubuntu archive before installing packages.
+        run: |
+          sudo grep -rl azure.archive.ubuntu.com /etc/apt/ | xargs -r sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g'
 
       - name: Install system dependencies
         run: make install-deps
@@ -69,4 +80,12 @@ jobs:
           path: |
             coverage.out
             coverage.html
+          retention-days: 7
+
+      - name: Upload fork canary binary
+        if: github.repository == 'limrun-inc/tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tag-linux-amd64
+          path: tag
           retention-days: 7

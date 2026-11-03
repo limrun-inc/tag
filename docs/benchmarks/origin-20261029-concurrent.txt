@@ -1,0 +1,8 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/tigrisdata/tag/proxy/origin
+cpu: Apple M3 Pro
+BenchmarkOriginFiveDownloads/single-12         	       1	32002597875 ns/op	  10.48 MB/s	         2.003 median_s	         1.000 origin_sent_x	         0 reserved_MiB	        32.00 slowest_s
+BenchmarkOriginFiveDownloads/ranges-12         	       1	2522085375 ns/op	 133.04 MB/s	         0.5374 median_s	         1.016 origin_sent_x	       480.0 reserved_MiB	         2.522 slowest_s
+PASS
+ok  	github.com/tigrisdata/tag/proxy/origin	35.102s
