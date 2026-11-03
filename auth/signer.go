@@ -134,6 +134,26 @@ func (s *RequestSigner) SignObjectRequest(ctx context.Context, method, bucket, k
 	return s.signURL(ctx, method, &baseURL, body, bodyHash, accessKey, secretKey, headers)
 }
 
+// SignRangeRequest pins a range to the version of an already-authorized GET.
+// Preserve the decoded URL path exactly, including literal question marks in keys.
+func (s *RequestSigner) SignRangeRequest(ctx context.Context, original *http.Request, start, end int64, etag, accessKey, secretKey string) (*http.Request, error) {
+	u := *original.URL
+	query := u.Query()
+	for key := range query {
+		if strings.HasPrefix(key, "X-Amz-") {
+			query.Del(key)
+		}
+	}
+	u.RawQuery = query.Encode()
+	headers := original.Header.Clone()
+	for _, key := range []string{"If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+		headers.Del(key)
+	}
+	headers.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	headers.Set("If-Match", etag)
+	return s.signURL(ctx, http.MethodGet, &u, nil, unsignedPayload, accessKey, secretKey, headers)
+}
+
 // signURL finishes request construction and SigV4 signing for an already-built
 // URL (path and query set as their decoded forms).
 func (s *RequestSigner) signURL(ctx context.Context, method string, baseURL *url.URL,

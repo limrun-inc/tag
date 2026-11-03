@@ -243,7 +243,7 @@ func (s *Service) setupCacheListener(
 		return nil, nil
 	}
 
-	listener := broadcaster.Subscribe()
+	listener := broadcaster.SubscribeCache()
 	if listener == nil {
 		taskDone()
 		s.releaseCacheSlot(weight)

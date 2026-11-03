@@ -202,6 +202,12 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		populateBudget.stagingCap = stagingCap
 	}
 
+	if cfg.Upstream.ParallelDownloads {
+		if f, ok := forwarder.(interface{ configureOriginRanges(*byteBudget) }); ok {
+			f.configureOriginRanges(populateBudget)
+		}
+	}
+
 	// The block buffer pool's retention cap must track the configured block size, or every
 	// block staging buffer in a larger-block deployment would be allocated fresh and dropped.
 	if bs := cfg.Cache.BlockSize; bs > maxPooledBlockBufBytes.Load() {

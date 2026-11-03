@@ -68,8 +68,8 @@ const (
 	// DefaultBroadcastChunkSize is the default chunk size for streaming (64KB).
 	DefaultBroadcastChunkSize = 64 * 1024
 
-	// DefaultBroadcastChannelBuffer absorbs temporary consumer slowdowns with up to 256 MiB of chunk buffers per listener.
-	DefaultBroadcastChannelBuffer = 4096
+	// DefaultBroadcastChannelBuffer absorbs temporary consumer slowdowns with up to 64 MiB of chunk buffers per listener.
+	DefaultBroadcastChannelBuffer = 1024
 
 	// DefaultMaxIdleConnsPerHost is the default HTTP connection pool size per upstream host.
 	// Higher values improve throughput for cache miss scenarios with high concurrency.
@@ -208,6 +208,9 @@ func (c *Config) ForwardsTransparently() bool {
 
 // UpstreamConfig holds Tigris endpoint configuration.
 type UpstreamConfig struct {
+	// ParallelDownloads enables bounded, version-pinned origin ranges for signed GETs.
+	ParallelDownloads bool `yaml:"parallel_downloads"`
+
 	Endpoint            string `yaml:"endpoint"`                // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
 	Region              string `yaml:"region"`                  // AWS region for signing (default: auto)
 	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 100)
@@ -322,7 +325,7 @@ type CacheConfig struct {
 	// Applied independently of MaxConcurrentWrites (both limits apply). 0 or unset uses
 	// DefaultCacheMaxPopulateMemoryBytes; a negative value disables the budget (count-only).
 	//
-	// Block-serve staging buffers (see proxy.NewService) draw from this SAME budget but are
+	// Block-serve staging and origin range buffers (see proxy.NewService) share this budget and are
 	// capped at half of it, so warm block serves — which hold staging bytes for a whole response —
 	// can never starve cold-miss populates, while populates can still use the entire budget when
 	// no serve is staging.
@@ -432,7 +435,7 @@ func (c *CacheConfig) SetGRPCAuth(enabled bool) {
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
 type BroadcastConfig struct {
 	ChunkSize     int `yaml:"chunk_size"`     // Size of chunks for streaming (default: 64KB)
-	ChannelBuffer int `yaml:"channel_buffer"` // Buffer size per listener in chunks (default: 4096, 256 MiB at 64 KiB chunks)
+	ChannelBuffer int `yaml:"channel_buffer"` // Buffer size per listener in chunks (default: 1024, 64 MiB at 64 KiB chunks)
 }
 
 // LogConfig holds logging configuration.
@@ -648,6 +651,10 @@ func envBool(key string) (bool, bool) {
 
 // applyEnvOverrides applies environment variable overrides to configuration.
 func applyEnvOverrides(cfg *Config) {
+	if enabled, ok := envBool("TAG_PARALLEL_DOWNLOADS"); ok {
+		cfg.Upstream.ParallelDownloads = enabled
+	}
+
 	// Override upstream endpoint from environment
 	if endpoint := os.Getenv("TAG_UPSTREAM_ENDPOINT"); endpoint != "" {
 		cfg.Upstream.Endpoint = endpoint

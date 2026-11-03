@@ -1,0 +1,20 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/tigrisdata/tag/proxy/origin
+cpu: Apple M3 Pro
+BenchmarkOriginDownload/healthy_10MiB/single-12  	       1	 314501000 ns/op	  33.34 MB/s	         9.795 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	   96096 B/op	     358 allocs/op
+BenchmarkOriginDownload/healthy_10MiB/ranges-12  	       1	 314112166 ns/op	  33.38 MB/s	        14.00 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	   88952 B/op	     326 allocs/op
+BenchmarkOriginDownload/healthy_64MiB/single-12  	       1	2001602959 ns/op	  33.53 MB/s	         9.385 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	  143176 B/op	     979 allocs/op
+BenchmarkOriginDownload/healthy_64MiB/ranges-12  	       1	 523726792 ns/op	 128.14 MB/s	         8.796 TTFB_ms	         1.000 origin_read_x	         1.000 origin_sent_x	        96.00 reserved_MiB	67539392 B/op	    3205 allocs/op
+BenchmarkOriginDownload/slow_first_64MiB/single-12         	       1	32001931833 ns/op	   2.10 MB/s	       126.4 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	  142760 B/op	     985 allocs/op
+BenchmarkOriginDownload/slow_first_64MiB/ranges-12         	       1	2532835333 ns/op	  26.50 MB/s	       126.0 TTFB_ms	         1.078 origin_read_x	         1.078 origin_sent_x	        96.00 reserved_MiB	84357440 B/op	    3523 allocs/op
+BenchmarkOriginDownload/slow_middle_64MiB/single-12        	       1	9502385958 ns/op	   7.06 MB/s	         9.582 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	  141848 B/op	     977 allocs/op
+BenchmarkOriginDownload/slow_middle_64MiB/ranges-12        	       1	2520326250 ns/op	  26.63 MB/s	         9.572 TTFB_ms	         1.078 origin_read_x	         1.078 origin_sent_x	        96.00 reserved_MiB	84330560 B/op	    3348 allocs/op
+BenchmarkOriginDownload/stall_64MiB/single-12              	       1	8056660834 ns/op	   8.33 MB/s	      8002 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	  140992 B/op	     970 allocs/op
+BenchmarkOriginDownload/stall_64MiB/ranges-12              	       1	2544033209 ns/op	  26.38 MB/s	      2013 TTFB_ms	         1.000 origin_read_x	         1.000 origin_sent_x	        96.00 reserved_MiB	84304808 B/op	    3129 allocs/op
+BenchmarkOriginDownload/shared_link_64MiB/single-12        	       1	4345930792 ns/op	  15.44 MB/s	        17.38 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	  142024 B/op	     972 allocs/op
+BenchmarkOriginDownload/shared_link_64MiB/ranges-12        	       1	4007870375 ns/op	  16.74 MB/s	        17.50 TTFB_ms	         1.000 origin_read_x	         1.000 origin_sent_x	        96.00 reserved_MiB	67531440 B/op	    3101 allocs/op
+BenchmarkOriginDownload/healthy_1GiB/single-12             	       1	16001545500 ns/op	  67.10 MB/s	         5.146 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	 1093160 B/op	   12488 allocs/op
+BenchmarkOriginDownload/healthy_1GiB/ranges-12             	       1	4055124667 ns/op	 264.79 MB/s	         4.602 TTFB_ms	         1.000 origin_read_x	         1.000 origin_sent_x	        96.00 reserved_MiB	104934680 B/op	   43031 allocs/op
+PASS
+ok  	github.com/tigrisdata/tag/proxy/origin	91.615s

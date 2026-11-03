@@ -11,6 +11,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_UPSTREAM_ENDPOINT`           | Tigris S3 endpoint URL                                                          | `https://t3.storage.dev` |
 | `TAG_UPSTREAM_REGION`             | Upstream region for SigV4 signing scope                                         | `auto`                   |
 | `TAG_MAX_IDLE_CONNS_PER_HOST`     | HTTP connection pool size per upstream host                                     | `100`                    |
+| `TAG_PARALLEL_DOWNLOADS` | Enable [bounded origin range downloads](parallel-downloads.md) for signed GETs | `false` |
 | `TAG_CACHE_TTL`                   | Default TTL for cached objects (Go duration, e.g. `12h`, `30m`)                 | `24h`                    |
 | `TAG_CACHE_DISABLED`              | Disable caching (`true` or `1`)                                                 | `false`                  |
 | `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
@@ -349,6 +350,7 @@ Configures the connection to upstream Tigris storage.
 | `endpoint`                | string | `"https://t3.storage.dev"` | Tigris S3 endpoint URL                           |
 | `region`                  | string | `"auto"`                   | AWS region for request signing                   |
 | `max_idle_conns_per_host` | int    | `100`                      | HTTP connection pool size per host               |
+| `parallel_downloads` | bool | `false` | Enable bounded origin range downloads; see [policy and limits](parallel-downloads.md) |
 | `transparent_proxy`       | bool   | `true`                     | **Deprecated** — use top-level `mode`. Forward client requests as-is with proxy headers |
 
 **Endpoint Validation:**

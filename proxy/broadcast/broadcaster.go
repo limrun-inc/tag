@@ -8,6 +8,8 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog/log"
 )
@@ -50,8 +52,8 @@ const (
 	// DefaultChunkSize is the default size of chunks for streaming (64 KB).
 	DefaultChunkSize = 64 * 1024
 	// DefaultChannelBuffer absorbs temporary consumer slowdowns before disconnecting a listener.
-	// Each listener can retain up to 256 MiB of pooled 64 KiB chunk buffers.
-	DefaultChannelBuffer = 4096
+	// Each listener can retain up to 64 MiB of pooled 64 KiB chunk buffers.
+	DefaultChannelBuffer = 1024
 )
 
 // ErrSlowConsumer indicates a listener was disconnected for being too slow.
@@ -86,6 +88,9 @@ func (c *Chunk) Release() {
 
 // Listener receives chunks from a broadcast.
 type Listener struct {
+	background   bool
+	abandoned    atomic.Bool
+	space        chan struct{}
 	ch           chan Chunk
 	headers      http.Header
 	status       int
@@ -136,6 +141,15 @@ func (l *Listener) Chunks() <-chan Chunk {
 	return l.ch
 }
 
+// Consumed wakes a producer waiting for a client queue to drain. Call after
+// receiving a chunk, before writing it to the downstream connection.
+func (l *Listener) Consumed() {
+	select {
+	case l.space <- struct{}{}:
+	default:
+	}
+}
+
 // Err returns the listener's terminal error: nil when the broadcast completed
 // successfully, otherwise the error that ended the stream (ErrSlowConsumer for
 // a slow-consumer disconnect, or the broadcaster's completion error).
@@ -174,6 +188,10 @@ func (l *Listener) closeWithError(err error) {
 // Call this after breaking out of a Chunks() range loop early.
 // Safe to call on normal completion (no-op if channel is already drained/closed).
 func (l *Listener) DrainAndRelease() {
+	// Cleanup can drain faster than a live client. Exclude this listener before
+	// draining so it cannot let the producer outrun the remaining clients.
+	l.abandoned.Store(true)
+	l.Consumed()
 	go func() {
 		for chunk := range l.ch {
 			chunk.Release()
@@ -183,6 +201,7 @@ func (l *Listener) DrainAndRelease() {
 
 // Broadcaster streams data to multiple listeners simultaneously.
 type Broadcaster struct {
+	space      chan struct{}
 	mu         sync.RWMutex
 	listeners  []*Listener
 	headers    http.Header
@@ -201,6 +220,7 @@ func NewBroadcaster(channelBuf int) *Broadcaster {
 		channelBuf = DefaultChannelBuffer
 	}
 	return &Broadcaster{
+		space:      make(chan struct{}, 1),
 		doneCh:     make(chan struct{}),
 		channelBuf: channelBuf,
 	}
@@ -217,6 +237,15 @@ func (b *Broadcaster) IsStreaming() bool {
 // Subscribe adds a new listener to receive chunks.
 // Returns nil if streaming has already started (no late joiners).
 func (b *Broadcaster) Subscribe() *Listener {
+	return b.subscribe(false)
+}
+
+// SubscribeCache excludes a best-effort cache writer from client backpressure.
+func (b *Broadcaster) SubscribeCache() *Listener {
+	return b.subscribe(true)
+}
+
+func (b *Broadcaster) subscribe(background bool) *Listener {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -226,8 +255,10 @@ func (b *Broadcaster) Subscribe() *Listener {
 	}
 
 	l := &Listener{
-		ch:       make(chan Chunk, b.channelBuf),
-		headerCh: make(chan struct{}),
+		background: background,
+		space:      b.space,
+		ch:         make(chan Chunk, b.channelBuf),
+		headerCh:   make(chan struct{}),
 	}
 
 	if b.headerSet {
@@ -259,6 +290,48 @@ func (b *Broadcaster) Subscribe() *Listener {
 
 	b.listeners = append(b.listeners, l)
 	return l
+}
+
+// WaitForClientCapacity prevents a fast origin from disconnecting every client.
+// One client with room permits progress; slower peers keep the existing bounded
+// queue/disconnect policy. A fast cache writer cannot outrun the last client.
+func (b *Broadcaster) WaitForClientCapacity(ctx context.Context) (time.Duration, error) {
+	var began time.Time
+	elapsed := func() time.Duration {
+		if began.IsZero() {
+			return 0
+		}
+		return time.Since(began)
+	}
+	for {
+		b.mu.RLock()
+		clients, ready := 0, false
+		for _, l := range b.listeners {
+			if l.background || l.disconnected || l.abandoned.Load() {
+				continue
+			}
+			clients++
+			if len(l.ch) < cap(l.ch) {
+				ready = true
+				break
+			}
+		}
+		done := b.done
+		b.mu.RUnlock()
+		if ready || clients == 0 || done {
+			return elapsed(), nil
+		}
+		if began.IsZero() {
+			began = time.Now()
+		}
+		select {
+		case <-b.space:
+		case <-b.doneCh:
+			return elapsed(), nil
+		case <-ctx.Done():
+			return elapsed(), ctx.Err()
+		}
+	}
 }
 
 // SetHeaders sets response headers (called by fetcher before streaming body).

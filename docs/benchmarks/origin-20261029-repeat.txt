@@ -1,0 +1,12 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/tigrisdata/tag/proxy/origin
+cpu: Apple M3 Pro
+BenchmarkOriginDownload/healthy_64MiB/single-12  	       3	2001541680 ns/op	  33.53 MB/s	         9.032 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	  118608 B/op	     911 allocs/op
+BenchmarkOriginDownload/healthy_64MiB/ranges-12  	       3	 530471458 ns/op	 126.51 MB/s	         8.875 TTFB_ms	         1.000 origin_read_x	         1.000 origin_sent_x	        96.00 reserved_MiB	67470856 B/op	    2869 allocs/op
+BenchmarkOriginDownload/slow_middle_64MiB/single-12         	       3	9501505778 ns/op	   7.06 MB/s	         9.168 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	  118656 B/op	     911 allocs/op
+BenchmarkOriginDownload/slow_middle_64MiB/ranges-12         	       3	2523892458 ns/op	  26.59 MB/s	         8.924 TTFB_ms	         1.078 origin_read_x	         1.078 origin_sent_x	        96.00 reserved_MiB	84267920 B/op	    3153 allocs/op
+BenchmarkOriginDownload/shared_link_64MiB/single-12         	       3	4282998167 ns/op	  15.67 MB/s	        16.53 TTFB_ms	         1.000 origin_sent_x	         0 reserved_MiB	  116525 B/op	     904 allocs/op
+BenchmarkOriginDownload/shared_link_64MiB/ranges-12         	       3	4014162861 ns/op	  16.72 MB/s	        17.53 TTFB_ms	         1.000 origin_read_x	         1.000 origin_sent_x	        96.00 reserved_MiB	67456949 B/op	    2792 allocs/op
+PASS
+ok  	github.com/tigrisdata/tag/proxy/origin	92.799s

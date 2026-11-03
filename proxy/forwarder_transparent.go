@@ -213,7 +213,7 @@ func (f *transparentForwarder) Forward(ctx context.Context, w http.ResponseWrite
 		return err
 	}
 
-	return f.executeAndStream(w, fwdReq, r.ContentLength, r)
+	return f.executeAndStream(w, fwdReq, r.ContentLength, r, nil)
 }
 
 // ForwardWithCapture forwards request in transparent proxy mode and captures the response.
@@ -225,7 +225,7 @@ func (f *transparentForwarder) ForwardWithCapture(ctx context.Context, w http.Re
 		return nil, err
 	}
 
-	return f.executeAndCapture(w, fwdReq, r.ContentLength, r)
+	return f.executeAndCapture(w, fwdReq, r.ContentLength, r, nil)
 }
 
 // ValidateAndGetCredentials validates the client's request locally if possible.
@@ -340,7 +340,7 @@ func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.R
 		return nil, err
 	}
 
-	return f.executeRequest(fwdReq, r.ContentLength, r)
+	return f.executeRequest(fwdReq, r.ContentLength, r, nil)
 }
 
 // learnSigningKeys extracts and caches derived signing keys from the Tigris response.
