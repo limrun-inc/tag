@@ -36,6 +36,7 @@ Warm whole-object cache hits continue to use the existing cache path.
 | Read-ahead window | At most four distinct ranges, including completed ranges waiting for output |
 | Extra attempts | At most two active across one object |
 | Attempts per range | At most three total, including the original, errors, and hedges |
+| HTTP 429/503 cooldown | Honor `Retry-After`; otherwise back off with jitter before retrying |
 | Hedge delay | At least two seconds between attempts |
 | Slow-rate comparison | Less than one third of a completed peer's rate, with enough remaining time to justify starting again |
 | No-progress detection | Two seconds; without a completed peer, only the leading stalled range can hedge |
@@ -56,6 +57,16 @@ its initial stream if the byte or request reservation cannot fit. An admitted
 range whose original attempt fails and cannot obtain a retry budget fails the
 response. Turning off the cache memory budget does not remove the range limit;
 the reader then uses a separate budget with a 1 GiB staging cap.
+
+An HTTP 429 or 503 response pauses new ranges, retries, and hedges for that
+object. Active reads can finish. TAG accepts `Retry-After` as seconds or an
+HTTP date and waits at least that long. The minimum delay uses exponential
+backoff with jitter: 0.5 to 1 second after the first attempt, then 1 to 2 seconds
+after the second. Missing, invalid, zero, or past headers retain that minimum.
+The longest cooldown requested by any part applies to the whole download.
+Waiting counts toward the body deadline, but the next attempt's 30-second
+deadline starts when it launches. Cancellation interrupts the wait and releases
+reservations. Other objects and single-stream reads keep their existing behavior.
 
 The initial GET supplies headers and streams its leading range immediately.
 TAG closes that body after the first range and obtains the remaining ranges
@@ -140,7 +151,10 @@ bypass, changed revalidation, background fills, warm hits, and a slow consumer.
 They also check that a failed version-pinned read never publishes cache metadata.
 Reader tests cover invalid responses, short bodies, three failed attempts,
 cancellation, deadline cleanup without further consumer reads, request/memory
-admission, and bounded read-ahead under backpressure. The full Go race suite,
+admission, bounded read-ahead under backpressure, and HTTP 429/503 cooldowns.
+Cooldown tests cover both header formats, backoff without a header, retries and
+hedges, new parts, oversized delay values, cancellation, and resource cleanup.
+The full Go race suite,
 local binary build, and `go vet` passed.
 
 ## Canary requirements
@@ -166,7 +180,8 @@ New metrics are `tag_origin_range_events_total`, `tag_origin_range_bytes_total`,
 `tag_origin_range_reserved_bytes`, `tag_origin_range_duration_seconds`, and
 `tag_origin_range_output_wait_seconds_total`. Their labels contain no object
 keys, URLs, or credentials. Read-byte and duration counters update when the
-body closes. Continue watching existing broadcast slow-consumer, populate-shed,
+body closes. The events `http_429` and `http_503` count rejected range attempts,
+including those followed by a successful retry. Continue watching existing broadcast slow-consumer, populate-shed,
 and cache-locality metrics. Disable the flag if correctness, completion rates,
 cache fills, RSS, or origin traffic regress.
 

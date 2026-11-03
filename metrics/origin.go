@@ -8,7 +8,7 @@ import (
 var (
 	OriginRangeOutputWait = promauto.NewCounter(prometheus.CounterOpts{Name: "tag_origin_range_output_wait_seconds_total", Help: "Time origin producers paused because all client broadcast queues were full."})
 	OriginRangeEvents     = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "tag_origin_range_events_total", Help: "Range reader admissions, completions, hedges, and budget fallbacks.",
+		Name: "tag_origin_range_events_total", Help: "Range reader admissions, completions, hedges, HTTP 429/503 responses, and budget fallbacks.",
 	}, []string{"event"})
 	OriginRangeBytes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "tag_origin_range_bytes_total", Help: "Bytes read from origin bodies, delivered, and discarded by the range reader.",

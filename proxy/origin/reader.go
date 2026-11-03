@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -162,6 +165,66 @@ type body struct {
 	received          atomic.Int64
 	extraBytes        atomic.Int64
 	started           time.Time
+	retryMu           sync.Mutex
+	retryUntil        time.Time
+}
+
+// A throttle response pauses new ranges and hedges for this object. Reads
+// already in progress can finish without adding more work at the origin.
+func (b *body) backoff(resp *http.Response, attempt int) {
+	now := time.Now()
+	until := now.Add(retryDelay(resp.Header.Get("Retry-After"), attempt, now))
+	b.retryMu.Lock()
+	if until.After(b.retryUntil) {
+		b.retryUntil = until
+	}
+	b.retryMu.Unlock()
+	metrics.OriginRangeEvents.WithLabelValues("http_" + strconv.Itoa(resp.StatusCode)).Inc()
+}
+
+func retryDelay(value string, attempt int, now time.Time) time.Duration {
+	// Equal jitter keeps a minimum pause even when Retry-After is absent or zero.
+	ceiling := time.Second << min(max(attempt-1, 0), maxAttempts-1)
+	delay := ceiling/2 + time.Duration(rand.Int64N(int64(ceiling/2)))
+	value = strings.TrimSpace(value)
+	if value != "" && strings.Trim(value, "0123456789") == "" {
+		seconds, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || seconds > uint64(math.MaxInt64/int64(time.Second)) {
+			// Never turn an overflowing server delay into an immediate retry.
+			return time.Duration(math.MaxInt64)
+		}
+		return max(delay, time.Duration(seconds)*time.Second)
+	}
+	if date, err := http.ParseTime(value); err == nil {
+		return max(delay, date.Sub(now))
+	}
+	return delay
+}
+
+func (b *body) retryDelay() time.Duration {
+	b.retryMu.Lock()
+	defer b.retryMu.Unlock()
+	return time.Until(b.retryUntil)
+}
+
+func (b *body) waitForRetry(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		delay := b.retryDelay()
+		if delay <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+			// Another part may have extended the shared cooldown while we waited.
+		}
+	}
 }
 
 func (b *body) spendExtra(n int64) bool {
@@ -325,6 +388,7 @@ type attempt struct {
 	err          error
 	terminal     bool
 	extra        bool
+	number       int
 }
 
 type part struct {
@@ -411,7 +475,7 @@ func (p *part) run() {
 		if buf == nil {
 			buf = make([]byte, b.engine.policy.partSize)
 		}
-		a := &attempt{buf: buf[:p.length()], started: time.Now(), extra: extra}
+		a := &attempt{buf: buf[:p.length()], started: time.Now(), extra: extra, number: launched + 1}
 		a.sampledAt = a.started
 		a.progress.Store(a.started.UnixNano())
 		active[a] = struct{}{}
@@ -430,6 +494,12 @@ func (p *part) run() {
 			results <- a
 		}()
 		return true
+	}
+	if p.start != 0 {
+		if err := p.body.waitForRetry(p.ctx); err != nil {
+			p.fail(err)
+			return
+		}
 	}
 	if !launch(false) {
 		p.fail(errors.New("origin range buffer unavailable"))
@@ -475,12 +545,22 @@ func (p *part) run() {
 				p.fail(a.err)
 				return
 			}
-			if len(active) == 0 && (launched == maxAttempts || !launch(true)) {
-				p.fail(lastErr)
-				return
+			if len(active) == 0 {
+				if launched == maxAttempts {
+					p.fail(lastErr)
+					return
+				}
+				if err := p.body.waitForRetry(p.ctx); err != nil {
+					p.fail(err)
+					return
+				}
+				if !launch(true) {
+					p.fail(lastErr)
+					return
+				}
 			}
 		case now := <-ticker.C:
-			if launched == maxAttempts || now.Sub(lastLaunch) < p.body.engine.policy.hedgeDelay {
+			if launched == maxAttempts || now.Sub(lastLaunch) < p.body.engine.policy.hedgeDelay || p.body.retryDelay() > 0 {
 				continue
 			}
 			// A completed peer supplies the comparison. Without one, hedge only
@@ -548,6 +628,9 @@ func (p *part) fetch(a *attempt, extra bool) {
 		if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != want ||
 			resp.ContentLength != p.length() || resp.Header.Get("ETag") != b.etag ||
 			resp.Uncompressed || resp.Header.Get("Content-Encoding") != "" {
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+				b.backoff(resp, a.number)
+			}
 			stream.Close()
 			a.err = fmt.Errorf("invalid origin range response: status %d", resp.StatusCode)
 			// Invalid metadata and non-transient HTTP errors cannot be repaired

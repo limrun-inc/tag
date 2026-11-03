@@ -255,7 +255,14 @@ func TestRetryTransientAndThreeAttemptLimit(t *testing.T) {
 		t.Run(strconv.FormatBool(succeed), func(t *testing.T) {
 			r, _ := testReader(t)
 			s := newTestOrigin(t, 2<<20)
+			var starts []time.Time
+			var startsMu sync.Mutex
 			s.behavior = func(w http.ResponseWriter, req *http.Request, start, end int64, attempt int) bool {
+				if start == r.policy.partSize {
+					startsMu.Lock()
+					starts = append(starts, time.Now())
+					startsMu.Unlock()
+				}
 				if start == 256<<10 && (!succeed || attempt < 3) {
 					w.WriteHeader(503)
 					return true
@@ -275,6 +282,14 @@ func TestRetryTransientAndThreeAttemptLimit(t *testing.T) {
 			defer s.mu.Unlock()
 			if s.requests[256<<10] != 3 {
 				t.Fatal(s.requests)
+			}
+			startsMu.Lock()
+			defer startsMu.Unlock()
+			for i := 1; i < len(starts); i++ {
+				minimum := (time.Second / 2) << (i - 1)
+				if elapsed := starts[i].Sub(starts[i-1]); elapsed < minimum {
+					t.Fatalf("retry %d started after %s, want at least %s", i, elapsed, minimum)
+				}
 			}
 		})
 	}
