@@ -87,3 +87,57 @@ func TestBackpressureWakesAfterClientConsumes(t *testing.T) {
 		chunk.Release()
 	}
 }
+
+func TestClientBackpressureIgnoresAbandonedClient(t *testing.T) {
+	b := NewBroadcaster(1)
+	t.Cleanup(func() { b.Complete(nil) })
+	b.SetHeaders(200, nil)
+	client, abandoned := b.Subscribe(), b.Subscribe()
+	b.Broadcast([]byte("first"))
+	// The write fails after the client dequeues its chunk. Cleanup must not
+	// make its empty queue count as capacity for the remaining live client.
+	chunk := <-abandoned.Chunks()
+	abandoned.Consumed()
+	chunk.Release()
+	abandoned.DrainAndRelease()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if waited, err := b.WaitForClientCapacity(ctx); !errors.Is(err, context.DeadlineExceeded) || waited <= 0 {
+		t.Fatalf("abandoned client allowed progress: wait=%s err=%v", waited, err)
+	}
+	chunk = <-client.Chunks()
+	client.Consumed()
+	chunk.Release()
+	if _, err := b.WaitForClientCapacity(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.Broadcast([]byte("second"))
+	b.Complete(nil)
+	chunk = <-client.Chunks()
+	if string(chunk.Data) != "second" {
+		t.Errorf("remaining client received %q, want second", chunk.Data)
+	}
+	chunk.Release()
+	for chunk := range client.Chunks() {
+		chunk.Release()
+	}
+	if err := client.Err(); err != nil {
+		t.Fatalf("remaining client disconnected: %v", err)
+	}
+}
+
+func TestBackpressureWakesAfterLastClientLeaves(t *testing.T) {
+	b := NewBroadcaster(1)
+	t.Cleanup(func() { b.Complete(nil) })
+	b.SetHeaders(200, nil)
+	client := b.Subscribe()
+	b.Broadcast([]byte("first"))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := b.WaitForClientCapacity(ctx); done <- err }()
+	client.DrainAndRelease()
+	if err := <-done; err != nil {
+		t.Fatalf("producer remained blocked after last client left: %v", err)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -88,6 +89,7 @@ func (c *Chunk) Release() {
 // Listener receives chunks from a broadcast.
 type Listener struct {
 	background   bool
+	abandoned    atomic.Bool
 	space        chan struct{}
 	ch           chan Chunk
 	headers      http.Header
@@ -186,9 +188,12 @@ func (l *Listener) closeWithError(err error) {
 // Call this after breaking out of a Chunks() range loop early.
 // Safe to call on normal completion (no-op if channel is already drained/closed).
 func (l *Listener) DrainAndRelease() {
+	// Cleanup can drain faster than a live client. Exclude this listener before
+	// draining so it cannot let the producer outrun the remaining clients.
+	l.abandoned.Store(true)
+	l.Consumed()
 	go func() {
 		for chunk := range l.ch {
-			l.Consumed()
 			chunk.Release()
 		}
 	}()
@@ -302,7 +307,7 @@ func (b *Broadcaster) WaitForClientCapacity(ctx context.Context) (time.Duration,
 		b.mu.RLock()
 		clients, ready := 0, false
 		for _, l := range b.listeners {
-			if l.background || l.disconnected {
+			if l.background || l.disconnected || l.abandoned.Load() {
 				continue
 			}
 			clients++

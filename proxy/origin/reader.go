@@ -414,14 +414,18 @@ func (p *part) wait() error {
 		if err != nil || complete {
 			return err
 		}
-		if p.ctx.Err() != nil {
-			return p.ctx.Err()
-		}
 		select {
 		case <-changed:
 		case <-p.ctx.Done():
 			// Completion cancels this part's losing attempts. Recheck its
 			// result before treating that internal cancellation as a failure.
+			p.mu.Lock()
+			complete, err = p.complete, p.err
+			p.mu.Unlock()
+			if err != nil || complete {
+				return err
+			}
+			return p.ctx.Err()
 		}
 	}
 }
