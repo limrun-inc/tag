@@ -91,7 +91,10 @@ func main() {
 	makeReq := func(ctx context.Context, method string, headers http.Header) (*http.Request, error) {
 		return signer.SignObjectRequest(ctx, method, c.Bucket, c.Keys[0], nil, "UNSIGNED-PAYLOAD", ak, sk, headers)
 	}
-	head, _ := makeReq(ctx, "HEAD", nil)
+	head, err := makeReq(ctx, "HEAD", nil)
+	if err != nil {
+		panic("cannot create signed request")
+	}
 	resp, err := client.Do(head)
 	if err != nil {
 		emit("error", map[string]any{"stage": "head", "error_type": origin.ErrorType(err)})
@@ -115,6 +118,9 @@ func main() {
 	started := time.Now()
 	h := sha256.New()
 	var n int64
+	responseInfo := func(r *http.Response, start, end int64, extra bool) {
+		emit("origin_response", map[string]any{"start": start, "end": end, "extra": extra, "status": r.StatusCode, "protocol": r.Proto, "cf_ray": r.Header.Get("Cf-Ray"), "request_id": r.Header.Get("X-Amz-Request-Id")})
+	}
 	var fetch func(context.Context, int64, int64, string, bool) (*http.Response, error)
 	fetch = func(ctx context.Context, start, end int64, tag string, extra bool) (*http.Response, error) {
 		req, e := makeReq(ctx, "GET", http.Header{"Range": {fmt.Sprintf("bytes=%d-%d", start, end)}, "If-Match": {tag}})
@@ -127,7 +133,7 @@ func main() {
 		}
 		r, e := cl.Do(req)
 		if r != nil {
-			emit("origin_response", map[string]any{"start": start, "end": end, "extra": extra, "status": r.StatusCode, "protocol": r.Proto, "cf_ray": r.Header.Get("Cf-Ray"), "request_id": r.Header.Get("X-Amz-Request-Id")})
+			responseInfo(r, start, end, extra)
 		}
 		return r, e
 	}
@@ -136,13 +142,18 @@ func main() {
 	} else {
 		// This trace belongs only to the initial request; ranges receive fresh hooks.
 		requestCtx, trace := origin.TraceAttempt(ctx, 0, size-1, 1, false)
-		req, _ := makeReq(requestCtx, "GET", http.Header{"If-Match": {etag}})
-		resp, err = client.Do(req)
+		req, requestErr := makeReq(requestCtx, "GET", http.Header{"If-Match": {etag}})
+		err = requestErr
 		if err == nil {
+			resp, err = client.Do(req)
+		}
+		if err == nil {
+			responseInfo(resp, 0, size-1, false)
 			trace.Headers(resp, false)
 			if resp.StatusCode != 200 || resp.Header.Get("ETag") != etag || resp.ContentLength != size {
 				err = errors.New("invalid full response")
 				resp.Body.Close()
+				trace.Finish(requestCtx, ctx, err, "read_or_validation_error")
 			} else if *mode == "parallel" {
 				trace.Finish(requestCtx, ctx, nil, "initial_headers_only")
 				plainReq := req.WithContext(ctx)
