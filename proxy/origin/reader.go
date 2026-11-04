@@ -87,7 +87,7 @@ func (r *Reader) Wrap(req *http.Request, resp *http.Response, fetch Fetch) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), r.policy.timeout)
-	b := &body{engine: r, ctx: ctx, cancel: cancel, fetch: fetch, size: resp.ContentLength,
+	b := &body{engine: r, parent: req.Context(), ctx: ctx, cancel: cancel, fetch: fetch, size: resp.ContentLength,
 		etag: resp.Header.Get("ETag"), reservation: reservation, initial: resp.Body,
 		buffers: make(chan []byte, Concurrency+maxExtra), extra: make(chan struct{}, maxExtra),
 		parts: make(chan *part, Concurrency), consumed: make(chan struct{}, Concurrency),
@@ -140,6 +140,7 @@ func (r *Reader) earn(n int64) {
 }
 
 type body struct {
+	parent            context.Context
 	engine            *Reader
 	ctx               context.Context
 	cancel            context.CancelFunc
@@ -227,18 +228,20 @@ func (b *body) waitForRetry(ctx context.Context) error {
 	}
 }
 
-func (b *body) spendExtra(n int64) bool {
+func (b *body) spendExtra(n int64) bool { return b.spendExtraReason(n) == "" }
+
+func (b *body) spendExtraReason(n int64) string {
 	limit := min(int64(trafficBurst), max(b.engine.policy.partSize, b.size/4))
 	for used := b.extraBytes.Load(); used+n <= limit; used = b.extraBytes.Load() {
 		if b.extraBytes.CompareAndSwap(used, used+n) {
 			if b.engine.spend(n) {
-				return true
+				return ""
 			}
 			b.extraBytes.Add(-n)
-			return false
+			return "process_extra_bytes"
 		}
 	}
-	return false
+	return "object_extra_bytes"
 }
 
 func (b *body) schedule() {
@@ -442,6 +445,16 @@ func (p *part) run() {
 	var workers sync.WaitGroup
 	defer workers.Wait()
 	launched := 0
+	var denials map[string]int
+	if report, _ := p.ctx.Value(diagnosticKey{}).(diagnosticObserver); report != nil {
+		denials = make(map[string]int)
+	}
+	deny := func(reason string) {
+		if denials != nil {
+			denials[reason]++
+		}
+	}
+	defer func() { p.reportDenials(denials) }()
 	lastLaunch := time.Time{}
 	launch := func(extra bool) bool {
 		b := p.body
@@ -449,9 +462,11 @@ func (p *part) run() {
 			select {
 			case b.extra <- struct{}{}:
 			default:
+				deny("extra_slots")
 				return false
 			}
 			if !b.engine.acquire() {
+				deny("process_slots")
 				<-b.extra
 				return false
 			}
@@ -460,13 +475,19 @@ func (p *part) run() {
 		select {
 		case buf = <-b.buffers:
 		default:
+			deny("buffers")
 			if extra {
 				b.engine.release()
 				<-b.extra
 			}
 			return false
 		}
-		if extra && !b.spendExtra(p.length()) {
+		reason := ""
+		if extra {
+			reason = b.spendExtraReason(p.length())
+		}
+		if reason != "" {
+			deny(reason)
 			b.buffers <- buf
 			b.engine.release()
 			<-b.extra
@@ -547,6 +568,7 @@ func (p *part) run() {
 			}
 			if len(active) == 0 {
 				if launched == maxAttempts {
+					deny("attempt_limit")
 					p.fail(lastErr)
 					return
 				}
@@ -613,10 +635,15 @@ func (p *part) fetch(a *attempt, extra bool) {
 	b := p.body
 	ctx, cancel := context.WithTimeout(p.ctx, b.engine.policy.attemptTimeout)
 	defer cancel()
+	ctx, diagnostic := TraceAttempt(ctx, p.start, p.end, a.number, extra)
+	if diagnostic != nil {
+		defer func() { diagnostic.Finish(ctx, p.ctx, a.err, p.diagnosticCause(ctx, a.err)) }()
+	}
 	var stream io.ReadCloser
 	initial := p.start == 0 && !extra
 	if initial {
 		stream = b.initial
+		diagnostic.Headers(nil, true)
 	} else {
 		resp, err := b.fetch(ctx, p.start, p.end, b.etag, extra)
 		if err != nil {
@@ -624,6 +651,7 @@ func (p *part) fetch(a *attempt, extra bool) {
 			return
 		}
 		stream = resp.Body
+		diagnostic.Headers(resp, false)
 		want := fmt.Sprintf("bytes %d-%d/%d", p.start, p.end, b.size)
 		if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != want ||
 			resp.ContentLength != p.length() || resp.Header.Get("ETag") != b.etag ||
@@ -652,6 +680,7 @@ func (p *part) fetch(a *attempt, extra bool) {
 	for n < p.length() {
 		got, err := stream.Read(a.buf[n:min(p.length(), n+64<<10)])
 		n += int64(got)
+		diagnostic.Progress(int64(got))
 		b.received.Add(int64(got))
 		a.available.Store(n)
 		if got > 0 {
