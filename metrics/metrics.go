@@ -32,7 +32,9 @@ var (
 			// DefBuckets plus extra resolution in the 1-10s tail (1.5, 2, 3, 4, 7.5):
 			// the default 1 -> 2.5 -> 5 -> 10 jumps are too coarse to localize p99 during
 			// tail investigations — quantiles interpolate across whole seconds.
-			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10},
+			// The 15-300s buckets separate large build-cache restores, which routinely
+			// exceed 10s, from requests that are actually stuck.
+			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 15, 20, 30, 60, 120, 300},
 		},
 		[]string{"operation", "mode", "source"},
 	)

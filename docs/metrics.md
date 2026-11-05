@@ -59,7 +59,7 @@ Request duration in seconds.
 | `mode`      | Operating mode (constant per instance) |
 | `source`    | `local` or `upstream` — where the response was produced |
 
-**Buckets:** 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10 (the default Prometheus buckets plus extra tail resolution at 1.5, 2, 3, 4 and 7.5 seconds)
+**Buckets:** 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 15, 20, 30, 60, 120, 300 (the default Prometheus buckets plus extra tail resolution at 1.5, 2, 3, 4 and 7.5 seconds, and long-transfer buckets from 15 to 300 seconds)
 
 **Example queries:**
 
