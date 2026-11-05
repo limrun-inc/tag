@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -226,6 +228,111 @@ func (s *RequestSigner) signURL(ctx context.Context, method string, baseURL *url
 	}
 
 	return req, nil
+}
+
+// ResignPresignedRequest creates a query-authenticated request for the signer's
+// upstream endpoint. It preserves the original signing time and expiration so
+// proxying cannot extend the URL's absolute validity deadline. Callers validate
+// the client signature before calling this method.
+func (s *RequestSigner) ResignPresignedRequest(
+	ctx context.Context,
+	source *http.Request,
+	body io.Reader,
+	accessKey, secretKey string,
+) (*http.Request, error) {
+	query := source.URL.Query()
+	dateStr := query.Get("X-Amz-Date")
+	expiresStr := query.Get("X-Amz-Expires")
+	signingTime, err := time.Parse(TimeFormat, dateStr)
+	if err != nil || expiresStr == "" {
+		return nil, ErrInvalidAuthFormat
+	}
+
+	signedHeadersStr := query.Get("X-Amz-SignedHeaders")
+	signedHeaders := strings.Split(signedHeadersStr, ";")
+	if signedHeadersStr == "" || !slices.Contains(signedHeaders, "host") {
+		return nil, ErrInvalidAuthFormat
+	}
+
+	if s.endpointErr != nil {
+		return nil, fmt.Errorf("failed to parse endpoint: %w", s.endpointErr)
+	}
+	baseURL := *s.endpointURL
+	baseURL.Path = source.URL.Path
+	baseURL.RawPath = awsURIEncode(source.URL.Path, false)
+
+	req, err := http.NewRequestWithContext(ctx, source.Method, baseURL.String(), body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.ContentLength = source.ContentLength
+	if source.ContentLength == 0 {
+		req.Body = http.NoBody
+	}
+	for key, values := range source.Header {
+		if shouldCopyPresignedHeader(key) {
+			req.Header[key] = append([]string(nil), values...)
+		}
+	}
+
+	for _, name := range signedHeaders {
+		if name == "host" {
+			continue
+		}
+		if isForbiddenPresignedSignedHeader(name) {
+			return nil, fmt.Errorf("%w: forbidden signed header %q", ErrInvalidAuthFormat, name)
+		}
+		values := source.Header.Values(name)
+		if name == "content-length" && len(values) == 0 && source.ContentLength >= 0 {
+			values = []string{strconv.FormatInt(source.ContentLength, 10)}
+		}
+		if len(values) == 0 {
+			return nil, fmt.Errorf("%w: unsupported signed header %q", ErrInvalidAuthFormat, name)
+		}
+		req.Header[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+	}
+
+	query.Del("X-Amz-Signature")
+	credentialScope := fmt.Sprintf(
+		"%s/%s/%s/%s",
+		signingTime.UTC().Format(shortTimeFormat),
+		s.region,
+		service,
+		terminationString,
+	)
+	query.Set("X-Amz-Algorithm", algorithm)
+	query.Set("X-Amz-Credential", accessKey+"/"+credentialScope)
+	query.Set("X-Amz-Date", dateStr)
+	query.Set("X-Amz-Expires", expiresStr)
+	query.Set("X-Amz-SignedHeaders", signedHeadersStr)
+
+	req.URL.RawQuery = s.buildCanonicalQueryString(query)
+	validator := &RequestValidator{}
+	canonicalRequest := validator.buildCanonicalRequestPresigned(req, signedHeaders, unsignedPayload)
+	stringToSign := s.buildStringToSign(signingTime, credentialScope, canonicalRequest)
+	signingKey := s.deriveSigningKey(secretKey, signingTime.UTC().Format(shortTimeFormat))
+	query.Set("X-Amz-Signature", hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign))))
+	req.URL.RawQuery = s.buildCanonicalQueryString(query)
+
+	return req, nil
+}
+
+func shouldCopyPresignedHeader(key string) bool {
+	return strings.EqualFold(key, "Origin") ||
+		strings.EqualFold(key, "If-Range") ||
+		shouldCopyHeader(key)
+}
+
+func isForbiddenPresignedSignedHeader(key string) bool {
+	lowerKey := strings.ToLower(key)
+	return lowerKey == "authorization" ||
+		lowerKey == "connection" ||
+		lowerKey == "proxy-connection" ||
+		lowerKey == "transfer-encoding" ||
+		lowerKey == "upgrade" ||
+		lowerKey == "trailer" ||
+		lowerKey == "x-tigris-forwarded-host" ||
+		strings.HasPrefix(lowerKey, "x-tigris-proxy-")
 }
 
 // signHTTP signs an HTTP request using AWS SigV4.

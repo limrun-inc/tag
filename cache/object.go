@@ -35,6 +35,9 @@ type BlockSpan struct {
 // - Conditional requests (If-None-Match, If-Modified-Since)
 // - Proper response headers on cache hits
 type CachedObjectMeta struct {
+	// Remember an explicit checksum-mode fetch even when the origin has no checksum.
+	ChecksumsRequested   bool              `json:"checksums_requested,omitempty"`
+	Checksums            map[string]string `json:"checksums,omitempty"` // x-amz-checksum-* response headers
 	Key                  string            `json:"key"`
 	Bucket               string            `json:"bucket"`
 	ETag                 string            `json:"etag,omitempty"`
@@ -150,6 +153,12 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 	// Store with lowercase key to match S3 convention
 	for k, v := range headers {
 		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "x-amz-checksum-") && len(v) > 0 {
+			if meta.Checksums == nil {
+				meta.Checksums = make(map[string]string)
+			}
+			meta.Checksums[lk] = v[0]
+		}
 		if strings.HasPrefix(lk, "x-amz-meta-") && len(v) > 0 {
 			meta.UserMetadata[lk] = v[0]
 		}
@@ -165,6 +174,12 @@ type WriteHeaderOption func(http.Header)
 // Content-Range and Accept-Ranges headers for 206 Partial Content responses.
 func WithRangeHeaders(start, end, totalSize int64) WriteHeaderOption {
 	return func(h http.Header) {
+		// An object checksum does not describe the partial response body.
+		for name := range h {
+			if strings.HasPrefix(strings.ToLower(name), "x-amz-checksum-") {
+				h.Del(name)
+			}
+		}
 		contentLength := end - start + 1
 		h.Set("Content-Length", strconv.FormatInt(contentLength, 10))
 		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
@@ -223,6 +238,9 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 	}
 	if m.PartsCount != "" {
 		w.Header().Set("x-amz-mp-parts-count", m.PartsCount)
+	}
+	for name, value := range m.Checksums {
+		w.Header().Set(name, value)
 	}
 	// Write user metadata with lowercase keys per S3 convention
 	for k, v := range m.UserMetadata {

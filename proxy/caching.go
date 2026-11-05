@@ -216,6 +216,7 @@ func (s *Service) setupCacheListener(
 	slotHeld bool,
 	weight int64,
 	expected uint64, // decision-time token; the meta commit's CAS precondition
+	checksumsRequested bool,
 ) (*io.PipeWriter, chan error) {
 	// Bound concurrent cache-populate operations. When the limit is saturated,
 	// skip caching entirely: the object is still served/forwarded from upstream,
@@ -273,6 +274,7 @@ func (s *Service) setupCacheListener(
 
 		// Build metadata from response headers
 		meta := cache.MetaFromHTTPHeaders(bucket, key, statusCode, headers)
+		meta.ChecksumsRequested = checksumsRequested
 		// Check if still cacheable based on metadata
 		if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
 			pipeWriter.CloseWithError(nil)

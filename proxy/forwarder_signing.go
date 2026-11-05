@@ -21,12 +21,29 @@ type signingForwarder struct {
 	validator *auth.RequestValidator
 }
 
-// validateRequest keeps signing mode's historical payload-hash requirement.
-// URL-only presigned GETs are enabled for transparent local authentication, not
-// for this forwarder's credential-translating request path.
+// validateRequest accepts URL-only reads and PUTs without changing the shared
+// validator's payload-hash requirement for other proxy modes.
 func (f *signingForwarder) validateRequest(r *http.Request) (*auth.ValidatedRequest, error) {
-	if r.Header.Get("X-Amz-Content-Sha256") == "" {
-		return nil, auth.ErrMissingContentHash
+	if auth.IsPresignedRequest(r) {
+		if r.Header.Get("Authorization") != "" || r.URL.Query().Has("X-Amz-Security-Token") ||
+			r.Header.Get("X-Amz-Security-Token") != "" || IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+			return nil, auth.ErrInvalidAuthFormat
+		}
+		urlOnly := r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodPut
+		if urlOnly && r.Header.Get("X-Amz-Content-Sha256") == "" {
+			// Do not invent a header that the URL requires the caller to supply.
+			info, err := auth.ParseAuthInfo(r)
+			if err != nil {
+				return nil, err
+			}
+			for _, name := range info.SignedHeaders {
+				if name == "x-amz-content-sha256" {
+					return nil, auth.ErrMissingContentHash
+				}
+			}
+			r = r.Clone(r.Context())
+			r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+		}
 	}
 	return f.validator.Validate(r)
 }
@@ -61,6 +78,20 @@ func (f *signingForwarder) chunkVerifier(r *http.Request) (*auth.ChunkVerifier, 
 // signForward builds the upstream request: the (possibly decoded) body, the
 // headers as they will be sent, and a fresh SigV4 signature over them.
 func (f *signingForwarder) signForward(ctx context.Context, r *http.Request, body io.Reader, bodyHash string, contentLength int64, chunked bool, accessKey, secretKey string) (*http.Request, error) {
+	if auth.IsPresignedRequest(r) {
+		source := r
+		if bucket, ok := PresignedVirtualHostBucket(r); ok {
+			source = r.Clone(ctx)
+			source.URL.Path = "/" + bucket + r.URL.Path
+			source.URL.RawPath = ""
+		}
+		fwdReq, err := f.signer.ResignPresignedRequest(ctx, source, body, accessKey, secretKey)
+		if err != nil {
+			return nil, err
+		}
+		prepareForwardedRequest(fwdReq, contentLength, false)
+		return fwdReq, nil
+	}
 	path := r.URL.Path
 	if r.URL.RawQuery != "" {
 		path = path + "?" + r.URL.RawQuery

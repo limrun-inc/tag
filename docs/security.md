@@ -105,7 +105,27 @@ Client                     TAG                          Tigris
 
 **RequestValidator** performs cryptographic SigV4 validation using stored signing keys. Uses constant-time comparison (HMAC-Equal) to prevent timing attacks. Enforces a 15-minute clock skew tolerance.
 
-A valid SigV4 presigned GET can omit `X-Amz-Content-Sha256`; its signature uses `UNSIGNED-PAYLOAD`. Header-authenticated requests and other methods still require the header. A presigned URL must carry exactly one integer `X-Amz-Expires` in `[1, 604800]` (seven days, as on AWS); it is rejected once that many seconds have passed since `X-Amz-Date`, or if `X-Amz-Date` is more than 15 minutes in the future. Cache serving still requires a learned signing key and an authorization grant for the requested bucket.
+In transparent mode, a valid SigV4 presigned GET can omit `X-Amz-Content-Sha256`; its signature uses `UNSIGNED-PAYLOAD`. Header-authenticated requests and other methods still require the header. A presigned URL must carry exactly one integer `X-Amz-Expires` in `[1, 604800]` (seven days, as on AWS); it is rejected once that many seconds have passed since `X-Amz-Date`, or if `X-Amz-Date` is more than 15 minutes in the future. Cache serving still requires a learned signing key and an authorization grant for the requested bucket.
+
+## Presigned URLs in signing mode
+
+Signing mode accepts SigV4 presigned GET, HEAD, and PUT requests without an
+`X-Amz-Content-Sha256` header. TAG validates the signature with the named credential
+in its local store before serving cached data or forwarding the request. The
+credential must also work at the upstream endpoint. TAG rejects unknown keys,
+invalid signatures, malformed authentication fields, and expired URLs.
+
+TAG re-signs the query for the upstream host and region with the same credential.
+It preserves the original signing time, expiration, signed headers, and operation
+parameters. Proxying cannot extend the URL's expiration. PUT bodies stream to the
+origin with their checksum parameters and headers intact; the origin verifies
+payload checksums. A successful PUT uses the existing cache invalidation and
+warm-on-write behavior.
+
+Signing mode rejects presigned requests with session tokens, simultaneous query
+and header authentication, or AWS chunk-signing markers. Its credential store
+holds permanent key pairs and cannot validate a session token's lifetime or policy.
+Header-authenticated requests retain their payload-hash requirement.
 
 ## Access Control Flow
 

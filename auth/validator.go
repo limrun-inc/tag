@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -194,7 +195,30 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 // passed since X-Amz-Date, and X-Amz-Date may not sit more than maxRequestAge
 // in the future (the same clock-skew tolerance header-signed requests get).
 func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo, signingKey []byte) (time.Time, error) {
-	query := r.URL.Query()
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return time.Time{}, ErrInvalidAuthFormat
+	}
+	for _, name := range []string{"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-SignedHeaders", "X-Amz-Signature"} {
+		if len(query[name]) != 1 || query.Get(name) == "" {
+			return time.Time{}, ErrInvalidAuthFormat
+		}
+	}
+	if query.Get("X-Amz-Algorithm") != algorithm {
+		return time.Time{}, ErrUnsupportedAuthScheme
+	}
+	parts := strings.Split(query.Get("X-Amz-Credential"), "/")
+	if len(parts) != 5 || parts[0] == "" || parts[2] == "" || parts[3] != service || parts[4] != terminationString {
+		return time.Time{}, ErrInvalidAuthFormat
+	}
+	if !slices.Contains(authInfo.SignedHeaders, "host") || !slices.IsSorted(authInfo.SignedHeaders) {
+		return time.Time{}, ErrInvalidAuthFormat
+	}
+	for i, name := range authInfo.SignedHeaders {
+		if name == "" || name != strings.ToLower(name) || i > 0 && name == authInfo.SignedHeaders[i-1] {
+			return time.Time{}, ErrInvalidAuthFormat
+		}
+	}
 
 	// Get expiration time
 	dateStr := query.Get("X-Amz-Date")
@@ -205,6 +229,10 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 	requestTime, err := time.Parse(TimeFormat, dateStr)
 	if err != nil {
 		return time.Time{}, ErrInvalidDate
+	}
+
+	if authInfo.Date != requestTime.UTC().Format(shortTimeFormat) {
+		return time.Time{}, ErrInvalidAuthFormat
 	}
 
 	// Check expires. The range check runs before the Duration conversion so
@@ -355,6 +383,8 @@ func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signed
 				value = r.URL.Host
 			}
 			builder.WriteString(canonicalHeaderValue(value))
+		} else if name == "content-length" && r.Header.Get("Content-Length") == "" && r.ContentLength >= 0 {
+			builder.WriteString(strconv.FormatInt(r.ContentLength, 10))
 		} else {
 			writeCanonicalHeaderValues(&builder, r.Header.Values(name))
 		}

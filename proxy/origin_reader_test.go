@@ -62,7 +62,7 @@ func TestOriginRangesThroughForwardingAndCache(t *testing.T) {
 		w.Write(data[start : end+1])
 	}))
 	defer upstream.Close()
-	for _, path := range []string{"cold", "invalid-range", "no-store", "presigned-bypass", "slow-client", "forward", "background", "revalidation", "disabled"} {
+	for _, path := range []string{"cold", "invalid-range", "no-store", "presigned", "presigned-bypass", "slow-client", "forward", "background", "revalidation", "disabled"} {
 		t.Run(path, func(t *testing.T) {
 			invalid.Store(path == "invalid-range")
 			ranges.Store(0)
@@ -116,7 +116,7 @@ func TestOriginRangesThroughForwardingAndCache(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if path == "presigned-bypass" {
+				if path == "presigned" || path == "presigned-bypass" {
 					req, err = http.NewRequest("GET", "http://tag/bucket/object?X-Amz-Expires=900&X-Amz-Checksum-Mode=ENABLED", nil)
 					if err != nil {
 						t.Fatal(err)
@@ -129,8 +129,9 @@ func TestOriginRangesThroughForwardingAndCache(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
-					req.Header.Set("Cache-Control", "no-cache")
+					if path == "presigned-bypass" {
+						req.Header.Set("Cache-Control", "no-cache")
+					}
 				}
 				w := httptest.NewRecorder()
 				if path == "forward" {
@@ -176,7 +177,7 @@ func TestOriginRangesThroughForwardingAndCache(t *testing.T) {
 			}
 			// Join asynchronous fills before checking budget release and warm hits.
 			deadline := time.Now().Add(3 * time.Second)
-			for path == "cold" {
+			for path == "cold" || path == "presigned" {
 				_, found, _ := c.GetMeta(ctx, "bucket", "object")
 				if found {
 					break
@@ -186,7 +187,7 @@ func TestOriginRangesThroughForwardingAndCache(t *testing.T) {
 				}
 				<-time.After(time.Millisecond)
 			}
-			if path == "cold" || path == "background" {
+			if path == "cold" || path == "background" || path == "presigned" {
 				before := full.Load()
 				req, _ := auth.NewRequestSigner("http://tag", "auto").SignObjectRequest(ctx, "GET", "bucket", "object", nil, "UNSIGNED-PAYLOAD", "access", "secret", nil)
 				w := httptest.NewRecorder()
