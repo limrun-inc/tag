@@ -27,6 +27,9 @@ func TestPresignedVirtualHostBucket(t *testing.T) {
 		{"appstore-production.s3.limrun.dev:443", "/ExpoGo.apk", "appstore-production", "ExpoGo.apk"},
 		{"asset-storage-production.t3.tigrisfiles.io", "/org_example/app.ipa", "asset-storage-production", "org_example/app.ipa"},
 		{"t3.storage.dev", "/limrun-build-cache/org/archive.tar", "limrun-build-cache", "org/archive.tar"},
+		{"asset-storage-production.0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com", "/org_example/app:staging:hash.apk", "asset-storage-production", "org_example/app:staging:hash.apk"},
+		{"asset-storage-staging.0123456789ABCDEF0123456789ABCDEF.r2.cloudflarestorage.com:443", "/org_example/app.ipa", "asset-storage-staging", "org_example/app.ipa"},
+		{"0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com", "/asset-storage-production/org/app.apk", "asset-storage-production", "org/app.apk"},
 	} {
 		t.Run(tc.host, func(t *testing.T) {
 			r := httptest.NewRequest("GET", "https://"+tc.host+tc.path+"?X-Amz-Credential=test", nil)
@@ -39,6 +42,20 @@ func TestPresignedVirtualHostBucket(t *testing.T) {
 				t.Fatal("unsigned requests must keep path-style parsing")
 			}
 		})
+	}
+}
+
+func TestPresignedR2HostRequiresAccountAndBucket(t *testing.T) {
+	for _, host := range []string{
+		"0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
+		"bucket.r2.cloudflarestorage.com",
+		"bucket.not-an-account.r2.cloudflarestorage.com",
+		"bucket.0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com.example.org",
+	} {
+		r := httptest.NewRequest("GET", "https://"+host+"/object?X-Amz-Credential=test", nil)
+		if bucket, ok := PresignedVirtualHostBucket(r); ok {
+			t.Errorf("%s unexpectedly recognized as bucket %q", host, bucket)
+		}
 	}
 }
 
