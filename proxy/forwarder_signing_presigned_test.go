@@ -81,79 +81,84 @@ func verifyPresignedWithSDK(r *http.Request) error {
 }
 
 func TestSigningForwarderPresigned(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
-		for _, path := range []string{"forward", "capture", "credentials", "tee"} {
-			if path == "tee" && method != http.MethodPut {
-				continue
-			}
-			t.Run(method+"/"+path, func(t *testing.T) {
-				at := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
-				var upload []byte
-				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if err := verifyPresignedWithSDK(r); err != nil {
-						t.Error(err)
-						w.WriteHeader(403)
-						return
-					}
-					require.Empty(t, r.Header.Get("Authorization"))
-					require.Equal(t, at.Format(auth.TimeFormat), r.URL.Query().Get("X-Amz-Date"))
-					require.Equal(t, "600", r.URL.Query().Get("X-Amz-Expires"))
-					require.Equal(t, "/bucket/a?b+c% d/日本語", r.URL.Path)
-					require.Equal(t, "selected-version", r.URL.Query().Get("versionId"))
+	for _, host := range []string{"gateway.example", "bucket.0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com", "bucket.t3.tigrisfiles.io"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
+			for _, path := range []string{"forward", "capture", "credentials", "tee"} {
+				if path == "tee" && method != http.MethodPut {
+					continue
+				}
+				t.Run(host+"/"+method+"/"+path, func(t *testing.T) {
+					at := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+					var upload []byte
+					origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if err := verifyPresignedWithSDK(r); err != nil {
+							t.Error(err)
+							w.WriteHeader(403)
+							return
+						}
+						require.Empty(t, r.Header.Get("Authorization"))
+						require.Equal(t, at.Format(auth.TimeFormat), r.URL.Query().Get("X-Amz-Date"))
+						require.Equal(t, "600", r.URL.Query().Get("X-Amz-Expires"))
+						require.Equal(t, "/bucket/a?b+c% d/日本語", r.URL.Path)
+						require.Equal(t, "selected-version", r.URL.Query().Get("versionId"))
+						if method == http.MethodPut {
+							upload, _ = io.ReadAll(r.Body)
+							require.Equal(t, "signed-checksum", r.Header.Get("X-Amz-Checksum-Sha256"))
+						}
+						w.Header().Set("ETag", `"object"`)
+						if method == http.MethodGet {
+							io.WriteString(w, "download")
+						}
+					}))
+					defer origin.Close()
+					creds := auth.NewCredentialStore()
+					creds.AddCredential(compatAccess, compatSecret)
+					f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil).(*signingForwarder)
+					var body []byte
+					headers := make(http.Header)
 					if method == http.MethodPut {
-						upload, _ = io.ReadAll(r.Body)
-						require.Equal(t, "signed-checksum", r.Header.Get("X-Amz-Checksum-Sha256"))
+						body = []byte("uploaded body")
+						headers.Set("X-Amz-Checksum-Sha256", "signed-checksum")
 					}
-					w.Header().Set("ETag", `"object"`)
-					if method == http.MethodGet {
-						io.WriteString(w, "download")
+					u := &url.URL{Scheme: "http", Host: host, Path: "/bucket/a?b+c% d/日本語", RawQuery: "versionId=selected-version"}
+					if host != "gateway.example" {
+						u.Path = strings.TrimPrefix(u.Path, "/bucket")
 					}
-				}))
-				defer origin.Close()
-				creds := auth.NewCredentialStore()
-				creds.AddCredential(compatAccess, compatSecret)
-				f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil).(*signingForwarder)
-				var body []byte
-				headers := make(http.Header)
-				if method == http.MethodPut {
-					body = []byte("uploaded body")
-					headers.Set("X-Amz-Checksum-Sha256", "signed-checksum")
-				}
-				u := &url.URL{Scheme: "http", Host: "gateway.example", Path: "/bucket/a?b+c% d/日本語", RawQuery: "versionId=selected-version"}
-				r := signingPresign(t, method, u.String(), body, headers, at, "600")
-				original := r.URL.String()
-				require.Empty(t, r.Header.Get("X-Amz-Content-Sha256"))
-				result, access, secret, err := f.ValidateAndGetCredentials(r)
-				require.NoError(t, err)
-				require.Equal(t, AuthValidated, result)
-				w := httptest.NewRecorder()
-				switch path {
-				case "forward":
-					err = f.Forward(t.Context(), w, r)
-				case "capture":
-					_, err = f.ForwardWithCapture(t.Context(), w, r)
-				case "credentials":
-					var resp *http.Response
-					resp, err = f.DoRequestWithCreds(t.Context(), r, access, secret)
-					if err == nil {
-						require.Equal(t, 200, resp.StatusCode)
-						resp.Body.Close()
+					r := signingPresign(t, method, u.String(), body, headers, at, "600")
+					original := r.URL.String()
+					require.Empty(t, r.Header.Get("X-Amz-Content-Sha256"))
+					result, access, secret, err := f.ValidateAndGetCredentials(r)
+					require.NoError(t, err)
+					require.Equal(t, AuthValidated, result)
+					w := httptest.NewRecorder()
+					switch path {
+					case "forward":
+						err = f.Forward(t.Context(), w, r)
+					case "capture":
+						_, err = f.ForwardWithCapture(t.Context(), w, r)
+					case "credentials":
+						var resp *http.Response
+						resp, err = f.DoRequestWithCreds(t.Context(), r, access, secret)
+						if err == nil {
+							require.Equal(t, 200, resp.StatusCode)
+							resp.Body.Close()
+						}
+					case "tee":
+						var tee bytes.Buffer
+						var status int
+						status, _, _, _, err = f.ForwardTeeingBody(t.Context(), w, r, &tee)
+						require.Equal(t, 200, status)
+						require.Equal(t, body, tee.Bytes())
 					}
-				case "tee":
-					var tee bytes.Buffer
-					var status int
-					status, _, _, _, err = f.ForwardTeeingBody(t.Context(), w, r, &tee)
-					require.Equal(t, 200, status)
-					require.Equal(t, body, tee.Bytes())
-				}
-				require.NoError(t, err)
-				require.Equal(t, 200, w.Code)
-				require.Equal(t, original, r.URL.String())
-				require.Empty(t, r.Header.Get("X-Amz-Content-Sha256"))
-				if method == http.MethodPut {
-					require.Equal(t, body, upload)
-				}
-			})
+					require.NoError(t, err)
+					require.Equal(t, 200, w.Code)
+					require.Equal(t, original, r.URL.String())
+					require.Empty(t, r.Header.Get("X-Amz-Content-Sha256"))
+					if method == http.MethodPut {
+						require.Equal(t, body, upload)
+					}
+				})
+			}
 		}
 	}
 }
