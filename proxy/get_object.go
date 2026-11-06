@@ -159,6 +159,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			cacheHit = false
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping cache for anonymous request - object not public")
 		}
+		if cacheHit && r.URL.Query().Get("X-Amz-Checksum-Mode") == "ENABLED" && !meta.ChecksumsRequested {
+			cacheHit = false
+		}
 		if cacheHit {
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			// For range requests, the Range header is included in the conditional GET
@@ -281,6 +284,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 
 	// Full object request: use broadcast manager for streaming coalescing
 	bcastKey := makeBroadcastKey(bucket, key, rangeHeader)
+	if r.URL.Query().Get("X-Amz-Checksum-Mode") == "ENABLED" {
+		// An ordinary fetch may omit checksums requested by this caller.
+		bcastKey += "\x00checksum"
+	}
 	broadcaster, isFirstCaller := s.broadcastManager.GetOrCreate(bcastKey)
 
 	// Update active broadcasts metric
@@ -445,7 +452,7 @@ func (s *Service) streamFromUpstream(
 		// Reserve against the memory budget by the object's actual size (capped at
 		// the buffer ceiling), so small objects don't each reserve the worst case.
 		weight := s.populateWeight(resp.ContentLength)
-		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, expected)
+		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, expected, r.URL.Query().Get("X-Amz-Checksum-Mode") == "ENABLED")
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,

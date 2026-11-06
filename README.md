@@ -203,7 +203,7 @@ See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
 
 TAG supports transparent proxy mode (default) with local SigV4 validation and per-bucket authorization caching, as well as signing mode with local credential stores. In transparent mode, TAG grants cached-read authorization for a bucket only after a successful upstream `GetObject` or `HeadObject`. Successful writes and other passthrough responses do not grant cached-read access.
 
-After key learning and bucket authorization, local auth can validate a valid SigV4 presigned GET without an `X-Amz-Content-Sha256` header; header-authenticated requests and other methods still require it.
+In transparent mode, local auth accepts presigned GETs without `X-Amz-Content-Sha256` after key learning and bucket authorization. Signing mode accepts presigned GET, HEAD, and PUT requests using a credential in its local store. See [presigned URLs](docs/usage.md#presigned-urls-in-signing-mode) for usage and cache behavior.
 
 See [docs/security.md](docs/security.md) for authentication, access control, and security architecture.
 

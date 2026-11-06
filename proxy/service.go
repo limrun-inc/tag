@@ -939,6 +939,9 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 			cacheHit = false
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping HEAD cache for anonymous request - object not public")
 		}
+		if cacheHit && r.URL.Query().Get("X-Amz-Checksum-Mode") == "ENABLED" && !meta.ChecksumsRequested {
+			return s.forwardWithoutCache(ctx, w, r, "HeadObject", start)
+		}
 		if cacheHit {
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			if forceRevalidate && meta.ETag != "" {
@@ -1474,10 +1477,56 @@ func PresignedVirtualHostBucket(r *http.Request) (string, bool) {
 	return "", false
 }
 
-// Presigned app downloads explicitly request origin validation. Keep the original
-// signed request intact and let Tigris answer, even when a cached object exists.
+// Presigned reads share the object cache only when their request semantics
+// match its current-object entry. The origin handles all other variants.
 func bypassPresignedCache(r *http.Request) bool {
-	return auth.IsPresignedRequest(r) && r.Header.Get("Cache-Control") != ""
+	if !auth.IsPresignedRequest(r) {
+		return false
+	}
+	if r.Header.Get("Cache-Control") != "" || r.Header.Get("Origin") != "" ||
+		r.Header.Get("X-Amz-Security-Token") != "" || r.Method == http.MethodHead && r.Header.Get("Range") != "" {
+		return true
+	}
+	for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+		if r.Header.Get(name) != "" {
+			return true
+		}
+	}
+	query := r.URL.Query()
+	for _, name := range strings.Split(query.Get("X-Amz-SignedHeaders"), ";") {
+		if name != "host" && name != "x-amz-content-sha256" {
+			return true
+		}
+	}
+	for name := range r.Header {
+		if strings.HasPrefix(strings.ToLower(name), "x-amz-") && !strings.EqualFold(name, "X-Amz-Content-Sha256") {
+			return true
+		}
+	}
+	for name, values := range query {
+		switch name {
+		case "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature":
+		case "X-Amz-Content-Sha256":
+			if len(values) != 1 || values[0] != "UNSIGNED-PAYLOAD" {
+				return true
+			}
+		case "X-Amz-Checksum-Mode":
+			if len(values) != 1 || values[0] != "ENABLED" {
+				return true
+			}
+		case "x-id":
+			operation := "GetObject"
+			if r.Method == http.MethodHead {
+				operation = "HeadObject"
+			}
+			if len(values) != 1 || values[0] != operation {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // hasNoAuthCredentials returns true if the request carries no SigV4 credentials

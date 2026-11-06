@@ -296,3 +296,44 @@ Client request cancellation and service shutdown still cancel active work.
 With legacy coordination, a cache populate that outlives its invalidation-marker
 window cannot publish metadata. Its client download continues; this prevents an
 expired deletion marker from allowing old content back into the cache.
+
+## Presigned URLs in signing mode
+
+With `TAG_MODE=signing`, generate a presigned GET, HEAD, or PUT URL using TAG's
+endpoint and a key pair configured in TAG's credential store. That key pair must
+also have the required permission at the upstream endpoint. Use path-style
+addressing. For example, with boto3:
+
+```python
+import boto3
+from botocore.config import Config
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://localhost:8080",
+    region_name="auto",
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+url = s3.generate_presigned_url(
+    "put_object",
+    Params={"Bucket": "my-bucket", "Key": "archive.tar.gz"},
+    ExpiresIn=300,
+)
+```
+
+Use `get_object` for a download or `head_object` for metadata. Send the URL with
+its matching HTTP method and any headers included when signing it. No additional
+`Authorization` or `X-Amz-Content-Sha256` header is required. Expiration must be
+between 1 and 604800 seconds. TAG preserves the original expiration when it
+re-signs a request for the upstream host and region.
+
+GET and HEAD requests can use cached objects after local signature validation.
+Version and part selectors, response overrides, unknown query parameters,
+conditional headers, signed ranges, and requests carrying `Cache-Control` bypass
+the cache. Checksum headers returned by the origin are preserved on cache hits. A
+checksum-mode request fetches from the origin if the entry came from a read that
+did not request checksums. PUT requests reach the origin and
+invalidate or replace the cached object after success, as header-signed uploads do.
+
+Temporary credentials carrying `X-Amz-Security-Token` are not supported in signing
+mode. Other HTTP methods retain their existing payload-hash requirement.

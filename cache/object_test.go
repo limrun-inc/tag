@@ -3,6 +3,7 @@ package cache
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -582,5 +583,36 @@ func TestCachedObjectMeta_ACL_EncodeDecode(t *testing.T) {
 
 	if decoded.ACL != original.ACL {
 		t.Errorf("ACL = %q, want %q", decoded.ACL, original.ACL)
+	}
+}
+
+func TestChecksumHeadersSurviveCacheAndStayOffRanges(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("Content-Length", "100")
+	headers.Set("X-Amz-Checksum-Sha256", "sha256-value")
+	headers.Set("X-Amz-Checksum-Crc32c", "crc32c-value")
+	headers.Set("X-Amz-Checksum-Type", "FULL_OBJECT")
+	meta := MetaFromHTTPHeaders("bucket", "key", http.StatusOK, headers)
+	encoded, err := meta.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := DecodeMeta(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := httptest.NewRecorder()
+	restored.WriteHeaders(full)
+	for _, name := range []string{"X-Amz-Checksum-Sha256", "X-Amz-Checksum-Crc32c", "X-Amz-Checksum-Type"} {
+		if full.Header().Get(name) != headers.Get(name) {
+			t.Errorf("lost %s", name)
+		}
+	}
+	partial := httptest.NewRecorder()
+	restored.WriteHeaders(partial, WithRangeHeaders(0, 9, 100))
+	for name := range partial.Header() {
+		if strings.HasPrefix(strings.ToLower(name), "x-amz-checksum-") {
+			t.Errorf("range retained object checksum %s", name)
+		}
 	}
 }
