@@ -431,8 +431,10 @@ func (s *Service) streamFromUpstream(
 	}
 	defer resp.Body.Close()
 	streamCtx := ctx
+	reader := "stream"
 	if timed, ok := resp.Body.(interface{ Context() context.Context }); ok {
 		streamCtx = timed.Context()
+		reader = "range"
 	}
 
 	// Determine if we should cache this response. The whole-vs-block decision is made downstream
@@ -489,15 +491,20 @@ func (s *Service) streamFromUpstream(
 		broadcast.PutChunkBuf(buf)
 	}()
 
+	// Pace every origin read on client capacity, whichever reader produced the body.
+	// An origin that is faster than the client fills the client's bounded queue
+	// within seconds of a cold read, and the broadcaster then disconnects that
+	// client mid-body, so a restore ends in a truncated response. Waiting here lets
+	// the client's drain rate throttle the origin read instead. The broadcaster
+	// bounds one wait, so a client that never reads still gets disconnected.
+	outputWait := metrics.OriginOutputWait.WithLabelValues(reader)
 	for {
-		if s.config.Upstream.ParallelDownloads {
-			waited, err := broadcaster.WaitForClientCapacity(streamCtx)
-			if waited > 0 {
-				metrics.OriginRangeOutputWait.Add(waited.Seconds())
-			}
-			if err != nil {
-				return err
-			}
+		waited, err := broadcaster.WaitForClientCapacity(streamCtx)
+		if waited > 0 {
+			outputWait.Add(waited.Seconds())
+		}
+		if err != nil {
+			return err
 		}
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {

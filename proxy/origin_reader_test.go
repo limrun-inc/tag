@@ -62,15 +62,17 @@ func TestOriginRangesThroughForwardingAndCache(t *testing.T) {
 		w.Write(data[start : end+1])
 	}))
 	defer upstream.Close()
-	for _, path := range []string{"cold", "invalid-range", "no-store", "presigned", "presigned-bypass", "slow-client", "forward", "background", "revalidation", "disabled"} {
+	for _, path := range []string{"cold", "invalid-range", "no-store", "presigned", "presigned-bypass", "slow-client", "disabled-slow-client", "forward", "background", "revalidation", "disabled"} {
 		t.Run(path, func(t *testing.T) {
 			invalid.Store(path == "invalid-range")
 			ranges.Store(0)
 			full.Store(0)
 			cfg := config.NewDefault()
-			cfg.Upstream.ParallelDownloads = path != "disabled"
+			disabled := path == "disabled" || path == "disabled-slow-client"
+			slow := path == "slow-client" || path == "disabled-slow-client"
+			cfg.Upstream.ParallelDownloads = !disabled
 			cfg.Cache.SetBlockCachingEnabled(false)
-			if path == "slow-client" {
+			if slow {
 				cfg.Broadcast.ChannelBuffer = 2
 			}
 			forwarder := NewForwarder(store, upstream.URL, "auto", 10, nil, nil)
@@ -138,7 +140,7 @@ func TestOriginRangesThroughForwardingAndCache(t *testing.T) {
 					err = forwarder.Forward(ctx, w, req)
 				} else {
 					var writer http.ResponseWriter = w
-					if path == "slow-client" {
+					if slow {
 						writer = &pacedRangeWriter{ResponseWriter: w}
 					}
 					err = s.HandleGetObject(writer, req)
@@ -169,10 +171,10 @@ func TestOriginRangesThroughForwardingAndCache(t *testing.T) {
 					t.Fatal("presigned cache bypass populated the cache")
 				}
 			}
-			if path != "disabled" && ranges.Load() != 2 {
+			if !disabled && ranges.Load() != 2 {
 				t.Fatalf("range GETs=%d, expected 2", ranges.Load())
 			}
-			if path == "disabled" && ranges.Load() != 0 {
+			if disabled && ranges.Load() != 0 {
 				t.Fatal("disabled flag made range requests")
 			}
 			// Join asynchronous fills before checking budget release and warm hits.
@@ -223,6 +225,7 @@ func TestOriginRangeFactoryScope(t *testing.T) {
 
 // The delay models a consumer slower than the local origin, rather than test
 // synchronization. Two queue slots make overflow deterministic without a GB fixture.
+// Both the range reader and the single origin stream must finish such a client.
 type pacedRangeWriter struct{ http.ResponseWriter }
 
 func (w *pacedRangeWriter) Write(p []byte) (int, error) {

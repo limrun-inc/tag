@@ -19,6 +19,10 @@ Authentication remains the forwarder's responsibility. The routing/authenticatio
 migration is a prerequisite for client request forms the deployed forwarder does
 not already support; this feature does not grant new access.
 
+Client backpressure on origin reads does not depend on this flag: every origin
+reader pauses while all client broadcast queues are full, so a client slower than
+the origin receives a complete body either way (see [architecture](architecture.md)).
+
 Small objects, client Range requests, encoded bodies, unknown lengths, weak or
 missing ETags, and unsupported query selectors retain the existing stream.
 Selectors such as `versionId`, `partNumber`, and response-header overrides are
@@ -178,9 +182,9 @@ fleet capacity or identify the cause of the original outliers.
 
 New metrics are `tag_origin_range_events_total`, `tag_origin_range_bytes_total`,
 `tag_origin_range_reserved_bytes`, `tag_origin_range_duration_seconds`, and
-`tag_origin_range_output_wait_seconds_total`. Their labels contain no object
-keys, URLs, or credentials. Read-byte and duration counters update when the
-body closes. The events `http_429` and `http_503` count rejected range attempts,
+`tag_origin_output_wait_seconds_total` (label `reader`, `range` or `stream`).
+Their labels contain no object keys, URLs, or credentials. Read-byte and
+duration counters update when the body closes. The events `http_429` and `http_503` count rejected range attempts,
 including those followed by a successful retry. Continue watching existing broadcast slow-consumer, populate-shed,
 and cache-locality metrics. Disable the flag if correctness, completion rates,
 cache fills, RSS, or origin traffic regress.
