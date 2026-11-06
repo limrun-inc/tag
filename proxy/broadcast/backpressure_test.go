@@ -141,3 +141,34 @@ func TestBackpressureWakesAfterLastClientLeaves(t *testing.T) {
 		t.Fatalf("producer remained blocked after last client left: %v", err)
 	}
 }
+
+func TestBackpressureResumesAfterStalledClient(t *testing.T) {
+	previous := maxClientCapacityWait
+	maxClientCapacityWait = 20 * time.Millisecond
+	t.Cleanup(func() { maxClientCapacityWait = previous })
+	b := NewBroadcaster(1)
+	t.Cleanup(func() { b.Complete(nil) })
+	b.SetHeaders(200, nil)
+	client := b.Subscribe()
+	b.Broadcast([]byte("first"))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waited, err := b.WaitForClientCapacity(ctx)
+	if err != nil || waited < 20*time.Millisecond {
+		t.Fatalf("stalled client held the producer: wait=%s err=%v", waited, err)
+	}
+	// The producer resumes and the stalled client loses its place; the chunk it
+	// already queued is still delivered, in order.
+	b.Broadcast([]byte("second"))
+	chunk := <-client.Chunks()
+	if string(chunk.Data) != "first" {
+		t.Errorf("queued chunk %q, want first", chunk.Data)
+	}
+	chunk.Release()
+	for chunk := range client.Chunks() {
+		chunk.Release()
+	}
+	if !errors.Is(client.Err(), ErrSlowConsumer) {
+		t.Fatalf("stalled client err=%v, want %v", client.Err(), ErrSlowConsumer)
+	}
+}

@@ -292,11 +292,27 @@ func (b *Broadcaster) subscribe(background bool) *Listener {
 	return l
 }
 
+// maxClientCapacityWait bounds one pause for client capacity. A draining client
+// frees a queue slot within milliseconds, so a pause this long means every client
+// has stalled. The producer then resumes and the bounded queue policy disconnects
+// the stalled clients, so a client that never reads cannot hold the origin
+// connection and the cache fill open. Tests shorten it.
+var maxClientCapacityWait = 2 * time.Minute
+
 // WaitForClientCapacity prevents a fast origin from disconnecting every client.
 // One client with room permits progress; slower peers keep the existing bounded
 // queue/disconnect policy. A fast cache writer cannot outrun the last client.
+// After maxClientCapacityWait without progress it returns with no error, and the
+// next broadcast disconnects the stalled clients instead of holding the producer.
 func (b *Broadcaster) WaitForClientCapacity(ctx context.Context) (time.Duration, error) {
 	var began time.Time
+	var stall *time.Timer
+	var stalled <-chan time.Time
+	defer func() {
+		if stall != nil {
+			stall.Stop()
+		}
+	}()
 	elapsed := func() time.Duration {
 		if began.IsZero() {
 			return 0
@@ -323,9 +339,15 @@ func (b *Broadcaster) WaitForClientCapacity(ctx context.Context) (time.Duration,
 		}
 		if began.IsZero() {
 			began = time.Now()
+			stall = time.NewTimer(maxClientCapacityWait)
+			stalled = stall.C
 		}
 		select {
 		case <-b.space:
+		case <-stalled:
+			log.Warn().Dur("waited", elapsed()).Int("clients", clients).
+				Msg("No client drained its broadcast queue; resuming the origin read")
+			return elapsed(), nil
 		case <-b.doneCh:
 			return elapsed(), nil
 		case <-ctx.Done():

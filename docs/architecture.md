@@ -395,7 +395,13 @@ type Listener struct {
 **Policies:**
 
 - **No Late Joiners**: Once streaming starts, new requests start their own broadcast
-- **Slow Consumer Handling**: Listeners with full channels are disconnected
+- **Client Backpressure**: The origin reader pauses while every client queue is full,
+  so the slowest client that still drains paces the origin read. A pause ends after
+  two minutes without any client progress, so a client that never reads cannot hold
+  the origin connection or the cache fill open. Background cache writers never pace
+  the origin read.
+- **Slow Consumer Handling**: A listener whose channel is full while another client
+  has room, or after a pause ends, is disconnected
 - **Memory Bounded**: `chunkSize × channelBuffer × numListeners` per broadcast
 
 ## Error Handling
