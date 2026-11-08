@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -112,7 +114,7 @@ func TestSigningForwarderPresigned(t *testing.T) {
 					}))
 					defer origin.Close()
 					creds := auth.NewCredentialStore()
-					creds.AddCredential(compatAccess, compatSecret)
+					loadScopedPresigner(t, creds)
 					f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil).(*signingForwarder)
 					var body []byte
 					headers := make(http.Header)
@@ -159,6 +161,66 @@ func TestSigningForwarderPresigned(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// Keep the gateway key different from the asset presigner, as in production.
+func loadScopedPresigner(t *testing.T, creds *auth.CredentialStore) {
+	t.Helper()
+	t.Setenv("AWS_ACCESS_KEY_ID", "gateway")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "gateway-secret")
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	t.Setenv("TAG_SIGNING_CREDENTIALS_FILE", path)
+	require.NoError(t, os.WriteFile(path, []byte(fmt.Sprintf(`[{"access_key_id":%q,"secret_access_key":%q,"buckets":["bucket"]}]`, compatAccess, compatSecret)), 0600))
+	require.NoError(t, creds.LoadFromEnv())
+}
+
+func TestSigningScopedPresignerCannotReadAnotherBucketsCache(t *testing.T) {
+	for _, hostStyle := range []bool{false, true} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
+			t.Run(fmt.Sprintf("virtualHost=%t/%s", hostStyle, method), func(t *testing.T) {
+				var calls atomic.Int32
+				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(403) }))
+				defer origin.Close()
+				creds := auth.NewCredentialStore()
+				loadScopedPresigner(t, creds)
+				f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil)
+				svc, store := newTestService(f, true)
+				defer svc.Stop()
+				for _, bucket := range []string{"bucket", "private-build-cache"} {
+					meta := &cache.CachedObjectMeta{Bucket: bucket, Key: "object", ETag: `"version"`, ContentLength: 4, StatusCode: 200}
+					require.NoError(t, store.PutWithMeta(t.Context(), bucket, "object", meta, []byte("data"), 60))
+					target := "http://gateway.example/" + bucket + "/object"
+					if hostStyle {
+						target = "http://" + bucket + ".0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/object"
+					}
+					r := signingPresign(t, method, target, nil, nil, time.Now(), "300")
+					w := httptest.NewRecorder()
+					var err error
+					switch method {
+					case http.MethodGet:
+						err = svc.HandleGetObject(w, r)
+					case http.MethodHead:
+						err = svc.HandleHeadObject(w, r)
+					case http.MethodPut:
+						_, _, _, err = f.ValidateAndGetCredentials(r)
+					}
+					if bucket == "bucket" {
+						require.NoError(t, err)
+						if method != http.MethodPut {
+							require.Equal(t, XCacheHit, w.Header().Get(XCacheHeader))
+						}
+					} else {
+						require.ErrorIs(t, err, auth.ErrBucketAccessDenied)
+						var authErr *AuthError
+						require.ErrorAs(t, err, &authErr)
+						require.Equal(t, ErrCodeAccessDenied, authErr.Code)
+						require.Empty(t, w.Body.String())
+					}
+				}
+				require.Zero(t, calls.Load(), "bucket scope must be checked before cache and upstream")
+			})
 		}
 	}
 }

@@ -58,6 +58,10 @@ func (f *signingForwarder) validate(r *http.Request) (*auth.ValidatedRequest, st
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return nil, "", mapAuthError(err)
 	}
+	bucket, _ := ParseBucketKey(r)
+	if err := f.credStore.AuthorizeBucket(vr.AccessKey, bucket); err != nil {
+		return nil, "", mapAuthError(err)
+	}
 	secretKey, err := f.credStore.GetSecretKey(vr.AccessKey)
 	if err != nil {
 		return nil, "", mapAuthError(err)

@@ -19,6 +19,7 @@ func WriteAuthError(w http.ResponseWriter, r *http.Request, code int, err error)
 		errCodeExpiredRequest    = 2
 		errCodeMalformedAuth     = 3
 		errCodeInternal          = 4
+		errCodeAccessDenied      = 5
 	)
 
 	var s3Code s3err.ErrorCode
@@ -27,7 +28,7 @@ func WriteAuthError(w http.ResponseWriter, r *http.Request, code int, err error)
 		s3Code = s3err.ErrSignatureDoesNotMatch
 	case errCodeInvalidAccessKey:
 		s3Code = s3err.ErrInvalidAccessKeyId
-	case errCodeExpiredRequest:
+	case errCodeExpiredRequest, errCodeAccessDenied:
 		s3Code = s3err.ErrAccessDenied
 	case errCodeMalformedAuth:
 		s3Code = s3err.ErrAuthorizationHeaderMalformed

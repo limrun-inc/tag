@@ -97,6 +97,8 @@ const (
 	ErrCodeMalformedAuth
 	// ErrCodeInternal indicates an internal error during auth processing.
 	ErrCodeInternal
+	// ErrCodeAccessDenied indicates a valid signature outside its configured bucket grant.
+	ErrCodeAccessDenied
 )
 
 // AuthError represents an authentication error with a specific code.
@@ -129,6 +131,9 @@ func mapAuthError(err error) *AuthError {
 	} else if errors.Is(err, auth.ErrUnknownAccessKey) {
 		reason = "unknown_access_key"
 		code = ErrCodeInvalidAccessKey
+	} else if errors.Is(err, auth.ErrBucketAccessDenied) {
+		reason = "bucket_access_denied"
+		code = ErrCodeAccessDenied
 	} else if errors.Is(err, auth.ErrExpiredRequest) {
 		reason = "expired_request"
 		code = ErrCodeExpiredRequest
