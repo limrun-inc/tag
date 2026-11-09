@@ -531,13 +531,14 @@ func (s *Service) fetchFullObjectToCache(
 	// unsigned request so upstream applies anonymous authorization — 200 only if the
 	// object is publicly readable — which is what lets us cache public-read safely.
 	var (
-		resp *http.Response
-		err  error
+		resp               *http.Response
+		err                error
+		checksumsRequested bool
 	)
 	if anonymous {
 		resp, err = s.forwarder.DoAnonymousFullObjectRequest(ctx, bucket, key)
 	} else {
-		resp, err = s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
+		resp, checksumsRequested, err = s.cacheFillRequest(ctx, http.MethodGet, bucket, key, accessKey, secretKey)
 	}
 	if err != nil {
 		return err
@@ -583,6 +584,7 @@ func (s *Service) fetchFullObjectToCache(
 	// The cache writer owns the body read directly, so no broadcaster, listener
 	// channel, intermediate queue, pipe, or relay goroutine is needed on this path.
 	meta := cache.MetaFromHTTPHeaders(bucket, key, resp.StatusCode, resp.Header)
+	meta.ChecksumsRequested = checksumsRequested
 	if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
 		// The former background relay continued consuming the response after its
 		// listener rejected the metadata. Drain it here too so a reusable upstream

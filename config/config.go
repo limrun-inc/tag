@@ -39,6 +39,10 @@ const (
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
+	// DefaultCacheWriteThroughMaxSize is the largest single PUT retained for
+	// write-through (256 MiB), independently of the read-side block size.
+	DefaultCacheWriteThroughMaxSize = 256 * 1024 * 1024
+
 	// DefaultCacheBlockSize (1 MiB) is the block granularity AND the read-side whole-vs-block
 	// boundary: a read miss for an object SMALLER than one block is cached as a whole blob
 	// (block-caching a sub-block object is identical to whole-caching it), while an object
@@ -331,13 +335,18 @@ type CacheConfig struct {
 	// no serve is staging.
 	MaxPopulateMemoryBytes int64 `yaml:"max_populate_memory_bytes"`
 	// WarmOnWrite, when true, repopulates the cache after a successful write
-	// (PutObject / CompleteMultipartUpload / CopyObject) by triggering a background
-	// full-object fetch — so a read soon after a write hits cache. This is
-	// cache-warm-on-write (write-around plus async warming), not strict
-	// write-through: the write still invalidates, and the warm is a separate,
-	// best-effort background GET (deduplicated and shed under the populate budget).
-	// It costs one extra upstream GET per write, so it defaults to false.
+	// (PutObject / CompleteMultipartUpload / CopyObject). Eligible single PUTs
+	// retain their uploaded bytes and confirm metadata with HEAD; other writes
+	// use a background full-object GET. Cache population is asynchronous and
+	// best effort under the populate budget. Defaults to false.
 	WarmOnWrite bool `yaml:"warm_on_write"`
+	// WriteThroughMaxSize bounds single PUTs cached from their uploaded body,
+	// without a full-object read-back. The whole body plus cache-writer buffers
+	// must fit the populate memory budget before forwarding begins; otherwise
+	// the write falls back to streaming background warming. PUTs >= 1 MiB also
+	// require that byte budget to be enabled. No temporary disk copy is used.
+	// 0/unset uses 256 MiB; negative disables the tee, retaining background warming.
+	WriteThroughMaxSize int64 `yaml:"write_through_max_size"`
 	// LegacyCoordination selects the cache's meta-key ordering mechanism
 	// (cache/coordinator.go). true (the DEFAULT when unset) runs the legacy
 	// timestamp-tombstone mechanism, byte-faithful to v1.20 — rolling upgrades
@@ -526,6 +535,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Cache.SizeThreshold == 0 {
 		cfg.Cache.SizeThreshold = DefaultCacheSizeThreshold
+	}
+	if cfg.Cache.WriteThroughMaxSize == 0 {
+		cfg.Cache.WriteThroughMaxSize = DefaultCacheWriteThroughMaxSize
 	}
 	// Block size must be positive (it is a divisor in block arithmetic, and the read-side
 	// whole-vs-block boundary); a zero or negative value — from YAML or a programmatic config —
@@ -765,6 +777,9 @@ func applyEnvOverrides(cfg *Config) {
 		// Override cache-warm-on-write from environment (accepts true/false/1/0)
 		if b, ok := envBool("TAG_CACHE_WARM_ON_WRITE"); ok {
 			cfg.Cache.WarmOnWrite = b
+		}
+		if n, ok := envInt64("TAG_CACHE_WRITE_THROUGH_MAX_SIZE"); ok && n != 0 {
+			cfg.Cache.WriteThroughMaxSize = n
 		}
 		// Override block-aligned caching from environment (accepts true/false/1/0).
 		if b, ok := envBool("TAG_CACHE_BLOCK_CACHING_ENABLED"); ok {

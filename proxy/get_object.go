@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
@@ -163,6 +164,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			cacheHit = false
 		}
 		if cacheHit {
+			if forceRevalidate && meta.ETag != "" && auth.IsPresignedRequest(r) {
+				return s.revalidatePresignedAndServe(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
+			}
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			// For range requests, the Range header is included in the conditional GET
 			// so upstream returns 304 (serve range from cache) or 206 (stream range to client).
@@ -280,6 +284,20 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	if rangeHeader != "" {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range request cache miss - forwarding with background cache")
 		return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, xCache)
+	}
+
+	// Each freshness request must reach origin under its own signed capability.
+	// Joining another caller's fetch could hide a revoked credential or overwrite.
+	if auth.IsPresignedRequest(r) && forceRevalidate {
+		broadcaster := broadcast.NewBroadcaster(s.config.Broadcast.ChannelBuffer)
+		s.activeIndependentBroadcasts.Add(1)
+		s.setActiveBroadcasts()
+		defer func() {
+			s.activeIndependentBroadcasts.Add(-1)
+			s.setActiveBroadcasts()
+		}()
+		metrics.RecordBroadcastFetch()
+		return s.fetchAndBroadcast(ctx, w, r, bucket, key, accessKey, secretKey, broadcaster, start, xCache)
 	}
 
 	// Full object request: use broadcast manager for streaming coalescing

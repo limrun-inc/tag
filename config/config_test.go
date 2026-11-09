@@ -372,6 +372,37 @@ func TestLoad_WarmOnWrite(t *testing.T) {
 	}
 }
 
+func TestLoad_WriteThroughMaxSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	for _, tc := range []struct {
+		name, yaml, env string
+		want            int64
+	}{
+		{"default", "", "", 256 * 1024 * 1024},
+		{"yaml", "  write_through_max_size: 67108864\n", "", 67108864},
+		{"env", "  write_through_max_size: 67108864\n", "1073741824", 1073741824},
+		{"disabled", "", "-1", -1},
+		{"zero retains default", "", "0", 256 * 1024 * 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_WRITE_THROUGH_MAX_SIZE", tc.env)
+			if err := os.WriteFile(path, []byte("cache:\n  block_size: 1048576\n"+tc.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Cache.WriteThroughMaxSize != tc.want {
+				t.Fatalf("got %d, want %d", cfg.Cache.WriteThroughMaxSize, tc.want)
+			}
+			if cfg.Cache.BlockSize != 1048576 {
+				t.Fatal("write-through limit changed the read-side block size")
+			}
+		})
+	}
+}
+
 func TestLoad_StorageTuningDefaults(t *testing.T) {
 	content := `
 cache:

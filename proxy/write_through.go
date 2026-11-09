@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
+	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 )
 
@@ -99,35 +101,49 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		// not populate the cache at all.
 		s.config.Cache.WarmOnWrite &&
 		s.cache.IsEnabled() &&
-		// Not gated on a configured populate budget: acquireCacheSlot/releaseCacheSlot treat a
-		// nil budget as unlimited (count-semaphore only), exactly as warm-on-write does, so the
-		// tee must stay available when the byte budget is explicitly disabled — otherwise every
-		// eligible PUT silently regresses to the read-back warm.
 		// Anonymous writes fall back to warm-on-write, whose unsigned probe learns whether
 		// the object is public-read before caching it; the tee can't make that inference.
 		!hasNoAuthCredentials(r) &&
 		size > 0 &&
-		// The tee buffers the whole object in memory, so it applies only to sub-block objects
-		// (size < BlockSize) — small and memory-safe. Objects at or above BlockSize fall back to
-		// warm-on-write's streaming read-back instead (no in-memory buffering): a block-eligible
-		// object is block-split from that read-back, a non-block-eligible one (e.g. block caching
-		// off) is whole-cached. IsCacheable(SizeThreshold) still applies after the HEAD.
-		size < s.config.Cache.BlockSize &&
-		// Never buffer more than we'd ever cache: with a nil populate budget the tee is not
-		// budget-bounded, so a misconfigured BlockSize > SizeThreshold could otherwise let it
-		// buffer an object larger than the cacheability ceiling. Bounds the in-memory buffer
-		// to SizeThreshold (a no-op in any config where BlockSize <= SizeThreshold).
+		// Write-through admission is independent of block representation. Keep large
+		// in-memory tees disabled when the byte budget is explicitly disabled; the
+		// legacy sub-MiB fast path remains available in count-only configurations.
+		size <= s.config.Cache.WriteThroughMaxSize &&
+		(size < config.DefaultCacheBlockSize || s.populateBudget != nil) &&
+		// Never retain an object larger than the cacheability ceiling.
 		size <= s.config.Cache.SizeThreshold
 
 	if !eligible {
 		return nil, false, s.forwarder.Forward(ctx, w, r)
+	}
+	// Reject invalid credentials before allocating a potentially large body.
+	// The forwarding path still owns the authoritative HTTP error response.
+	if size >= config.DefaultCacheBlockSize {
+		result, _, _, authErr := s.forwarder.ValidateAndGetCredentials(r)
+		if authErr != nil || result != AuthValidated {
+			return nil, false, s.forwarder.Forward(ctx, w, r)
+		}
 	}
 
 	// Non-blocking admission: the tee runs on the client PUT path, so it must never block
 	// the write waiting for budget. priorityReadMiss acquires the count slot and byte budget
 	// without blocking; on denial we fall back to a plain forward + (async, blocking)
 	// warm-on-write, so the object still gets cached under budget pressure.
-	if !s.acquireCacheSlot(ctx, size, priorityReadMiss) {
+	// Account for both the retained PUT body and the direct writer's buffers.
+	// Block mode additionally needs one scratch block. Reserve everything before
+	// teeing, so the detached commit never waits for memory while holding the body.
+	weight := s.backgroundPopulateWeight()
+	if s.isBlockEligibleSize(size) {
+		if s.config.Cache.BlockSize > math.MaxInt64-weight {
+			return nil, false, s.forwarder.Forward(ctx, w, r)
+		}
+		weight += s.config.Cache.BlockSize
+	}
+	if size > math.MaxInt64-weight || size > int64(math.MaxInt) {
+		return nil, false, s.forwarder.Forward(ctx, w, r)
+	}
+	weight += size
+	if !s.acquireCacheSlot(ctx, weight, priorityReadMiss) {
 		return nil, false, s.forwarder.Forward(ctx, w, r)
 	}
 
@@ -135,7 +151,7 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 	// write hot path.
 	ts := &teeState{
 		buf:    &cappedBuffer{buf: make([]byte, 0, int(size)), cap: int(size)},
-		weight: size,
+		weight: weight,
 	}
 	status, headers, accessKey, secretKey, err := tf.ForwardTeeingBody(ctx, w, r, ts.buf)
 	ts.statusCode = status
@@ -240,8 +256,9 @@ func (s *Service) cacheTeedBodyFromHead(ctx context.Context, bucket, key, putETa
 	headCtx, cancel := context.WithTimeout(ctx, backgroundFetchTimeout)
 	defer cancel()
 
-	// Empty etag/lastModified => a plain (non-conditional) HEAD.
-	resp, err := s.forwarder.DoConditionalHeadRequest(headCtx, bucket, key, accessKey, secretKey, "", 0)
+	// An unconditional HEAD requests authoritative checksum metadata too, so the
+	// first checksum-bearing GET can use these bytes without another body fetch.
+	resp, checksumsRequested, err := s.cacheFillRequest(headCtx, http.MethodHead, bucket, key, accessKey, secretKey)
 	if err != nil || resp == nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through tee HEAD failed")
 		return teeFallbackWarm
@@ -260,6 +277,7 @@ func (s *Service) cacheTeedBodyFromHead(ctx context.Context, bucket, key, putETa
 	}
 
 	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
+	meta.ChecksumsRequested = checksumsRequested
 	if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
 		// The authoritative HEAD says this object must not be cached (Cache-Control no-store/
 		// private, or over threshold). A warm would only re-download the full body to reject it
@@ -277,7 +295,13 @@ func (s *Service) cacheTeedBodyFromHead(ctx context.Context, bucket, key, putETa
 	defer cacheCancel()
 	// Put-if-absent: this tee follows the PUT's own invalidation; a racer that
 	// re-established the entry (a warm) caches the current version and wins.
-	wrote, err := s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
+	var wrote bool
+	if s.isBlockEligibleSize(meta.ContentLength) {
+		meta.BlockSize = s.config.Cache.BlockSize
+		wrote, err = s.putBlocksFromStream(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
+	} else {
+		wrote, err = s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
+	}
 	if errors.Is(err, cache.ErrPopulateShed) {
 		// The owner has already said not to store this body; a warm would only
 		// re-download it to be refused again.
