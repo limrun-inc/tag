@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/hex"
 	"math"
 	"net"
 	"net/http"
@@ -1456,7 +1457,7 @@ func ParseBucketKey(r *http.Request) (bucket, key string) {
 	return
 }
 
-// PresignedVirtualHostBucket recognizes the bucket hosts used by Tigris download URLs.
+// PresignedVirtualHostBucket recognizes bucket hosts used by S3 presigned URLs.
 // The handlers apply the same bucket-name validation as for path-style requests.
 func PresignedVirtualHostBucket(r *http.Request) (string, bool) {
 	if !auth.IsPresignedRequest(r) {
@@ -1473,6 +1474,15 @@ func PresignedVirtualHostBucket(r *http.Request) (string, bool) {
 	}
 	if i := strings.Index(host, ".s3."); i > 0 {
 		return host[:i], true
+	}
+	// R2's account endpoint is path-style; only a bucket prefix makes it virtual-hosted.
+	if prefix, ok := strings.CutSuffix(host, ".r2.cloudflarestorage.com"); ok {
+		if i := strings.LastIndexByte(prefix, '.'); i > 0 {
+			account := prefix[i+1:]
+			if _, err := hex.DecodeString(account); len(account) == 32 && err == nil {
+				return prefix[:i], true
+			}
+		}
 	}
 	return "", false
 }

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
-	"sync/atomic"
 )
 
 func signingPresign(t *testing.T, method, target string, body []byte, headers http.Header, at time.Time, expires string) *http.Request {
@@ -81,77 +81,148 @@ func verifyPresignedWithSDK(r *http.Request) error {
 }
 
 func TestSigningForwarderPresigned(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
-		for _, path := range []string{"forward", "capture", "credentials", "tee"} {
-			if path == "tee" && method != http.MethodPut {
-				continue
-			}
-			t.Run(method+"/"+path, func(t *testing.T) {
-				at := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
-				var upload []byte
-				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if err := verifyPresignedWithSDK(r); err != nil {
-						t.Error(err)
-						w.WriteHeader(403)
-						return
-					}
-					require.Empty(t, r.Header.Get("Authorization"))
-					require.Equal(t, at.Format(auth.TimeFormat), r.URL.Query().Get("X-Amz-Date"))
-					require.Equal(t, "600", r.URL.Query().Get("X-Amz-Expires"))
-					require.Equal(t, "/bucket/a?b+c% d/日本語", r.URL.Path)
-					require.Equal(t, "selected-version", r.URL.Query().Get("versionId"))
+	for _, host := range []string{"gateway.example", "bucket.0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com", "bucket.t3.tigrisfiles.io"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
+			for _, path := range []string{"forward", "capture", "credentials", "tee"} {
+				if path == "tee" && method != http.MethodPut {
+					continue
+				}
+				t.Run(host+"/"+method+"/"+path, func(t *testing.T) {
+					at := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+					var upload []byte
+					origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if err := verifyPresignedWithSDK(r); err != nil {
+							t.Error(err)
+							w.WriteHeader(403)
+							return
+						}
+						require.Empty(t, r.Header.Get("Authorization"))
+						require.Equal(t, at.Format(auth.TimeFormat), r.URL.Query().Get("X-Amz-Date"))
+						require.Equal(t, "600", r.URL.Query().Get("X-Amz-Expires"))
+						require.Equal(t, "/bucket/a?b+c% d/日本語", r.URL.Path)
+						require.Equal(t, "selected-version", r.URL.Query().Get("versionId"))
+						if method == http.MethodPut {
+							upload, _ = io.ReadAll(r.Body)
+							require.Equal(t, "signed-checksum", r.Header.Get("X-Amz-Checksum-Sha256"))
+						}
+						w.Header().Set("ETag", `"object"`)
+						if method == http.MethodGet {
+							io.WriteString(w, "download")
+						}
+					}))
+					defer origin.Close()
+					creds := auth.NewCredentialStore()
+					creds.AddCredential(compatAccess, compatSecret)
+					f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil).(*signingForwarder)
+					var body []byte
+					headers := make(http.Header)
 					if method == http.MethodPut {
-						upload, _ = io.ReadAll(r.Body)
-						require.Equal(t, "signed-checksum", r.Header.Get("X-Amz-Checksum-Sha256"))
+						body = []byte("uploaded body")
+						headers.Set("X-Amz-Checksum-Sha256", "signed-checksum")
 					}
-					w.Header().Set("ETag", `"object"`)
-					if method == http.MethodGet {
-						io.WriteString(w, "download")
+					u := &url.URL{Scheme: "http", Host: host, Path: "/bucket/a?b+c% d/日本語", RawQuery: "versionId=selected-version"}
+					if host != "gateway.example" {
+						u.Path = strings.TrimPrefix(u.Path, "/bucket")
 					}
+					r := signingPresign(t, method, u.String(), body, headers, at, "600")
+					original := r.URL.String()
+					require.Empty(t, r.Header.Get("X-Amz-Content-Sha256"))
+					result, access, secret, err := f.ValidateAndGetCredentials(r)
+					require.NoError(t, err)
+					require.Equal(t, AuthValidated, result)
+					w := httptest.NewRecorder()
+					switch path {
+					case "forward":
+						err = f.Forward(t.Context(), w, r)
+					case "capture":
+						_, err = f.ForwardWithCapture(t.Context(), w, r)
+					case "credentials":
+						var resp *http.Response
+						resp, err = f.DoRequestWithCreds(t.Context(), r, access, secret)
+						if err == nil {
+							require.Equal(t, 200, resp.StatusCode)
+							resp.Body.Close()
+						}
+					case "tee":
+						var tee bytes.Buffer
+						var status int
+						status, _, _, _, err = f.ForwardTeeingBody(t.Context(), w, r, &tee)
+						require.Equal(t, 200, status)
+						require.Equal(t, body, tee.Bytes())
+					}
+					require.NoError(t, err)
+					require.Equal(t, 200, w.Code)
+					require.Equal(t, original, r.URL.String())
+					require.Empty(t, r.Header.Get("X-Amz-Content-Sha256"))
+					if method == http.MethodPut {
+						require.Equal(t, body, upload)
+					}
+				})
+			}
+		}
+	}
+}
+
+// Asset URLs and the build-cache SDK share the environment credential in signing mode.
+func TestSigningSharedKeyServesAssetsAndBuildCache(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", compatAccess)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", compatSecret)
+	creds := auth.NewCredentialStore()
+	require.NoError(t, creds.LoadFromEnv())
+	for _, bucket := range []string{"asset-storage-production", "limbuild-build-cache-production"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
+			t.Run(bucket+"/"+method, func(t *testing.T) {
+				var calls atomic.Int32
+				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					require.Equal(t, http.MethodPut, r.Method)
+					require.Equal(t, "/"+bucket+"/object", r.URL.Path)
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					require.Equal(t, "data", string(body))
+					w.WriteHeader(http.StatusOK)
 				}))
 				defer origin.Close()
-				creds := auth.NewCredentialStore()
-				creds.AddCredential(compatAccess, compatSecret)
-				f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil).(*signingForwarder)
+				f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil)
+				svc, store := newTestService(f, true)
+				defer svc.Stop()
+				meta := &cache.CachedObjectMeta{Bucket: bucket, Key: "object", ETag: `"version"`, ContentLength: 4, StatusCode: http.StatusOK}
+				require.NoError(t, store.PutWithMeta(t.Context(), bucket, "object", meta, []byte("data"), 60))
 				var body []byte
-				headers := make(http.Header)
 				if method == http.MethodPut {
-					body = []byte("uploaded body")
-					headers.Set("X-Amz-Checksum-Sha256", "signed-checksum")
+					body = []byte("data")
 				}
-				u := &url.URL{Scheme: "http", Host: "gateway.example", Path: "/bucket/a?b+c% d/日本語", RawQuery: "versionId=selected-version"}
-				r := signingPresign(t, method, u.String(), body, headers, at, "600")
-				original := r.URL.String()
-				require.Empty(t, r.Header.Get("X-Amz-Content-Sha256"))
-				result, access, secret, err := f.ValidateAndGetCredentials(r)
-				require.NoError(t, err)
-				require.Equal(t, AuthValidated, result)
+				var r *http.Request
+				if bucket == "asset-storage-production" {
+					target := "http://" + bucket + ".0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/object"
+					r = signingPresign(t, method, target, body, nil, time.Now(), "300")
+				} else {
+					var err error
+					r, err = http.NewRequest(method, "http://gateway.example/"+bucket+"/object", bytes.NewReader(body))
+					require.NoError(t, err)
+					r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+					require.NoError(t, v4.NewSigner().SignHTTP(t.Context(), aws.Credentials{AccessKeyID: compatAccess, SecretAccessKey: compatSecret}, r, "UNSIGNED-PAYLOAD", "s3", compatRegion, time.Now()))
+				}
 				w := httptest.NewRecorder()
-				switch path {
-				case "forward":
-					err = f.Forward(t.Context(), w, r)
-				case "capture":
-					_, err = f.ForwardWithCapture(t.Context(), w, r)
-				case "credentials":
-					var resp *http.Response
-					resp, err = f.DoRequestWithCreds(t.Context(), r, access, secret)
-					if err == nil {
-						require.Equal(t, 200, resp.StatusCode)
-						resp.Body.Close()
-					}
-				case "tee":
-					var tee bytes.Buffer
-					var status int
-					status, _, _, _, err = f.ForwardTeeingBody(t.Context(), w, r, &tee)
-					require.Equal(t, 200, status)
-					require.Equal(t, body, tee.Bytes())
+				var err error
+				switch method {
+				case http.MethodGet:
+					err = svc.HandleGetObject(w, r)
+				case http.MethodHead:
+					err = svc.HandleHeadObject(w, r)
+				case http.MethodPut:
+					err = svc.HandlePutObject(w, r)
 				}
 				require.NoError(t, err)
-				require.Equal(t, 200, w.Code)
-				require.Equal(t, original, r.URL.String())
-				require.Empty(t, r.Header.Get("X-Amz-Content-Sha256"))
+				require.Equal(t, http.StatusOK, w.Code)
 				if method == http.MethodPut {
-					require.Equal(t, body, upload)
+					require.EqualValues(t, 1, calls.Load())
+				} else {
+					require.Equal(t, XCacheHit, w.Header().Get(XCacheHeader))
+					require.Zero(t, calls.Load())
+					if method == http.MethodGet {
+						require.Equal(t, "data", w.Body.String())
+					}
 				}
 			})
 		}
