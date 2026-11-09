@@ -8,9 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,7 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
-	"sync/atomic"
 )
 
 func signingPresign(t *testing.T, method, target string, body []byte, headers http.Header, at time.Time, expires string) *http.Request {
@@ -114,7 +112,7 @@ func TestSigningForwarderPresigned(t *testing.T) {
 					}))
 					defer origin.Close()
 					creds := auth.NewCredentialStore()
-					loadScopedPresigner(t, creds)
+					creds.AddCredential(compatAccess, compatSecret)
 					f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil).(*signingForwarder)
 					var body []byte
 					headers := make(http.Header)
@@ -165,61 +163,67 @@ func TestSigningForwarderPresigned(t *testing.T) {
 	}
 }
 
-// Keep the gateway key different from the asset presigner, as in production.
-func loadScopedPresigner(t *testing.T, creds *auth.CredentialStore) {
-	t.Helper()
-	t.Setenv("AWS_ACCESS_KEY_ID", "gateway")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "gateway-secret")
-	path := filepath.Join(t.TempDir(), "credentials.json")
-	t.Setenv("TAG_SIGNING_CREDENTIALS_FILE", path)
-	require.NoError(t, os.WriteFile(path, []byte(fmt.Sprintf(`[{"access_key_id":%q,"secret_access_key":%q,"buckets":["bucket"]}]`, compatAccess, compatSecret)), 0600))
+// Asset URLs and the build-cache SDK share the environment credential in signing mode.
+func TestSigningSharedKeyServesAssetsAndBuildCache(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", compatAccess)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", compatSecret)
+	creds := auth.NewCredentialStore()
 	require.NoError(t, creds.LoadFromEnv())
-}
-
-func TestSigningScopedPresignerCannotReadAnotherBucketsCache(t *testing.T) {
-	for _, hostStyle := range []bool{false, true} {
+	for _, bucket := range []string{"asset-storage-production", "limbuild-build-cache-production"} {
 		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
-			t.Run(fmt.Sprintf("virtualHost=%t/%s", hostStyle, method), func(t *testing.T) {
+			t.Run(bucket+"/"+method, func(t *testing.T) {
 				var calls atomic.Int32
-				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(403) }))
+				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					require.Equal(t, http.MethodPut, r.Method)
+					require.Equal(t, "/"+bucket+"/object", r.URL.Path)
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					require.Equal(t, "data", string(body))
+					w.WriteHeader(http.StatusOK)
+				}))
 				defer origin.Close()
-				creds := auth.NewCredentialStore()
-				loadScopedPresigner(t, creds)
 				f := NewForwarder(creds, origin.URL, compatRegion, 1, nil, nil)
 				svc, store := newTestService(f, true)
 				defer svc.Stop()
-				for _, bucket := range []string{"bucket", "private-build-cache"} {
-					meta := &cache.CachedObjectMeta{Bucket: bucket, Key: "object", ETag: `"version"`, ContentLength: 4, StatusCode: 200}
-					require.NoError(t, store.PutWithMeta(t.Context(), bucket, "object", meta, []byte("data"), 60))
-					target := "http://gateway.example/" + bucket + "/object"
-					if hostStyle {
-						target = "http://" + bucket + ".0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/object"
-					}
-					r := signingPresign(t, method, target, nil, nil, time.Now(), "300")
-					w := httptest.NewRecorder()
+				meta := &cache.CachedObjectMeta{Bucket: bucket, Key: "object", ETag: `"version"`, ContentLength: 4, StatusCode: http.StatusOK}
+				require.NoError(t, store.PutWithMeta(t.Context(), bucket, "object", meta, []byte("data"), 60))
+				var body []byte
+				if method == http.MethodPut {
+					body = []byte("data")
+				}
+				var r *http.Request
+				if bucket == "asset-storage-production" {
+					target := "http://" + bucket + ".0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/object"
+					r = signingPresign(t, method, target, body, nil, time.Now(), "300")
+				} else {
 					var err error
-					switch method {
-					case http.MethodGet:
-						err = svc.HandleGetObject(w, r)
-					case http.MethodHead:
-						err = svc.HandleHeadObject(w, r)
-					case http.MethodPut:
-						_, _, _, err = f.ValidateAndGetCredentials(r)
-					}
-					if bucket == "bucket" {
-						require.NoError(t, err)
-						if method != http.MethodPut {
-							require.Equal(t, XCacheHit, w.Header().Get(XCacheHeader))
-						}
-					} else {
-						require.ErrorIs(t, err, auth.ErrBucketAccessDenied)
-						var authErr *AuthError
-						require.ErrorAs(t, err, &authErr)
-						require.Equal(t, ErrCodeAccessDenied, authErr.Code)
-						require.Empty(t, w.Body.String())
+					r, err = http.NewRequest(method, "http://gateway.example/"+bucket+"/object", bytes.NewReader(body))
+					require.NoError(t, err)
+					r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+					require.NoError(t, v4.NewSigner().SignHTTP(t.Context(), aws.Credentials{AccessKeyID: compatAccess, SecretAccessKey: compatSecret}, r, "UNSIGNED-PAYLOAD", "s3", compatRegion, time.Now()))
+				}
+				w := httptest.NewRecorder()
+				var err error
+				switch method {
+				case http.MethodGet:
+					err = svc.HandleGetObject(w, r)
+				case http.MethodHead:
+					err = svc.HandleHeadObject(w, r)
+				case http.MethodPut:
+					err = svc.HandlePutObject(w, r)
+				}
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, w.Code)
+				if method == http.MethodPut {
+					require.EqualValues(t, 1, calls.Load())
+				} else {
+					require.Equal(t, XCacheHit, w.Header().Get(XCacheHeader))
+					require.Zero(t, calls.Load())
+					if method == http.MethodGet {
+						require.Equal(t, "data", w.Body.String())
 					}
 				}
-				require.Zero(t, calls.Load(), "bucket scope must be checked before cache and upstream")
 			})
 		}
 	}

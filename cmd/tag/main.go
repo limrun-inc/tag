@@ -203,9 +203,8 @@ func main() {
 
 	// Load credentials from environment
 	if err := credStore.LoadFromEnv(); err != nil {
-		log.Fatal().Err(err).Msg("Failed to load signing credentials")
+		log.Warn().Err(err).Msg("Failed to load credentials from environment")
 	}
-	log.Info().Int("count", credStore.Count()).Msg("Loaded signing credentials")
 
 	// Initialize the proxy signer for transparent forwarding (proxy headers,
 	// TAG's own creds). Whether tiered forwards transparently or by signing
