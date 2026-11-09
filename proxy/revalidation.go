@@ -77,7 +77,7 @@ func (s *Service) revalidateAndServe(
 		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, meta.ETag, revalErr, start)
 	case http.StatusOK:
 		// Full-object response (no range or upstream ignored range)
-		return s.handleRevalidation200(ctx, w, bucket, key, meta.ETag, resp, start)
+		return s.handleRevalidation200(ctx, w, r, bucket, key, meta.ETag, resp, start)
 	case http.StatusPartialContent:
 		// Range response — object changed, upstream returned only the requested range
 		return s.handleRevalidation206Range(ctx, w, r, bucket, key, accessKey, secretKey, meta.ETag, resp, start)
@@ -206,6 +206,7 @@ func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) (ui
 func (s *Service) handleRevalidation200(
 	ctx context.Context,
 	w http.ResponseWriter,
+	r *http.Request,
 	bucket, key, staleETag string,
 	resp *http.Response,
 	start time.Time,
@@ -215,6 +216,7 @@ func (s *Service) handleRevalidation200(
 
 	// Build new metadata from upstream response
 	newMeta := cache.MetaFromHTTPHeaders(bucket, key, resp.StatusCode, resp.Header)
+	newMeta.ChecksumsRequested = r.URL.Query().Get("X-Amz-Checksum-Mode") == "ENABLED"
 
 	// Check if the new object should be cached
 	shouldCache := newMeta.IsCacheable(s.config.Cache.SizeThreshold) &&
@@ -701,8 +703,15 @@ func (s *Service) revalidateAndServeHead(
 // shouldForceRevalidate checks if the client is requesting cache revalidation.
 // Per RFC 7234, Cache-Control: no-cache means "must revalidate with origin before serving".
 func shouldForceRevalidate(r *http.Request) bool {
-	cc := r.Header.Get("Cache-Control")
-	return strings.Contains(cc, "no-cache") || strings.Contains(cc, "max-age=0")
+	for _, value := range r.Header.Values("Cache-Control") {
+		for _, directive := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(directive)) {
+			case "no-cache", "max-age=0":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // shouldBypassCache checks if the client is requesting full cache bypass.

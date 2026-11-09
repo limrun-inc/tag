@@ -1,17 +1,20 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 )
@@ -67,64 +70,276 @@ func compatLearnedForwarder(t *testing.T, endpoint string, r *http.Request, buck
 	return f
 }
 
-func TestPresignedCacheControlUsesOriginEvenWithWarmCache(t *testing.T) {
-	for _, method := range []string{"GET", "HEAD"} {
-		for _, status := range []int{200, 403, 404, 503} {
-			t.Run(fmt.Sprintf("%s/%d", method, status), func(t *testing.T) {
-				var calls atomic.Int32
-				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func presignedRevalidationRequest(t *testing.T, method string) *http.Request {
+	t.Helper()
+	r := compatPresignedGET(t, "https://asset-storage-production.s3.example.test/org_example/app.apk")
+	if method == http.MethodHead {
+		r, _ = http.NewRequest(method, r.URL.Scheme+"://"+r.Host+r.URL.Path+"?X-Amz-Expires=900", nil)
+		r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+		signed, _, err := v4.NewSigner().PresignHTTP(t.Context(), aws.Credentials{AccessKeyID: compatAccess, SecretAccessKey: compatSecret}, r, "UNSIGNED-PAYLOAD", "s3", compatRegion, time.Now().UTC())
+		require.NoError(t, err)
+		r.URL, _ = url.Parse(signed)
+	}
+	r.Header.Set("Cache-Control", "no-cache")
+	return r
+}
+
+func presignedRevalidationForwarder(t *testing.T, mode, endpoint string, r *http.Request) RequestForwarder {
+	t.Helper()
+	if mode == "transparent" {
+		return compatLearnedForwarder(t, endpoint, r, "asset-storage-production")
+	}
+	creds := auth.NewCredentialStore()
+	creds.AddCredential(compatAccess, compatSecret)
+	return NewForwarder(creds, endpoint, compatRegion, 1, nil, nil)
+}
+
+func TestPresignedCacheControlRevalidatesWarmCache(t *testing.T) {
+	for _, mode := range []string{"signing", "transparent"} {
+		for _, method := range []string{"GET", "HEAD"} {
+			for _, status := range []int{200, 304, 403, 404, 410, 500, 503} {
+				t.Run(fmt.Sprintf("%s/%s/%d", mode, method, status), func(t *testing.T) {
+					var calls atomic.Int32
+					original := presignedRevalidationRequest(t, method)
+					origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						calls.Add(1)
+						require.NoError(t, verifyPresignedWithSDK(r))
+						require.Equal(t, original.URL.Query().Get("X-Amz-Date"), r.URL.Query().Get("X-Amz-Date"))
+						require.Equal(t, original.URL.Query().Get("X-Amz-Expires"), r.URL.Query().Get("X-Amz-Expires"))
+						require.Equal(t, original.URL.Query().Get("X-Amz-Checksum-Mode"), r.URL.Query().Get("X-Amz-Checksum-Mode"))
+						require.Equal(t, `"old"`, r.Header.Get("If-None-Match"))
+						require.Equal(t, "no-cache", r.Header.Get("Cache-Control"))
+						require.Empty(t, r.Header.Get("If-Modified-Since"))
+						require.Empty(t, r.Header.Get("Authorization"))
+						if status == 304 {
+							w.Header().Set("ETag", `"old"`)
+						} else {
+							w.Header().Set("ETag", `"fresh"`)
+							w.Header().Set("Content-Length", "15")
+						}
+						w.WriteHeader(status)
+						if r.Method != "HEAD" && status != 304 {
+							io.WriteString(w, "origin response")
+						}
+					}))
+					defer origin.Close()
+					svc, store := newTestService(presignedRevalidationForwarder(t, mode, origin.URL, original), true)
+					defer svc.Stop()
+					meta := &cache.CachedObjectMeta{Bucket: "asset-storage-production", Key: "org_example/app.apk", ETag: `"old"`, ContentLength: 10, StatusCode: 200, ChecksumsRequested: true}
+					require.NoError(t, store.PutWithMeta(t.Context(), meta.Bucket, meta.Key, meta, []byte("cached app"), 60))
+					w := httptest.NewRecorder()
+					if method == "GET" {
+						require.NoError(t, svc.HandleGetObject(w, original))
+					} else {
+						require.NoError(t, svc.HandleHeadObject(w, original))
+					}
+					require.EqualValues(t, 1, calls.Load())
+					wantStatus, wantCache := status, XCacheRevalidated
+					if status == 304 {
+						wantStatus, wantCache = 200, XCacheHit
+					}
+					require.Equal(t, wantStatus, w.Code)
+					require.Equal(t, wantCache, w.Header().Get(XCacheHeader))
+					if method == "GET" {
+						expected := "origin response"
+						if status == 304 {
+							expected = "cached app"
+						}
+						require.Equal(t, expected, w.Body.String())
+					} else {
+						require.Empty(t, w.Body.String())
+					}
+					current, found, err := store.GetMeta(t.Context(), meta.Bucket, meta.Key)
+					require.NoError(t, err)
+					switch {
+					case status == 404 || status == 410 || status == 200 && method == "HEAD":
+						require.False(t, found)
+					case status == 200:
+						require.True(t, found)
+						require.Equal(t, `"fresh"`, current.ETag)
+						require.True(t, current.ChecksumsRequested)
+					default:
+						require.True(t, found)
+						require.Equal(t, meta.ETag, current.ETag)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestPresignedCacheControlColdWarmAndOverwrite(t *testing.T) {
+	for _, mode := range []string{"signing", "transparent"} {
+		for _, blocks := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/blocks=%t", mode, blocks), func(t *testing.T) {
+				var version atomic.Int32
+				version.Store(1)
+				var calls, bodies atomic.Int32
+				r := presignedRevalidationRequest(t, "GET")
+				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 					calls.Add(1)
-					if r.Host != "asset-storage-production.s3.example.test" || r.URL.Path != "/org_example/app.apk" || r.Header.Get("If-None-Match") != "" || r.Header.Get("Cache-Control") != "no-cache" {
-						t.Errorf("request changed: host=%s path=%s headers=%v", r.Host, r.URL.Path, r.Header)
+					require.NoError(t, verifyPresignedWithSDK(req))
+					etag := fmt.Sprintf(`"v%d"`, version.Load())
+					w.Header().Set("ETag", etag)
+					if req.Header.Get("If-None-Match") == etag {
+						w.WriteHeader(304)
+						return
 					}
-					w.Header().Set("ETag", `"fresh"`)
-					w.WriteHeader(status)
-					if r.Method != "HEAD" {
-						io.WriteString(w, "origin response")
-					}
+					bodies.Add(1)
+					body := fmt.Sprintf("app archive version %d", version.Load())
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+					io.WriteString(w, body)
 				}))
 				defer origin.Close()
-				r := compatPresignedGET(t, "https://asset-storage-production.s3.example.test/org_example/app.apk")
-				if method == "HEAD" {
-					// HEAD signatures require a content hash in upstream local auth.
-					r, _ = http.NewRequest(method, r.URL.Scheme+"://"+r.Host+r.URL.Path+"?X-Amz-Expires=900", nil)
-					r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
-					signed, _, err := v4.NewSigner().PresignHTTP(t.Context(), aws.Credentials{AccessKeyID: compatAccess, SecretAccessKey: compatSecret}, r, "UNSIGNED-PAYLOAD", "s3", compatRegion, time.Now().UTC())
-					if err != nil {
-						t.Fatal(err)
-					}
-					r.URL, _ = url.Parse(signed)
-					r.Header.Set("Cache-Control", "no-cache")
-				}
-				f := compatLearnedForwarder(t, origin.URL, r, "asset-storage-production")
-				svc, store := newTestService(f, true)
+				svc, store := newTestService(presignedRevalidationForwarder(t, mode, origin.URL, r), true)
 				defer svc.Stop()
-				meta := &cache.CachedObjectMeta{Bucket: "asset-storage-production", Key: "org_example/app.apk", ETag: `"old"`, ContentLength: 10, StatusCode: 200}
-				if err := store.PutWithMeta(t.Context(), meta.Bucket, meta.Key, meta, []byte("cached app"), 60); err != nil {
-					t.Fatal(err)
+				svc.config.Cache.SetBlockCachingEnabled(blocks)
+				svc.config.Cache.BlockSize = 4
+				for _, step := range []struct {
+					version     int32
+					cache       string
+					rangeHeader string
+				}{{1, XCacheMiss, ""}, {1, XCacheHit, ""}, {1, XCacheHit, "bytes=4-10"}, {2, XCacheRevalidated, ""}, {2, XCacheHit, ""}} {
+					version.Store(step.version)
+					req := r.Clone(t.Context())
+					req.Header.Set("Range", step.rangeHeader)
+					w := httptest.NewRecorder()
+					require.NoError(t, svc.HandleGetObject(w, req))
+					expected := fmt.Sprintf("app archive version %d", step.version)
+					status := 200
+					if step.rangeHeader != "" {
+						expected, status = expected[4:11], 206
+					}
+					require.Equal(t, status, w.Code)
+					require.Equal(t, expected, w.Body.String())
+					require.Equal(t, step.cache, w.Header().Get(XCacheHeader))
+					require.Eventually(t, func() bool {
+						meta, found, err := store.GetMeta(t.Context(), "asset-storage-production", "org_example/app.apk")
+						return err == nil && found && meta.ETag == fmt.Sprintf(`"v%d"`, step.version) && meta.ChecksumsRequested && (meta.BlockSize > 0) == blocks
+					}, time.Second, time.Millisecond)
 				}
-				w := httptest.NewRecorder()
-				var err error
-				if method == "HEAD" {
-					err = svc.HandleHeadObject(w, r)
-				} else {
-					err = svc.HandleGetObject(w, r)
-				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				if w.Code != status || w.Header().Get(XCacheHeader) != XCacheBypass || calls.Load() != 1 {
-					t.Fatalf("status=%d cache=%s calls=%d", w.Code, w.Header().Get(XCacheHeader), calls.Load())
-				}
-				if method == "GET" && w.Body.String() != "origin response" {
-					t.Fatalf("served stale app: %q", w.Body.String())
-				}
-				current, found, err := store.GetMeta(t.Context(), meta.Bucket, meta.Key)
-				if err != nil || !found || current.ETag != meta.ETag {
-					t.Fatalf("bypass replaced cached entry: %+v, found=%v err=%v", current, found, err)
-				}
+				require.EqualValues(t, 5, calls.Load(), "every request must check origin")
+				require.EqualValues(t, 2, bodies.Load(), "only the cold and changed objects transfer an upstream body")
 			})
 		}
+	}
+}
+
+func TestPresignedCacheControlTransportFailureNeverServesStale(t *testing.T) {
+	for _, method := range []string{"GET", "HEAD"} {
+		t.Run(method, func(t *testing.T) {
+			failure := fmt.Errorf("origin unavailable")
+			f := &mockForwarder{doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+				return nil, failure
+			}}
+			svc, store := newTestService(f, true)
+			defer svc.Stop()
+			r := presignedRevalidationRequest(t, method)
+			meta := &cache.CachedObjectMeta{Bucket: "asset-storage-production", Key: "org_example/app.apk", ETag: `"old"`, ContentLength: 10, StatusCode: 200, ChecksumsRequested: true}
+			require.NoError(t, store.PutWithMeta(t.Context(), meta.Bucket, meta.Key, meta, []byte("cached app"), 60))
+			w := httptest.NewRecorder()
+			var err error
+			if method == "GET" {
+				err = svc.HandleGetObject(w, r)
+			} else {
+				err = svc.HandleHeadObject(w, r)
+			}
+			require.ErrorIs(t, err, failure)
+			require.Empty(t, w.Body.String())
+			require.Empty(t, w.Header().Get(XCacheHeader))
+		})
+	}
+}
+
+func TestPresignedCacheControlDoesNotJoinAnotherCapability(t *testing.T) {
+	r := presignedRevalidationRequest(t, "GET")
+	var calls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(403)
+		io.WriteString(w, "revoked")
+	}))
+	defer origin.Close()
+	svc, _ := newTestService(presignedRevalidationForwarder(t, "signing", origin.URL, r), true)
+	defer svc.Stop()
+	key := makeBroadcastKey("asset-storage-production", "org_example/app.apk", "") + "\x00checksum"
+	// A different request already owns this object's fetch. Freshness requests
+	// must still reach origin and observe their own authorization result.
+	_, first := svc.broadcastManager.GetOrCreate(key)
+	require.True(t, first)
+	defer svc.broadcastManager.Remove(key)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	w := httptest.NewRecorder()
+	require.NoError(t, svc.HandleGetObject(w, r.Clone(ctx)))
+	require.Equal(t, 403, w.Code)
+	require.Equal(t, "revoked", w.Body.String())
+	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestPresignedCacheControlEligibility(t *testing.T) {
+	for _, tc := range []struct {
+		values             []string
+		bypass, revalidate bool
+	}{
+		{[]string{"no-cache"}, false, true},
+		{[]string{" MAX-AGE=0 "}, false, true},
+		{[]string{"No-Cache", "max-age=0"}, false, true},
+		{[]string{"no-cache, no-store"}, true, true},
+		{[]string{"no-cache", "NO-STORE"}, true, true},
+		{[]string{"private"}, true, false},
+		{[]string{"max-age=0, private"}, true, true},
+		{[]string{"max-age=0, unknown"}, true, true},
+		{[]string{"x-no-cache"}, true, false},
+	} {
+		t.Run(strings.Join(tc.values, "/"), func(t *testing.T) {
+			r := presignedRevalidationRequest(t, "GET")
+			r.Header["Cache-Control"] = tc.values
+			require.Equal(t, tc.bypass, bypassPresignedCache(r))
+			require.Equal(t, tc.revalidate, shouldForceRevalidate(r))
+		})
+	}
+}
+
+func TestPresignedCacheControl304CannotReuseEntry(t *testing.T) {
+	for _, reason := range []string{"body evicted", "no-store", "different etag"} {
+		t.Run(reason, func(t *testing.T) {
+			r := presignedRevalidationRequest(t, "GET")
+			var calls atomic.Int32
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				calls.Add(1)
+				require.NoError(t, verifyPresignedWithSDK(req))
+				if req.Header.Get("If-None-Match") != "" {
+					switch reason {
+					case "no-store":
+						w.Header().Set("Cache-Control", "NO-STORE")
+					case "different etag":
+						w.Header().Set("ETag", `"different"`)
+					}
+					w.WriteHeader(304)
+					return
+				}
+				w.Header().Set("Content-Length", "5")
+				io.WriteString(w, "fresh")
+			}))
+			defer origin.Close()
+			svc, store := newTestService(presignedRevalidationForwarder(t, "signing", origin.URL, r), true)
+			defer svc.Stop()
+			meta := &cache.CachedObjectMeta{Bucket: "asset-storage-production", Key: "org_example/app.apk", ETag: `"old"`, ContentLength: 10, StatusCode: 200, ChecksumsRequested: true}
+			require.NoError(t, store.PutWithMeta(t.Context(), meta.Bucket, meta.Key, meta, []byte("cached app"), 60))
+			if reason == "body evicted" {
+				require.NoError(t, store.DeleteBody(t.Context(), meta.Bucket, meta.Key, meta.ETag))
+			}
+			w := httptest.NewRecorder()
+			require.NoError(t, svc.HandleGetObject(w, r))
+			require.Equal(t, 200, w.Code)
+			require.Equal(t, "fresh", w.Body.String())
+			require.Equal(t, XCacheMiss, w.Header().Get(XCacheHeader))
+			require.EqualValues(t, 2, calls.Load())
+			_, found, err := store.GetMeta(t.Context(), meta.Bucket, meta.Key)
+			require.NoError(t, err)
+			require.False(t, found)
+		})
 	}
 }
 

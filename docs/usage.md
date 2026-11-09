@@ -329,8 +329,11 @@ re-signs a request for the upstream host and region.
 
 GET and HEAD requests can use cached objects after local signature validation.
 Version and part selectors, response overrides, unknown query parameters,
-conditional headers, signed ranges, and requests carrying `Cache-Control` bypass
-the cache. Checksum headers returned by the origin are preserved on cache hits. A
+conditional headers, signed ranges, and unsupported `Cache-Control` directives
+bypass the cache. Unsigned `Cache-Control: no-cache` and `max-age=0` instead
+[revalidate the cached copy with upstream](cache-control.md#force-revalidation)
+before serving it. Upstream errors never permit stale content on this path.
+Checksum headers returned by the origin are preserved on cache hits. A
 checksum-mode request fetches from the origin if the entry came from a read that
 did not request checksums. PUT requests reach the origin and
 invalidate or replace the cached object after success, as header-signed uploads do.

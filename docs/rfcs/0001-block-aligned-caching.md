@@ -124,7 +124,7 @@ So a block-eligible object is **always** block-mode; a full read never produces 
 
 **Bounded degraded serves.** Because `blocks_complete` is a hint and blocks evict independently of the meta, a committed serve (headers already sent) recovers at most `maxInlineFetchesPerServe` (2) absent blocks via individual aligned upstream fetches. Past that cap, on a populate-budget decline, or on a transient or short cache-read failure, the committed response is completed **byte-exact from a single uncached upstream remainder stream** — validated against the entry's ETag and the exact remaining byte range — instead of truncating, and a cap-tripped (mass-evicted) entry is invalidated so the next GET re-establishes it with one streaming re-split. Only three things still truncate a committed body: a stale signal (a different object version must never be mixed into a committed response), a client write failure (the client is broken, not the cache — tracked explicitly so it is never "salvaged" with a wasted upstream round trip), and a failed remainder stream. The request-level `X-Cache: HIT` is committed before streaming; it identifies the cache-backed response selection, not every byte's source or successful completion.
 
-A client-forced revalidation (`Cache-Control: no-cache`) of a block-mode entry likewise invalidates it and lets the miss path re-establish the current version.
+A client-forced revalidation (`Cache-Control: no-cache`) of a block-mode entry invalidates it and lets the miss path re-establish the current version, except for presigned reads. Presigned reads send a conditional request with the cached ETag and reuse the blocks only after upstream confirms the object is unchanged.
 
 ### Configuration
 

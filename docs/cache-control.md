@@ -8,7 +8,7 @@ TAG supports RFC 7234-compliant cache revalidation. Clients can control caching 
 | ------------- | -------------------------------------------------------------------------------- |
 | `HIT`         | A cache entry was selected to serve the response (including revalidation that confirmed the object is unchanged) |
 | `MISS`        | Not in cache, fetched from upstream and now cached                               |
-| `REVALIDATED` | Revalidated with upstream, object changed, new content returned                  |
+| `REVALIDATED` | Checked upstream and returned its response, including changed content or an origin error |
 | `BYPASS`      | Cache bypassed entirely (client requested `no-store`, or the request carries a representation selector: `versionId`, `partNumber`, `response-*`) |
 | `DISABLED`    | Caching is disabled server-side (`TAG_CACHE_DISABLED=true`)                      |
 
@@ -30,13 +30,22 @@ curl -H "Cache-Control: no-cache" -H "Range: bytes=0-99" \
   http://localhost:8080/my-bucket/my-key
 ```
 
-If the revalidation request to upstream fails, TAG serves the stale cached copy as a fallback.
+Presigned GET and HEAD requests with `no-cache` or `max-age=0` check upstream
+using the URL's original signing time, expiry, and query parameters. On a cache
+hit, TAG adds `If-None-Match` with the cached ETag. A `304` permits serving the
+cached object, including cached blocks and requested ranges. A changed object
+streams from upstream and replaces the cached copy when cacheable. A changed
+HEAD response invalidates the old entry; the next GET populates the new version.
+Cold GETs also populate the cache. Each freshness request contacts upstream
+independently, even if another download of that object is in progress.
 
-Presigned GET and HEAD requests are an exception: any nonempty `Cache-Control`
-header bypasses the cache. TAG forwards the original signed request, returns the
-origin's status and body, and does not populate or replace an entry. This keeps
-presigned `no-cache` app downloads subject to origin authorization and prevents a
-stale cached app from hiding an origin error.
+Presigned revalidation never serves stale content after an upstream error.
+TAG returns upstream authorization and server errors, and fails the request if
+upstream cannot be reached. A `404` or `410` also invalidates the cached entry.
+Other request directives, including `no-store` and `private`, still bypass the
+cache, as do [unsupported presigned request variants](usage.md#presigned-urls-in-signing-mode).
+The existing revalidation path for requests without query authentication can
+serve stale content when upstream fails.
 
 ## Bypass Cache
 

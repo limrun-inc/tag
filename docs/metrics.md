@@ -88,7 +88,7 @@ upstream suffix or later finish with an error; request status is recorded separa
 in `tag_requests_total`.
 
 `tag_cache_hits_total` and `tag_cache_misses_total` count only `HIT` and `MISS`.
-`REVALIDATED` responses (object changed on upstream) are neither — they are tracked
+`REVALIDATED` responses (changed content or a presigned revalidation error from upstream) are neither — they are tracked
 by the `tag_revalidations_*` metrics — and `BYPASS`/`DISABLED` requests are not
 counted at all.
 

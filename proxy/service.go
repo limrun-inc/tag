@@ -947,6 +947,9 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			if forceRevalidate && meta.ETag != "" {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD cache hit requires revalidation (client-triggered)")
+				if auth.IsPresignedRequest(r) {
+					return s.revalidatePresignedAndServe(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
+				}
 				return s.revalidateAndServeHead(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
 			}
 
@@ -1493,7 +1496,18 @@ func bypassPresignedCache(r *http.Request) bool {
 	if !auth.IsPresignedRequest(r) {
 		return false
 	}
-	if r.Header.Get("Cache-Control") != "" || r.Header.Get("Origin") != "" ||
+	// Only freshness directives can reuse the current-object cache. Other directives
+	// retain the original forwarding behavior, including no-store and private.
+	for _, value := range r.Header.Values("Cache-Control") {
+		for _, directive := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(directive)) {
+			case "", "no-cache", "max-age=0":
+			default:
+				return true
+			}
+		}
+	}
+	if r.Header.Get("Origin") != "" ||
 		r.Header.Get("X-Amz-Security-Token") != "" || r.Method == http.MethodHead && r.Header.Get("Range") != "" {
 		return true
 	}
