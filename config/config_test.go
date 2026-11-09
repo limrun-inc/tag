@@ -378,11 +378,11 @@ func TestLoad_WriteThroughMaxSize(t *testing.T) {
 		name, yaml, env string
 		want            int64
 	}{
-		{"default", "", "", 500 * 1024 * 1024},
+		{"default", "", "", 256 * 1024 * 1024},
 		{"yaml", "  write_through_max_size: 67108864\n", "", 67108864},
 		{"env", "  write_through_max_size: 67108864\n", "1073741824", 1073741824},
 		{"disabled", "", "-1", -1},
-		{"zero retains default", "", "0", 500 * 1024 * 1024},
+		{"zero retains default", "", "0", 256 * 1024 * 1024},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("TAG_CACHE_WRITE_THROUGH_MAX_SIZE", tc.env)

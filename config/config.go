@@ -40,8 +40,8 @@ const (
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
 	// DefaultCacheWriteThroughMaxSize is the largest single PUT retained for
-	// write-through (500 MiB), independently of the read-side block size.
-	DefaultCacheWriteThroughMaxSize = 500 * 1024 * 1024
+	// write-through (256 MiB), independently of the read-side block size.
+	DefaultCacheWriteThroughMaxSize = 256 * 1024 * 1024
 
 	// DefaultCacheBlockSize (1 MiB) is the block granularity AND the read-side whole-vs-block
 	// boundary: a read miss for an object SMALLER than one block is cached as a whole blob
@@ -345,7 +345,7 @@ type CacheConfig struct {
 	// must fit the populate memory budget before forwarding begins; otherwise
 	// the write falls back to streaming background warming. PUTs >= 1 MiB also
 	// require that byte budget to be enabled. No temporary disk copy is used.
-	// 0/unset uses 500 MiB; negative disables the tee, retaining background warming.
+	// 0/unset uses 256 MiB; negative disables the tee, retaining background warming.
 	WriteThroughMaxSize int64 `yaml:"write_through_max_size"`
 	// LegacyCoordination selects the cache's meta-key ordering mechanism
 	// (cache/coordinator.go). true (the DEFAULT when unset) runs the legacy
