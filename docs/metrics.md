@@ -296,7 +296,9 @@ Number of objects cached by teeing the `PutObject` body on the write path
 (write-through): the body is captured as it's forwarded and the object's metadata is sourced
 from a lightweight HEAD (which returns the same headers a GET would, without the body), so
 **no full-object read-back GET** is needed. Applies to authenticated single PUTs within
-`cache.size_threshold` in signing mode. Compare with `tag_warm_on_write_triggered_total`
+both `cache.write_through_max_size` (500 MiB by default) and `cache.size_threshold`
+in signing mode. The whole body plus writer buffers must fit the shared memory
+budget before admission. Compare with `tag_warm_on_write_triggered_total`
 (the read-back full GET, used for multipart completions, `CopyObject`, over-threshold or
 anonymous writes, when the populate budget is saturated, and when the tee's HEAD can't
 confirm the just-written version).

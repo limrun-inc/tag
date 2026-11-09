@@ -18,7 +18,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
 | `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
 | `TAG_CACHE_COMPACTION_BPS`        | Shared read budget (bytes/second) for ocache background compaction, recompaction, and the liveness walks that gate reclaim; protects serving reads on throughput-capped volumes. `0` disables (also via env override); unset keeps YAML/default; set to a small fraction of the volume cap (e.g. `33554432` = 32 MiB/s on a 240 MB/s volume) | unthrottled              |
-| `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
+| `TAG_CACHE_WARM_ON_WRITE`         | Warm after a successful write: eligible PUTs retain their uploaded body, other writes use a background GET (`true`/`false`)  | `false`                  |
+| `TAG_CACHE_WRITE_THROUGH_MAX_SIZE` | Largest single PUT retained for direct write-through; requires `warm_on_write`. Independent of block size. Negative disables the tee | `524288000` (500 MiB) |
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
 | `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `true`                   |
 | `TAG_CACHE_BLOCK_SIZE`             | Block granularity **and** the read-side whole-vs-block boundary (bytes): a read miss below this is whole-cached, at/above it is block-cached; must stay below ocache's 64 MB compaction threshold | `1048576` (1 MiB)        |
@@ -164,11 +165,10 @@ cache:
   compaction_bytes_per_second: 0
 
   # Warm the cache after a successful write (PutObject / CompleteMultipartUpload /
-  # CopyObject) by triggering a background full-object fetch, so a read soon after a
-  # write hits cache. This is cache-warm-on-write (write-around plus async warming),
-  # NOT strict write-through: the write still invalidates, and the warm is a
-  # separate, best-effort background GET — deduplicated and shed under the cache
-  # populate budget. It costs one extra upstream GET per write, so it defaults off.
+  # CopyObject). Eligible single PUTs retain their uploaded bytes in memory and
+  # confirm metadata with a checksum-enabled HEAD, avoiding an origin body download.
+  # Other writes use a background GET. Both paths commit asynchronously after PUT
+  # success and respect cacheability, version ordering, and the populate budget.
   # An authenticated write warms with the write's credentials (TAG's own in
   # transparent mode, the client's in signing mode); a signing-mode client authorized
   # only to write will have its warm fetch fail, same as if it read the object itself.
@@ -177,6 +177,15 @@ cache:
   # returns 200); a private object is never exposed via the cache.
   # Override with TAG_CACHE_WARM_ON_WRITE env var
   warm_on_write: false
+
+  # Maximum single PUT retained in memory for direct write-through (500 MiB).
+  # Independent of block_size. The whole body PLUS writer buffers must fit the
+  # shared populate memory budget before forwarding; otherwise use a background GET.
+  # PUTs >= 1 MiB require the byte budget to be enabled. No temporary disk copy.
+  # The cached object itself still occupies its full size on disk, whole or blocked.
+  # 0/unset = default; negative disables direct teeing, retaining background warming.
+  # Override with TAG_CACHE_WRITE_THROUGH_MAX_SIZE.
+  write_through_max_size: 524288000
   # Fraction of the populate memory budget reserved for warm-on-write populates so
   # they aren't starved by the read-miss full-object warm flood. The reservation is
   # elastic and demand-driven: read-miss warms use the whole budget when no
@@ -432,7 +441,8 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |
 | `compaction_bytes_per_second` | int64 | `0`          | Shared source-read budget (bytes/s) for background compaction + recompaction; `0` = unthrottled. Size to a small fraction of the volume's throughput cap |
-| `warm_on_write`         | bool     | `false`          | Warm the cache after a successful write via a background fetch (one extra upstream GET per write) |
+| `warm_on_write`         | bool     | `false`          | Warm after a successful write: eligible PUTs tee the body; otherwise use a background GET |
+| `write_through_max_size` | int64 | `524288000` | Maximum retained single PUT body (500 MiB), independent of `block_size`; negative disables direct teeing |
 | `warm_on_write_reserved_fraction` | float | `0.5`     | Elastic share of the populate budget reserved for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; `0`/unset = default, negative = disabled) |
 | `node_id`               | string   | `""`             | Unique node identifier for cluster mode                                             |
 | `cluster_addr`          | string   | `:7000`          | Address for memberlist gossip                                                       |

@@ -563,9 +563,9 @@ func TestHandlePutObject_WriteThroughTee_DisabledWhenWarmOnWriteOff(t *testing.T
 	}
 }
 
-// An object at or above BlockSize is not eligible for the in-memory tee; the write path falls
+// An object above WriteThroughMaxSize is not eligible for the in-memory tee; the write path falls
 // back to the streaming warm-on-write read-back.
-func TestHandlePutObject_WriteThroughTee_FallsBackAboveBlockSize(t *testing.T) {
+func TestHandlePutObject_WriteThroughTee_FallsBackAboveWriteThroughLimit(t *testing.T) {
 	var puts, warmGets atomic.Int32
 	body := "this-body-exceeds-the-tiny-write-through-cap"
 
@@ -581,10 +581,11 @@ func TestHandlePutObject_WriteThroughTee_FallsBackAboveBlockSize(t *testing.T) {
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
-	// BlockSize sits at or below the PUT body: the tee is skipped (too big to buffer),
+	// The independent write-through cap is below the PUT body: the tee is skipped,
 	// but the object is still cacheable (SizeThreshold large) so the warm read-back caches it.
 	svc.config.Cache.SizeThreshold = 1 << 20
 	svc.config.Cache.BlockSize = 8
+	svc.config.Cache.WriteThroughMaxSize = 8
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {

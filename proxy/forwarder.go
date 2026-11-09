@@ -369,6 +369,25 @@ func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, ac
 	return resp, nil
 }
 
+// DoCacheFillRequest reads authoritative object/checksum metadata for a cache
+// fill. HEAD verifies a teed PUT without downloading the body; GET warms writes
+// that could not be teed. These synthetic requests use the object's credentials,
+// not a caller's GET capability, and never alter a forwarded presigned URL.
+func (b *baseForwarder) DoCacheFillRequest(ctx context.Context, method, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+	if method != http.MethodHead && method != http.MethodGet {
+		return nil, errors.New("cache fill requires GET or HEAD")
+	}
+	headers := http.Header{"X-Amz-Checksum-Mode": {"ENABLED"}}
+	req, err := b.signer.SignObjectRequest(ctx, method, bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, headers)
+	if err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	resp, err := b.doOriginRequest(req, b.rangeFetch(req, accessKey, secretKey))
+	metrics.RecordUpstreamRequest(method, time.Since(start).Seconds(), err)
+	return resp, err
+}
+
 // DoAnonymousFullObjectRequest executes an UNSIGNED full-object GET (no credentials),
 // so upstream applies anonymous authorization: 200 for a publicly-readable object,
 // 403 otherwise. Uses vhost-style addressing where the endpoint supports it, matching
